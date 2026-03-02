@@ -305,6 +305,17 @@ pub fn build_terrain_mesh(
     }
 
     // ── Pass 2: Compute per-vertex normals from neighboring positions ──
+    //
+    // At tile edges, the naive approach clamps the missing neighbor to `self`,
+    // producing a one-sided difference.  Adjacent tiles compute the opposite
+    // one-sided difference → normal discontinuity → visible hillshade seam.
+    //
+    // Fix: use a **reflected sample** at edges.  For example, at the left edge
+    // (gx=0), the missing "left" neighbor is approximated as the mirror of
+    // the "right" neighbor across the current vertex:
+    //     left_virtual = 2 * p - right
+    // This produces a central-difference-like normal that's symmetric and
+    // continuous.  At interior vertices, standard central differences are used.
     let mut normals = vec![[0.0f32, 0.0, 1.0]; vert_count];
     let vs = verts_per_side as usize;
 
@@ -313,13 +324,29 @@ pub fn build_terrain_mesh(
             let idx = gy * vs + gx;
             let p = positions[idx];
 
-            // Finite-difference neighbors (clamped at edges)
-            let left = if gx > 0 { positions[idx - 1] } else { p };
-            let right = if gx + 1 < vs { positions[idx + 1] } else { p };
-            let up = if gy > 0 { positions[idx - vs] } else { p };
-            let down = if gy + 1 < vs { positions[idx + vs] } else { p };
+            // Reflected-sample neighbors at edges for smooth boundary normals.
+            let right = if gx + 1 < vs { positions[idx + 1] } else {
+                // Right edge: reflect left neighbor across p
+                let l = positions[idx - 1];
+                [2.0 * p[0] - l[0], 2.0 * p[1] - l[1], 2.0 * p[2] - l[2]]
+            };
+            let left = if gx > 0 { positions[idx - 1] } else {
+                // Left edge: reflect right neighbor across p
+                let r = positions[idx + 1];
+                [2.0 * p[0] - r[0], 2.0 * p[1] - r[1], 2.0 * p[2] - r[2]]
+            };
+            let down = if gy + 1 < vs { positions[idx + vs] } else {
+                // Bottom edge: reflect up neighbor across p
+                let u = positions[idx - vs];
+                [2.0 * p[0] - u[0], 2.0 * p[1] - u[1], 2.0 * p[2] - u[2]]
+            };
+            let up = if gy > 0 { positions[idx - vs] } else {
+                // Top edge: reflect down neighbor across p
+                let d = positions[idx + vs];
+                [2.0 * p[0] - d[0], 2.0 * p[1] - d[1], 2.0 * p[2] - d[2]]
+            };
 
-            // Tangent vectors
+            // Tangent vectors (central difference or reflected central difference)
             let dx = [right[0] - left[0], right[1] - left[1], right[2] - left[2]];
             let dy = [down[0] - up[0], down[1] - up[1], down[2] - up[2]];
 
@@ -1710,6 +1737,63 @@ mod tests {
             (tl_elev - 1500.0).abs() < 100.0,
             "top-left should be ~1500m (parent center), got {}m",
             tl_elev
+        );
+    }
+
+    #[test]
+    fn test_build_terrain_mesh_edge_normals_smooth() {
+        // Verify that edge normals are smooth (no abrupt jump at boundary).
+        //
+        // Create a sloped terrain (linear gradient in y) and check that the
+        // normals at the top edge (gy=0) are close to the normals at gy=1
+        // (first interior row), and similarly for the bottom edge.
+        // With the reflected-sample approach, edge normals should extrapolate
+        // the interior slope, not clamp to flat.
+        let coord = TileCoord::new(5, 16, 16);
+        let grid_size = 33u32;
+        // Linear gradient: height increases from north to south (0m → 1000m)
+        let mut elevation = vec![0.0f32; (grid_size * grid_size) as usize];
+        for row in 0..grid_size {
+            for col in 0..grid_size {
+                let v = row as f32 / (grid_size - 1) as f32;
+                elevation[(row * grid_size + col) as usize] = v * 1000.0;
+            }
+        }
+        let scale = 1e-5;
+        let identity_uv = [0.0, 0.0, 1.0, 1.0];
+        let (verts, _) = build_terrain_mesh(
+            &coord, &elevation, grid_size, grid_size, scale, identity_uv,
+        );
+        let vs = (TERRAIN_GRID_SIZE + 1) as usize;
+
+        // Check top edge normals vs first interior row
+        let mid_x = vs / 2;
+        let edge_top = verts[0 * vs + mid_x].normal;
+        let interior_1 = verts[1 * vs + mid_x].normal;
+
+        // With reflected samples, top edge normal should closely match
+        // the first interior row's normal (both see the same linear slope).
+        let dot_top = edge_top[0] * interior_1[0]
+            + edge_top[1] * interior_1[1]
+            + edge_top[2] * interior_1[2];
+        assert!(
+            dot_top > 0.99,
+            "Top edge normal should match interior (dot={:.4}), edge={:?}, interior={:?}",
+            dot_top, edge_top, interior_1,
+        );
+
+        // Check bottom edge normals vs last interior row
+        let last = vs - 1;
+        let edge_bottom = verts[last * vs + mid_x].normal;
+        let interior_last = verts[(last - 1) * vs + mid_x].normal;
+
+        let dot_bottom = edge_bottom[0] * interior_last[0]
+            + edge_bottom[1] * interior_last[1]
+            + edge_bottom[2] * interior_last[2];
+        assert!(
+            dot_bottom > 0.99,
+            "Bottom edge normal should match interior (dot={:.4}), edge={:?}, interior={:?}",
+            dot_bottom, edge_bottom, interior_last,
         );
     }
 

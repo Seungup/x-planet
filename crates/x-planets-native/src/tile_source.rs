@@ -632,7 +632,7 @@ mod tests {
 
         // Primary should be first
         let (primary_gx, primary_gy, primary_gz) = tiles[0];
-        let (_w, _e, primary_north, primary_south) =
+        let (_w, _e, _primary_north, primary_south) =
             geographic_tile_bounds(primary_gx, primary_gy, primary_gz);
 
         // Secondary should be adjacent (gy+1, covering south)
