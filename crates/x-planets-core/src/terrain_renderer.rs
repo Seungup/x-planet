@@ -13,7 +13,7 @@
 //! + texture + sampler) so the shaders share a uniform interface.
 
 use x_planets_gpu::GpuContext;
-use x_planets_math::{TileCoord, ViewportUniforms};
+use x_planets_math::{TileCoord, TileUniforms, ViewportUniforms};
 
 use crate::pipeline::{build_terrain_mesh, compute_height_scale, fallback_uv_rect, tile_uniforms_with_uv, RenderableTile};
 use crate::render::TerrainVertex;
@@ -48,24 +48,26 @@ pub struct TerrainLayerData<'a> {
     pub tile_opacity_overrides: HashMap<TileCoord, f32>,
 }
 
-/// Cached vertex/index buffers for a terrain tile mesh.
-/// These are static once built — they only depend on the tile coord,
-/// elevation data, and exaggeration (height_scale).
+/// Cached GPU resources for a terrain tile.
+///
+/// Everything here is allocated once and reused across frames:
+/// - Vertex/index buffers: rebuilt only when elevation source changes
+/// - Uniform buffer: same allocation, contents updated via `write_buffer()`
+/// - Bind group: reused as long as the imagery texture coord doesn't change
+///   (uniform buffer is the same object, sampler never changes)
 struct CachedMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
-    /// Which elevation tile was used (for invalidation).
+    /// Which elevation tile was used (for mesh invalidation).
     elev_source: TileCoord,
-}
-
-/// Per-frame tile data: uniform buffer + bind group that depend on the
-/// current camera VP, opacity, and imagery texture.
-struct FrameTile {
-    _uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
-    /// Index into the mesh cache (by TileCoord).
-    coord: TileCoord,
+    /// Reusable uniform buffer — updated every frame, never reallocated.
+    uniform_buffer: wgpu::Buffer,
+    /// Cached bind group — reused when imagery texture hasn't changed.
+    bind_group: Option<wgpu::BindGroup>,
+    /// The imagery texture coord used to build `bind_group`.
+    /// When this changes (parent→child swap), bind group is recreated.
+    last_texture_coord: Option<TileCoord>,
 }
 
 /// Renders terrain tiles with 3D displaced meshes.
@@ -344,12 +346,21 @@ impl TerrainRenderer {
                 &format!("terrain-idx-{}-{}-{}", coord.z, coord.x, coord.y),
                 &indices,
             );
+            // Uniform buffer allocated once, reused every frame via update_buffer.
+            let zero_uniforms: TileUniforms = bytemuck::Zeroable::zeroed();
+            let uniform_buffer = gpu.create_uniform_buffer(
+                &format!("terrain-uni-{}-{}-{}", coord.z, coord.x, coord.y),
+                &zero_uniforms,
+            );
 
             self.mesh_cache.insert(*coord, CachedMesh {
                 vertex_buffer,
                 index_buffer,
                 index_count: indices.len() as u32,
                 elev_source,
+                uniform_buffer,
+                bind_group: None,
+                last_texture_coord: None,
             });
         }
 
@@ -419,47 +430,55 @@ impl TerrainRenderer {
                 rendered_coords.insert(rt.coord);
             }
 
-            // Phase 2: Create per-frame uniform + bind group (cheap).
-            let frame_tiles: Vec<FrameTile> = tile_data
+            // Phase 2: Update uniform buffers + reuse/rebuild bind groups.
+            //
+            // Per-frame cost breakdown (steady-state, no new tiles):
+            //   - uniform_buffer: queue.write_buffer() only (zero alloc)
+            //   - bind_group:     REUSED from cache (zero alloc)
+            // Bind group is only rebuilt when imagery texture_coord changes
+            // (parent→child swap), which happens at most once per tile load.
+            let render_coords: Vec<TileCoord> = tile_data
                 .iter()
                 .filter_map(|&(rt, tex_view, _, _, _, tile_opacity)| {
-                    let _cached = self.mesh_cache.get(&rt.coord)?;
+                    let cached = self.mesh_cache.get_mut(&rt.coord)?;
 
+                    // Update uniform buffer in-place (no allocation).
                     let tile_uniforms = tile_uniforms_with_uv(&rt.coord, tile_opacity, rt.uv_rect, &vp_f64);
-                    let uniform_buffer = gpu.create_uniform_buffer("terrain-tile-uniforms", &tile_uniforms);
+                    gpu.update_buffer(&cached.uniform_buffer, &tile_uniforms);
 
-                    let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("terrain-tile-bg"),
-                        layout: &self.tile_bgl,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: uniform_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::TextureView(tex_view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::Sampler(&self.sampler),
-                            },
-                        ],
-                    });
+                    // Rebuild bind group only when imagery texture changes.
+                    let tex_changed = cached.last_texture_coord != Some(rt.texture_coord);
+                    if tex_changed || cached.bind_group.is_none() {
+                        cached.bind_group = Some(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("terrain-tile-bg"),
+                            layout: &self.tile_bgl,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: cached.uniform_buffer.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::TextureView(tex_view),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                                },
+                            ],
+                        }));
+                        cached.last_texture_coord = Some(rt.texture_coord);
+                    }
 
-                    Some(FrameTile {
-                        _uniform_buffer: uniform_buffer,
-                        bind_group,
-                        coord: rt.coord,
-                    })
+                    Some(rt.coord)
                 })
                 .collect();
 
-            if frame_tiles.is_empty() {
+            if render_coords.is_empty() {
                 continue;
             }
 
-            // Phase 3: Render pass — reference cached vertex/index buffers.
+            // Phase 3: Render pass — all buffers and bind groups live in mesh_cache.
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("terrain-render-pass"),
@@ -485,12 +504,14 @@ impl TerrainRenderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.viewport_bg, &[]);
 
-                for ft in &frame_tiles {
-                    if let Some(cached) = self.mesh_cache.get(&ft.coord) {
-                        pass.set_bind_group(1, &ft.bind_group, &[]);
-                        pass.set_vertex_buffer(0, cached.vertex_buffer.slice(..));
-                        pass.set_index_buffer(cached.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..cached.index_count, 0, 0..1);
+                for coord in &render_coords {
+                    if let Some(cached) = self.mesh_cache.get(coord) {
+                        if let Some(bg) = &cached.bind_group {
+                            pass.set_bind_group(1, bg, &[]);
+                            pass.set_vertex_buffer(0, cached.vertex_buffer.slice(..));
+                            pass.set_index_buffer(cached.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..cached.index_count, 0, 0..1);
+                        }
                     }
                 }
             }

@@ -202,7 +202,8 @@ struct NativeLayerState {
     tile_loader: TileLoader,
     pending_coords: HashSet<TileCoord>,
     /// Elevation data for terrain layers (CPU-side, used for mesh generation).
-    terrain_data: HashMap<TileCoord, TerrainTileData>,
+    /// LRU-evicted alongside tile_textures to prevent unbounded memory growth.
+    terrain_data: TileCache<TerrainTileData>,
     /// Cooldown for failed tiles: don't retry until the Instant has passed.
     /// Prevents infinite retry loops when the server returns 429 / transient errors.
     failed_cooldowns: HashMap<TileCoord, Instant>,
@@ -441,7 +442,7 @@ impl ApplicationHandler for NativeApp {
                     tile_textures: TileCache::new(cfg.max_cached_tiles),
                     tile_loader: TileLoader::new(cfg.max_concurrent_loads),
                     pending_coords: HashSet::new(),
-                    terrain_data: HashMap::new(),
+                    terrain_data: TileCache::new(cfg.max_cached_tiles),
                     failed_cooldowns: HashMap::new(),
                 }
             })
@@ -892,8 +893,18 @@ impl ApplicationHandler for NativeApp {
                     }
                 }
 
-                // 4b. Poll completed tiles & create GPU textures (dispatched by layer name)
-                while let Ok(msg) = self.tile_rx.try_recv() {
+                // 4b. Poll completed tiles & create GPU textures (dispatched by layer name).
+                // Cap per frame to avoid frame-time spikes when many tiles arrive at once
+                // (each raster tile = ~256KB GPU upload, each terrain mesh = CPU build).
+                // Remaining tiles stay in the channel and are processed next frame.
+                const MAX_TILES_PER_FRAME: usize = 4;
+                let mut tiles_this_frame = 0;
+                while tiles_this_frame < MAX_TILES_PER_FRAME {
+                    let msg = match self.tile_rx.try_recv() {
+                        Ok(m) => m,
+                        Err(_) => break,
+                    };
+                    tiles_this_frame += 1;
                     if let Some(ls) = self.layer_states.iter_mut().find(|s| s.name == msg.layer_name) {
                         match msg.result {
                             Ok(TileResult::Raster(decoded)) => {
@@ -968,9 +979,23 @@ impl ApplicationHandler for NativeApp {
                 }
 
                 // ── 5. LRU bump all layers (mutable pass) ──
+                // Bump visible tiles AND their fallback ancestors to prevent
+                // parent tiles from being evicted while still needed as fallback
+                // coverage for unloaded children.
                 for ls in &mut self.layer_states {
                     for &coord in &visible {
                         let _ = ls.tile_textures.get(&coord);
+                        let _ = ls.terrain_data.get(&coord);
+                        // Also bump ancestor tiles that might serve as fallbacks
+                        let mut parent = coord.parent();
+                        while let Some(p) = parent {
+                            let tex_found = ls.tile_textures.get(&p).is_some();
+                            let _ = ls.terrain_data.get(&p);
+                            if tex_found {
+                                break; // bumped — ancestors above are even older, skip
+                            }
+                            parent = p.parent();
+                        }
                     }
                 }
 
@@ -1013,17 +1038,48 @@ impl ApplicationHandler for NativeApp {
                                     .map(|(k, v)| (*k, &v.view))
                                     .collect();
 
-                                // Compute per-tile fade-in opacity overrides
+                                // Compute per-tile fade-in opacity overrides.
+                                //
+                                // Only fade tiles appearing for the FIRST TIME (no parent
+                                // coverage in the cache).  When a child tile replaces a
+                                // parent fallback we swap at full opacity — the parent was
+                                // already showing that area, so there's no visual gap.
                                 let mut tile_opacity_overrides = HashMap::new();
                                 for rt in &renderable {
+                                    // Only consider tiles using their OWN texture (not fallback)
+                                    if rt.texture_coord != rt.coord {
+                                        continue; // using parent → full opacity, no fade
+                                    }
                                     if let Some(&start) =
-                                        self.anim.tile_fade_start.get(&rt.texture_coord)
+                                        self.anim.tile_fade_start.get(&rt.coord)
                                     {
                                         let elapsed = now.duration_since(start).as_secs_f64();
                                         if elapsed < FADE_DURATION {
-                                            let t = (elapsed / FADE_DURATION).min(1.0) as f32;
-                                            tile_opacity_overrides
-                                                .insert(rt.coord, layer.config.opacity * t);
+                                            // Check if a parent tile provided prior coverage
+                                            let parent_covered = {
+                                                let mut c = rt.coord.parent();
+                                                let mut found = false;
+                                                while let Some(p) = c {
+                                                    if available.contains(&p) {
+                                                        found = true;
+                                                        break;
+                                                    }
+                                                    c = p.parent();
+                                                }
+                                                found
+                                            };
+                                            if !parent_covered {
+                                                // No parent coverage → fade in from near-zero
+                                                // (min 1/60 avoids zero-opacity frame)
+                                                let t = ((elapsed / FADE_DURATION) as f32)
+                                                    .max(1.0 / 60.0)
+                                                    .min(1.0);
+                                                tile_opacity_overrides.insert(
+                                                    rt.coord,
+                                                    layer.config.opacity * t,
+                                                );
+                                            }
+                                            // Parent covered → full opacity (seamless swap)
                                         }
                                     }
                                 }
@@ -1078,7 +1134,7 @@ impl ApplicationHandler for NativeApp {
                                         // Try exact match first, then walk up to parents
                                         let mut c = Some(coord);
                                         while let Some(candidate) = c {
-                                            if let Some(data) = ls.terrain_data.get(&candidate) {
+                                            if let Some(data) = ls.terrain_data.peek(&candidate) {
                                                 elevation_data.insert(coord, (data, candidate));
                                                 break;
                                             }
@@ -1086,29 +1142,18 @@ impl ApplicationHandler for NativeApp {
                                         }
                                     }
 
-                                    // Compute per-tile fade-in opacity overrides
-                                    let mut tile_opacity_overrides = HashMap::new();
-                                    for rt in &renderable {
-                                        if let Some(&start) =
-                                            self.anim.tile_fade_start.get(&rt.texture_coord)
-                                        {
-                                            let elapsed = now.duration_since(start).as_secs_f64();
-                                            if elapsed < FADE_DURATION {
-                                                let t =
-                                                    (elapsed / FADE_DURATION).min(1.0) as f32;
-                                                tile_opacity_overrides
-                                                    .insert(rt.coord, layer.config.opacity * t);
-                                            }
-                                        }
-                                    }
-
+                                    // Terrain tiles always render at full layer opacity.
+                                    // No fade-in — parent fallback provides seamless coverage
+                                    // until each child's own texture loads, then instant swap.
+                                    // This eliminates the zero-opacity frame flicker that
+                                    // occurs when a fading child replaces a full-opacity parent.
                                     terrain_layers.push(TerrainLayerData {
                                         name: &layer.config.name,
                                         opacity: layer.config.opacity,
                                         tiles: renderable,
                                         imagery_views,
                                         elevation_data,
-                                        tile_opacity_overrides,
+                                        tile_opacity_overrides: HashMap::new(),
                                     });
                                 }
                             }
