@@ -22,11 +22,34 @@ use std::collections::{HashMap, HashSet};
 
 const TERRAIN_TILE_SHADER: &str = include_str!("../../../shaders/rendering/terrain_tile.wgsl");
 
-/// CPU-side elevation data for a terrain tile.
-pub struct TerrainTileData {
-    pub elevation: Vec<f32>,
-    pub width: u32,
-    pub height: u32,
+/// CPU-side terrain data for a tile.
+///
+/// Two variants:
+/// - `Heightmap`: regular elevation grid from Terrain RGB / Terrarium decoding.
+///   Mesh is built on-demand by [`build_terrain_mesh`].
+/// - `PrebuiltMesh`: pre-built triangle mesh from Quantized Mesh 1.0 decoding.
+///   Heights are stored in **metres** (not scaled); [`build_terrain_mesh_from_qm`]
+///   is called once to produce this variant and `height_scale` is applied in
+///   [`TerrainRenderer::get_or_build_mesh`] so exaggeration changes work without
+///   re-fetching tiles.
+pub enum TerrainTileData {
+    /// Heightmap elevation grid (Terrain RGB / Terrarium).
+    Heightmap {
+        elevation: Vec<f32>,
+        width: u32,
+        height: u32,
+    },
+    /// Pre-built triangle mesh (Quantized Mesh 1.0).
+    ///
+    /// `positions[i][2]` is elevation in **metres** (not scaled by height_scale).
+    /// Scaling is applied when building the GPU vertex buffer.
+    PrebuiltMesh {
+        /// Per-vertex data (position, normal, tex_coord).
+        /// `position[2]` is raw metres; normal is in unscaled mesh space.
+        vertices: Vec<crate::render::TerrainVertex>,
+        /// Triangle indices.
+        indices: Vec<u32>,
+    },
 }
 
 /// Per-layer terrain data assembled each frame for rendering.
@@ -329,14 +352,40 @@ impl TerrainRenderer {
         };
 
         if needs_rebuild {
-            let (vertices, indices) = build_terrain_mesh(
-                coord,
-                &elevation.elevation,
-                elevation.width,
-                elevation.height,
-                height_scale,
-                elev_uv_rect,
-            );
+            let (vertices, indices) = match elevation {
+                TerrainTileData::Heightmap { elevation: elev, width, height } => {
+                    build_terrain_mesh(coord, elev, *width, *height, height_scale, elev_uv_rect)
+                }
+                TerrainTileData::PrebuiltMesh { vertices, indices } => {
+                    if elev_source != *coord {
+                        // Parent's QM mesh covers the parent tile area, not this
+                        // child's sub-region.  Using the parent geometry would
+                        // stretch / mis-register the imagery.
+                        // Generate a flat placeholder (all elevation = 0) so the
+                        // imagery is visible immediately during the parent-first
+                        // loading phase.  The real QM mesh will replace this as
+                        // soon as the child tile finishes loading.
+                        build_terrain_mesh(coord, &[0.0], 1, 1, 0.0, elev_uv_rect)
+                    } else {
+                        // Pre-built mesh: apply height_scale to the z component.
+                        // Heights are stored in metres; scale here so exaggeration
+                        // changes (which clear the GPU mesh cache) work correctly.
+                        let scaled: Vec<crate::render::TerrainVertex> = vertices
+                            .iter()
+                            .map(|v| crate::render::TerrainVertex {
+                                position: [
+                                    v.position[0],
+                                    v.position[1],
+                                    v.position[2] * height_scale,
+                                ],
+                                normal: v.normal,
+                                tex_coord: v.tex_coord,
+                            })
+                            .collect();
+                        (scaled, indices.clone())
+                    }
+                }
+            };
 
             let vertex_buffer = gpu.create_vertex_buffer(
                 &format!("terrain-verts-{}-{}-{}", coord.z, coord.x, coord.y),
@@ -411,8 +460,21 @@ impl TerrainRenderer {
                 .tiles
                 .iter()
                 .filter_map(|rt| {
-                    let tex_view = layer.imagery_views.get(&rt.texture_coord)?;
-                    let (elev, elev_source) = layer.elevation_data.get(&rt.coord)?;
+                    let tex_view = layer.imagery_views.get(&rt.texture_coord);
+                    let elev_entry = layer.elevation_data.get(&rt.coord);
+                    if tex_view.is_none() || elev_entry.is_none() {
+                        eprintln!(
+                            "[terrain] SKIP tile z={} x={} y={}: \
+                             imagery_view={} (tex_coord z={} x={} y={}), \
+                             elev_data={}",
+                            rt.coord.z, rt.coord.x, rt.coord.y,
+                            tex_view.is_some(),
+                            rt.texture_coord.z, rt.texture_coord.x, rt.texture_coord.y,
+                            elev_entry.is_some(),
+                        );
+                    }
+                    let tex_view = tex_view?;
+                    let (elev, elev_source) = elev_entry?;
                     let tile_opacity = layer
                         .tile_opacity_overrides
                         .get(&rt.coord)

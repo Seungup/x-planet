@@ -39,6 +39,121 @@ use tiles3d_native::{
 };
 
 // ═══════════════════════════════════════════════════════════════════
+// TileJSON support
+// ═══════════════════════════════════════════════════════════════════
+
+/// Minimal TileJSON 2.x/3.x metadata — only the fields we need.
+///
+/// Spec: <https://github.com/mapbox/tilejson-spec>
+#[derive(serde::Deserialize)]
+struct TileJson {
+    /// One or more tile URL templates (e.g. `"https://…/{z}/{x}/{y}.webp"`).
+    tiles: Vec<String>,
+    #[serde(default)]
+    minzoom: Option<u8>,
+    #[serde(default)]
+    maxzoom: Option<u8>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    scheme: Option<String>,
+    /// Tile pixel density (e.g. `"1.000000"` = 256×256, `"2.000000"` = 512×512).
+    /// MapTiler extension; not in the original TileJSON spec.
+    #[serde(default)]
+    scale: Option<String>,
+    /// Tile data format, e.g. `"quantized-mesh-1.0"`, `"terrarium"`, `"webp"`, `"png"`.
+    /// Used to auto-detect terrain encoding without requiring explicit config.
+    #[serde(default)]
+    format: Option<String>,
+}
+
+/// Resolved metadata from a TileJSON endpoint.
+struct TileJsonMeta {
+    /// The first tile URL template from the `tiles` array.
+    tile_url: String,
+    /// Whether the tile scheme is TMS (y-axis flipped).
+    tms: bool,
+    /// Minimum zoom level served by the source.
+    min_zoom: Option<u8>,
+    /// Maximum zoom level served by the source.
+    max_zoom: Option<u8>,
+    /// Tile pixel density (1.0 = 256px, 2.0 = 512px).
+    scale: f32,
+    /// Terrain encoding auto-detected from the TileJSON `format` field.
+    /// `None` if the format is not a recognized terrain format (raster).
+    detected_encoding: Option<TerrainEncoding>,
+}
+
+/// Returns `true` if the URL looks like a TileJSON endpoint
+/// (ends in `.json` but is not a 3D Tiles `tileset.json`).
+fn is_tilejson_url(url: &str) -> bool {
+    let lower = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    lower.ends_with(".json")
+        && !lower.ends_with("tileset.json")
+}
+
+/// Fetch a TileJSON endpoint and extract tile URL template + metadata.
+///
+/// Returns [`TileJsonMeta`] with the resolved URL, TMS flag, zoom range, and scale.
+async fn resolve_tilejson(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<TileJsonMeta, String> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("TileJSON fetch failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("TileJSON HTTP {}", resp.status()));
+    }
+    let json: TileJson = resp
+        .json()
+        .await
+        .map_err(|e| format!("TileJSON parse failed: {e}"))?;
+    let tile_url = json
+        .tiles
+        .into_iter()
+        .next()
+        .ok_or_else(|| "TileJSON has empty `tiles` array".to_string())?;
+    let tms = json
+        .scheme
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case("tms"))
+        .unwrap_or(false);
+    let scale = json
+        .scale
+        .as_deref()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(1.0);
+
+    // Auto-detect terrain encoding from TileJSON `format` field.
+    let detected_encoding = match json.format.as_deref() {
+        Some(f) if f.starts_with("quantized-mesh") => Some(TerrainEncoding::QuantizedMesh),
+        Some("terrarium") => Some(TerrainEncoding::Terrarium),
+        _ => None,
+    };
+
+    log::info!(
+        "TileJSON resolved: \"{}\" (zoom {}-{}, scale={}x, tms={}, format={:?})",
+        json.name.as_deref().unwrap_or("(unnamed)"),
+        json.minzoom.unwrap_or(0),
+        json.maxzoom.unwrap_or(22),
+        scale,
+        tms,
+        json.format.as_deref().unwrap_or("(none)"),
+    );
+    Ok(TileJsonMeta {
+        tile_url,
+        tms,
+        min_zoom: json.minzoom,
+        max_zoom: json.maxzoom,
+        scale,
+        detected_encoding,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Animation utilities
 // ═══════════════════════════════════════════════════════════════════
 
@@ -185,6 +300,8 @@ impl AnimationState {
 enum TileResult {
     Raster(DecodedRasterTile),
     Terrain(DecodedTerrainTile),
+    /// Quantized Mesh 1.0 terrain tile (pre-built triangle mesh).
+    QuantizedMesh(x_planets_tiles::DecodedQuantizedMesh),
 }
 
 /// Result from a layer tile fetch+decode, tagged with the layer name.
@@ -207,6 +324,16 @@ struct NativeLayerState {
     /// Cooldown for failed tiles: don't retry until the Instant has passed.
     /// Prevents infinite retry loops when the server returns 429 / transient errors.
     failed_cooldowns: HashMap<TileCoord, Instant>,
+    /// Minimum zoom level served by the tile source (from TileJSON `minzoom`).
+    min_zoom: u8,
+    /// Maximum zoom level served by the tile source (from TileJSON `maxzoom`).
+    /// Tiles beyond this zoom are never requested; the fallback system
+    /// renders them with parent tiles at `max_zoom`.
+    max_zoom: u8,
+    /// Tile pixel density (1.0 = 256px, 2.0 = 512px).
+    /// Parsed from TileJSON `scale` field.  Reserved for future LOD calculations.
+    #[allow(dead_code)]
+    tile_scale: f32,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -424,26 +551,97 @@ impl ApplicationHandler for NativeApp {
         self.anim = AnimationState::new(engine.viewport.zoom);
 
         // ── Per-layer GPU state (raster + terrain) ──
+        // Resolve TileJSON endpoints (URLs ending in `.json`) before creating
+        // tile sources.  This fetches the metadata JSON at startup and extracts
+        // the actual tile URL template from the `tiles` array.
+        let tilejson_client = reqwest::Client::builder()
+            .user_agent("x-planets/0.1")
+            .build()
+            .expect("Failed to create HTTP client for TileJSON");
+
         self.layer_states = engine
             .layers
             .iter()
             .filter(|layer| !matches!(layer.config.kind, LayerKind::Tiles3d))
             .map(|layer| {
                 let cfg = &layer.config;
+                let meta = if is_tilejson_url(&cfg.tile_source_url) {
+                    log::info!(
+                        "Layer '{}': resolving TileJSON → {}",
+                        cfg.name, cfg.tile_source_url,
+                    );
+                    match self.rt.block_on(resolve_tilejson(&tilejson_client, &cfg.tile_source_url)) {
+                        Ok(m) => {
+                            log::info!(
+                                "  → resolved to: {}",
+                                if m.tile_url.len() > 80 { format!("{}…", &m.tile_url[..80]) } else { m.tile_url.clone() },
+                            );
+                            m
+                        }
+                        Err(e) => {
+                            log::warn!("  → TileJSON resolution failed, using URL as-is: {}", e);
+                            TileJsonMeta {
+                                tile_url: cfg.tile_source_url.clone(),
+                                tms: false,
+                                min_zoom: None,
+                                max_zoom: None,
+                                scale: 1.0,
+                                detected_encoding: None,
+                            }
+                        }
+                    }
+                } else {
+                    TileJsonMeta {
+                        tile_url: cfg.tile_source_url.clone(),
+                        tms: false,
+                        min_zoom: None,
+                        max_zoom: None,
+                        scale: 1.0,
+                        detected_encoding: None,
+                    }
+                };
+
+                // If TileJSON detected a terrain encoding (e.g. "quantized-mesh-1.0"),
+                // override the encoding in the layer kind so explicit config is not required.
+                let kind = if let (LayerKind::Terrain { ref imagery_layer, .. }, Some(enc)) =
+                    (&cfg.kind, meta.detected_encoding)
+                {
+                    eprintln!(
+                        "[x-planets] Layer '{}': TileJSON auto-detected encoding → {:?}",
+                        cfg.name, enc
+                    );
+                    log::info!(
+                        "  → auto-detected terrain encoding: {:?}",
+                        enc
+                    );
+                    LayerKind::Terrain {
+                        imagery_layer: imagery_layer.clone(),
+                        encoding: enc,
+                    }
+                } else {
+                    cfg.kind.clone()
+                };
+
                 log::info!(
-                    "Creating layer '{}' → {} (max_concurrent={}, max_cached={})",
-                    cfg.name, cfg.tile_source_url,
+                    "Creating layer '{}' → {} (zoom {}-{}, scale={}x, max_concurrent={}, max_cached={})",
+                    cfg.name, meta.tile_url,
+                    meta.min_zoom.unwrap_or(0), meta.max_zoom.unwrap_or(22),
+                    meta.scale,
                     cfg.max_concurrent_loads, cfg.max_cached_tiles,
                 );
+                let source = NativeTileSource::new(&meta.tile_url).with_tms(meta.tms);
                 NativeLayerState {
                     name: cfg.name.clone(),
-                    kind: cfg.kind.clone(),
-                    tile_source: Arc::new(NativeTileSource::new(&cfg.tile_source_url)),
+                    kind,
+                    tile_source: Arc::new(source),
                     tile_textures: TileCache::new(cfg.max_cached_tiles),
                     tile_loader: TileLoader::new(cfg.max_concurrent_loads),
                     pending_coords: HashSet::new(),
                     terrain_data: TileCache::new(cfg.max_cached_tiles),
                     failed_cooldowns: HashMap::new(),
+                    min_zoom: meta.min_zoom.unwrap_or(0),
+                    max_zoom: meta.max_zoom.unwrap_or(22),
+                    tile_scale: meta.scale,
                 }
             })
             .collect();
@@ -757,7 +955,6 @@ impl ApplicationHandler for NativeApp {
                 let camera_center = x_planets_math::geo_to_mercator(&engine.viewport.center);
 
                 // 4a. For each layer: abort stale, enqueue visible tiles, spawn fetch tasks
-                let current_zoom = engine.viewport.tile_zoom();
                 let visible_set: HashSet<TileCoord> = visible.iter().copied().collect();
 
                 for ls in &mut self.layer_states {
@@ -768,15 +965,46 @@ impl ApplicationHandler for NativeApp {
                     // with fresh priorities.
                     ls.tile_loader.clear();
 
-                    // Prune pending_coords for tiles at distant zoom levels.
-                    // These are truly in-flight (task spawned), so freeing their
-                    // concurrency slot lets current-view tiles load faster.
+                    // Build the "needed" set: visible tiles + uncached ancestors
+                    // that serve as fallback coverage.  Only abort in-flight
+                    // tiles NOT in this set.  This prevents the old zoom_diff
+                    // heuristic from killing ancestor tiles spawned by
+                    // parent-first loading (which caused infinite re-spawn loops).
+                    //
+                    // For over-zoomed tiles (z > max_zoom), the max_zoom ancestor
+                    // is the deepest tile we can fetch, so include it in the needed set.
+                    let mut needed_coords: HashSet<TileCoord> = visible_set.clone();
+                    for &coord in &visible {
+                        // If tile exceeds max_zoom, start the ancestor chain
+                        // from the corresponding tile AT max_zoom.
+                        let start = if coord.z > ls.max_zoom {
+                            let dz = coord.z - ls.max_zoom;
+                            let clamped = TileCoord::new(
+                                ls.max_zoom,
+                                coord.x >> dz,
+                                coord.y >> dz,
+                            );
+                            needed_coords.insert(clamped);
+                            clamped.parent()
+                        } else {
+                            coord.parent()
+                        };
+                        let mut cur = start;
+                        while let Some(p) = cur {
+                            if ls.tile_textures.contains(&p) {
+                                // Cached ancestor found — it and everything
+                                // above it are already available.
+                                needed_coords.insert(p);
+                                break;
+                            }
+                            needed_coords.insert(p);
+                            cur = p.parent();
+                        }
+                    }
+
                     let stale_coords: Vec<TileCoord> = ls.pending_coords
                         .iter()
-                        .filter(|c| {
-                            let zoom_diff = (c.z as i32 - current_zoom as i32).unsigned_abs();
-                            zoom_diff > 1 && !visible_set.contains(c)
-                        })
+                        .filter(|c| !needed_coords.contains(c))
                         .copied()
                         .collect();
                     for coord in stale_coords {
@@ -787,25 +1015,123 @@ impl ApplicationHandler for NativeApp {
                     // GC expired cooldowns (once per frame is cheap).
                     ls.failed_cooldowns.retain(|_, expire| now < *expire);
 
+                    // ── Parent-first loading ──
+                    // For each visible tile missing a cached ancestor, enqueue
+                    // the NEAREST uncached ancestor (one level at a time).
+                    // Once that ancestor loads, next frame discovers the next
+                    // one.  This avoids flooding the queue with deep ancestor
+                    // chains (z=0..z=14) that block visible tile loading.
+                    //
+                    // Ancestors share a reserved portion of concurrency:
+                    //   2 out of max_concurrent slots.  The rest go to
+                    //   visible tiles so current-view loading isn't starved.
+                    {
+                        let max_ancestor_slots = 2usize;
+                        let ancestor_in_flight = ls.pending_coords
+                            .iter()
+                            .filter(|c| !visible_set.contains(c))
+                            .count();
+
+                        if ancestor_in_flight < max_ancestor_slots {
+                            let mut ancestor_enqueued: HashSet<TileCoord> = HashSet::new();
+                            let mut budget = max_ancestor_slots - ancestor_in_flight;
+                            for &coord in &visible {
+                                if budget == 0 { break; }
+                                // Start from the closest fetchable ancestor
+                                // (skip children beyond max_zoom).
+                                let start = if coord.z > ls.max_zoom {
+                                    let dz = coord.z - ls.max_zoom;
+                                    // The max_zoom tile covering this visible tile
+                                    // might itself be needed — enqueue it as a
+                                    // visible-priority tile, not just an ancestor.
+                                    let clamped = TileCoord::new(
+                                        ls.max_zoom,
+                                        coord.x >> dz,
+                                        coord.y >> dz,
+                                    );
+                                    Some(clamped)
+                                } else {
+                                    coord.parent()
+                                };
+                                let mut cur = start;
+                                while let Some(p) = cur {
+                                    if p.z < ls.min_zoom { break; }
+                                    if ls.tile_textures.contains(&p) {
+                                        break; // ancestor cached, chain OK
+                                    }
+                                    if !ls.pending_coords.contains(&p)
+                                        && !ls.failed_cooldowns.contains_key(&p)
+                                        && ancestor_enqueued.insert(p)
+                                        && !visible_set.contains(&p)
+                                    {
+                                        // Enqueue the nearest uncached ancestor.
+                                        // Priority: slightly better than the
+                                        // worst visible tile so it loads soon
+                                        // but doesn't starve visible tiles.
+                                        let p_center = p.mercator_center();
+                                        let p_dist = (p_center - camera_center)
+                                            .length() as f32;
+                                        ls.tile_loader.enqueue(TileRequest {
+                                            coord: p,
+                                            priority: p_dist * 0.8,
+                                        });
+                                        budget = budget.saturating_sub(1);
+                                        break; // only nearest ancestor per visible tile
+                                    }
+                                    cur = p.parent();
+                                }
+                            }
+                        }
+                    }
+
                     // Enqueue visible tiles that are not yet loaded or in-flight.
                     // Priority: distance from camera × fallback penalty.
                     // Tiles with no/distant fallback texture are prioritized
                     // (lower value = higher priority in the min-heap).
+                    //
+                    // Zoom clamping: tiles beyond `max_zoom` are never requested.
+                    // The fallback system renders them with parent tiles at `max_zoom`.
+                    // Tiles below `min_zoom` are also skipped (rare edge case).
+                    //
+                    // Over-zoom: for visible tiles at z > max_zoom, we enqueue the
+                    // corresponding tile at max_zoom so the fallback system can use
+                    // it.  Multiple over-zoomed children may map to the SAME max_zoom
+                    // tile, so we deduplicate.
+                    let mut overzoom_enqueued: HashSet<TileCoord> = HashSet::new();
                     for &coord in &visible {
-                        if ls.tile_textures.contains(&coord)
-                            || ls.pending_coords.contains(&coord)
-                            || ls.failed_cooldowns.contains_key(&coord)
+                        if coord.z < ls.min_zoom {
+                            continue;
+                        }
+                        // Clamp over-zoomed tiles: enqueue the deepest fetchable tile.
+                        let fetch_coord = if coord.z > ls.max_zoom {
+                            let dz = coord.z - ls.max_zoom;
+                            let clamped = TileCoord::new(
+                                ls.max_zoom,
+                                coord.x >> dz,
+                                coord.y >> dz,
+                            );
+                            if !overzoom_enqueued.insert(clamped) {
+                                continue; // already enqueued this max_zoom tile
+                            }
+                            clamped
+                        } else {
+                            coord
+                        };
+
+                        if ls.tile_textures.contains(&fetch_coord)
+                            || ls.pending_coords.contains(&fetch_coord)
+                            || ls.failed_cooldowns.contains_key(&fetch_coord)
                         {
                             continue;
                         }
-                        let tile_center = coord.mercator_center();
+                        let tile_center = fetch_coord.mercator_center();
                         let dist = (tile_center - camera_center).length() as f32;
 
                         // Fallback depth: how many zoom levels up to the nearest
                         // cached ancestor?  0 = no ancestor at all (blank tile!).
                         let fallback_depth = {
                             let mut depth = 0u32;
-                            let mut cur = coord.parent();
+                            let mut cur = fetch_coord.parent();
                             loop {
                                 match cur {
                                     Some(c) if ls.tile_textures.contains(&c) => {
@@ -834,7 +1160,7 @@ impl ApplicationHandler for NativeApp {
                             _ => 1.0,
                         };
                         ls.tile_loader.enqueue(TileRequest {
-                            coord,
+                            coord: fetch_coord,
                             priority: dist * fallback_factor,
                         });
                         // NOTE: Do NOT insert into pending_coords here!
@@ -857,20 +1183,26 @@ impl ApplicationHandler for NativeApp {
                         if let Some(enc) = terrain_encoding {
                             self.rt.spawn(async move {
                                 let result = match source.fetch(req.coord).await {
-                                    Ok(bytes) => {
-                                        let decoded = match enc {
-                                            TerrainEncoding::MapboxRgb => {
-                                                TerrainRgbDecoder.decode(req.coord, &bytes).await
+                                    Ok(bytes) => match enc {
+                                        TerrainEncoding::MapboxRgb => {
+                                            match TerrainRgbDecoder.decode(req.coord, &bytes).await {
+                                                Ok(d) => Ok(TileResult::Terrain(d)),
+                                                Err(e) => Err((req.coord, e.to_string())),
                                             }
-                                            TerrainEncoding::Terrarium => {
-                                                TerrariumDecoder.decode(req.coord, &bytes).await
-                                            }
-                                        };
-                                        match decoded {
-                                            Ok(decoded) => Ok(TileResult::Terrain(decoded)),
-                                            Err(e) => Err((req.coord, e.to_string())),
                                         }
-                                    }
+                                        TerrainEncoding::Terrarium => {
+                                            match TerrariumDecoder.decode(req.coord, &bytes).await {
+                                                Ok(d) => Ok(TileResult::Terrain(d)),
+                                                Err(e) => Err((req.coord, e.to_string())),
+                                            }
+                                        }
+                                        TerrainEncoding::QuantizedMesh => {
+                                            match x_planets_tiles::parse_quantized_mesh(req.coord, &bytes) {
+                                                Ok(qm) => Ok(TileResult::QuantizedMesh(qm)),
+                                                Err(e) => Err((req.coord, e.to_string())),
+                                            }
+                                        }
+                                    },
                                     Err(e) => Err((req.coord, e.to_string())),
                                 };
                                 let _ = tx.send(LayerTileResult { layer_name, result });
@@ -939,11 +1271,16 @@ impl ApplicationHandler for NativeApp {
                                     decoded.coord.z, decoded.coord.x, decoded.coord.y,
                                     decoded.min_elevation, decoded.max_elevation,
                                 );
-                                self.anim.tile_fade_start.insert(decoded.coord, now);
+                                // Note: we do NOT insert terrain tile_fade_start here.
+                                // Terrain imagery comes from the companion raster layer,
+                                // whose fade_start is recorded when the raster tile loads.
+                                // Inserting here would overwrite the imagery fade_start,
+                                // causing incorrect cross-fade timing.
+
                                 // Store elevation data on CPU for mesh generation
                                 ls.terrain_data.insert(
                                     decoded.coord,
-                                    TerrainTileData {
+                                    TerrainTileData::Heightmap {
                                         elevation: decoded.elevation,
                                         width: decoded.width,
                                         height: decoded.height,
@@ -959,6 +1296,38 @@ impl ApplicationHandler for NativeApp {
                                 );
                                 ls.tile_textures.insert(decoded.coord, tex);
                             }
+                            Ok(TileResult::QuantizedMesh(qm)) => {
+                                if ls.pending_coords.remove(&qm.coord) {
+                                    ls.tile_loader.complete();
+                                }
+                                log::info!(
+                                    "[{}] QM tile loaded: z={} x={} y={} ({} verts, {} tris, h=[{:.0}..{:.0}]m)",
+                                    ls.name,
+                                    qm.coord.z, qm.coord.x, qm.coord.y,
+                                    qm.u.len(),
+                                    qm.indices.len() / 3,
+                                    qm.header.min_height, qm.header.max_height,
+                                );
+                                // Convert raw QM data to pre-built vertices/indices.
+                                // Heights stay in metres; height_scale applied in renderer
+                                // so exaggeration changes work without re-fetching.
+                                let (vertices, indices) =
+                                    x_planets_core::pipeline::build_terrain_mesh_from_qm(
+                                        &qm.coord, &qm,
+                                    );
+                                ls.terrain_data.insert(
+                                    qm.coord,
+                                    TerrainTileData::PrebuiltMesh { vertices, indices },
+                                );
+                                // Placeholder texture (imagery from companion raster layer)
+                                let tex = tex_mgr.create_rgba_texture(
+                                    &gpu.device, &gpu.queue,
+                                    &format!("{}-qm-{}-{}-{}", ls.name,
+                                        qm.coord.z, qm.coord.x, qm.coord.y),
+                                    1, 1, &[128, 128, 128, 255],
+                                );
+                                ls.tile_textures.insert(qm.coord, tex);
+                            }
                             Err((coord, err_msg)) => {
                                 if ls.pending_coords.remove(&coord) {
                                     ls.tile_loader.complete();
@@ -968,6 +1337,12 @@ impl ApplicationHandler for NativeApp {
                                 ls.failed_cooldowns.insert(
                                     coord,
                                     now + std::time::Duration::from_secs(cooldown_secs),
+                                );
+                                // Always print tile failures to stderr so the user can
+                                // see errors even without RUST_LOG=debug.
+                                eprintln!(
+                                    "[x-planets] TILE FAIL [{}] z={} x={} y={} (retry {}s): {}",
+                                    ls.name, coord.z, coord.x, coord.y, cooldown_secs, err_msg,
                                 );
                                 log::warn!(
                                     "[{}] Tile load failed {} (retry in {}s): {}",
@@ -1003,6 +1378,7 @@ impl ApplicationHandler for NativeApp {
                 let engine = self.engine.as_ref().unwrap();
                 let mut render_layers: Vec<RenderLayerData> = Vec::new();
                 let mut terrain_layers: Vec<TerrainLayerData> = Vec::new();
+                let mut terrain_overlay_layers: Vec<TerrainLayerData> = Vec::new();
 
                 // Collect raster layer names that are used as imagery for terrain layers.
                 // These will be skipped in the flat raster render pass — they're already
@@ -1025,11 +1401,8 @@ impl ApplicationHandler for NativeApp {
                                     continue;
                                 }
 
-                                // Resolve fallbacks
                                 let available: HashSet<TileCoord> =
                                     ls.tile_textures.keys().copied().collect();
-                                let renderable =
-                                    x_planets_core::pipeline::resolve_fallbacks(&visible, &available);
 
                                 // Build texture view map
                                 let texture_views: HashMap<TileCoord, &wgpu::TextureView> = ls
@@ -1038,26 +1411,25 @@ impl ApplicationHandler for NativeApp {
                                     .map(|(k, v)| (*k, &v.view))
                                     .collect();
 
-                                // Compute per-tile fade-in opacity overrides.
+                                // ── Cross-fade: identify tiles transitioning parent → child ──
                                 //
-                                // Only fade tiles appearing for the FIRST TIME (no parent
-                                // coverage in the cache).  When a child tile replaces a
-                                // parent fallback we swap at full opacity — the parent was
-                                // already showing that area, so there's no visual gap.
-                                let mut tile_opacity_overrides = HashMap::new();
-                                for rt in &renderable {
-                                    // Only consider tiles using their OWN texture (not fallback)
-                                    if rt.texture_coord != rt.coord {
-                                        continue; // using parent → full opacity, no fade
-                                    }
+                                // During the fade-in period, exclude child tiles from
+                                // the "available" set so resolve_fallbacks picks the
+                                // parent texture as the base.  The child tiles are then
+                                // rendered as a separate overlay layer at fade opacity.
+                                // Alpha blending: output = child×t + parent×(1−t).
+                                let mut available_for_base = available.clone();
+                                let mut crossfade_tiles: Vec<(TileCoord, f32)> = Vec::new();
+
+                                for &coord in &visible {
+                                    if !available.contains(&coord) { continue; }
                                     if let Some(&start) =
-                                        self.anim.tile_fade_start.get(&rt.coord)
+                                        self.anim.tile_fade_start.get(&coord)
                                     {
                                         let elapsed = now.duration_since(start).as_secs_f64();
                                         if elapsed < FADE_DURATION {
-                                            // Check if a parent tile provided prior coverage
-                                            let parent_covered = {
-                                                let mut c = rt.coord.parent();
+                                            let has_parent = {
+                                                let mut c = coord.parent();
                                                 let mut found = false;
                                                 while let Some(p) = c {
                                                     if available.contains(&p) {
@@ -1068,29 +1440,85 @@ impl ApplicationHandler for NativeApp {
                                                 }
                                                 found
                                             };
-                                            if !parent_covered {
-                                                // No parent coverage → fade in from near-zero
-                                                // (min 1/60 avoids zero-opacity frame)
-                                                let t = ((elapsed / FADE_DURATION) as f32)
+                                            if has_parent {
+                                                available_for_base.remove(&coord);
+                                                let fade_t = ((elapsed / FADE_DURATION) as f32)
                                                     .max(1.0 / 60.0)
                                                     .min(1.0);
-                                                tile_opacity_overrides.insert(
-                                                    rt.coord,
-                                                    layer.config.opacity * t,
-                                                );
+                                                crossfade_tiles.push((coord, fade_t));
                                             }
-                                            // Parent covered → full opacity (seamless swap)
                                         }
                                     }
                                 }
 
+                                let renderable =
+                                    x_planets_core::pipeline::resolve_fallbacks(
+                                        &visible, &available_for_base,
+                                    );
+
+                                // Opacity overrides: only for tiles with NO parent
+                                // coverage (first-time appearance, fade from zero).
+                                let mut tile_opacity_overrides = HashMap::new();
+                                for rt in &renderable {
+                                    if rt.texture_coord != rt.coord {
+                                        continue; // using parent fallback → full opacity
+                                    }
+                                    if let Some(&start) =
+                                        self.anim.tile_fade_start.get(&rt.coord)
+                                    {
+                                        let elapsed = now.duration_since(start).as_secs_f64();
+                                        if elapsed < FADE_DURATION {
+                                            // No parent coverage → fade from near-zero
+                                            let t = ((elapsed / FADE_DURATION) as f32)
+                                                .max(1.0 / 60.0)
+                                                .min(1.0);
+                                            tile_opacity_overrides.insert(
+                                                rt.coord,
+                                                layer.config.opacity * t,
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // Base layer: parent fallbacks for crossfading tiles,
+                                // own textures for tiles that finished fading or have
+                                // no parent coverage.
                                 render_layers.push(RenderLayerData {
                                     name: &layer.config.name,
                                     opacity: layer.config.opacity,
                                     tiles: renderable,
-                                    texture_views,
+                                    texture_views: texture_views.clone(),
                                     tile_opacity_overrides,
                                 });
+
+                                // Cross-fade overlay: child tiles fading in over parent.
+                                // Rendered as a separate layer — each layer gets its own
+                                // render pass with cleared depth, so the overlay composites
+                                // correctly via alpha blending.
+                                if !crossfade_tiles.is_empty() {
+                                    let mut overlay_tiles = Vec::new();
+                                    let mut overlay_opacity = HashMap::new();
+                                    for &(coord, fade_t) in &crossfade_tiles {
+                                        overlay_tiles.push(
+                                            x_planets_core::pipeline::RenderableTile {
+                                                coord,
+                                                texture_coord: coord,
+                                                uv_rect: [0.0, 0.0, 1.0, 1.0],
+                                            },
+                                        );
+                                        overlay_opacity.insert(
+                                            coord,
+                                            layer.config.opacity * fade_t,
+                                        );
+                                    }
+                                    render_layers.push(RenderLayerData {
+                                        name: "crossfade-overlay",
+                                        opacity: layer.config.opacity,
+                                        tiles: overlay_tiles,
+                                        texture_views,
+                                        tile_opacity_overrides: overlay_opacity,
+                                    });
+                                }
                             }
                             LayerKind::Tiles3d => {
                                 // 3D Tiles layers are handled separately below.
@@ -1102,14 +1530,16 @@ impl ApplicationHandler for NativeApp {
                                     .iter()
                                     .find(|s| s.name == *imagery_layer);
 
+                                if imagery_ls.is_none() {
+                                    eprintln!(
+                                        "[x-planets] TERRAIN WARN: layer '{}' references imagery_layer '{}' \
+                                         which was not found — terrain cannot render without it.",
+                                        layer.config.name, imagery_layer
+                                    );
+                                }
                                 if let Some(img_ls) = imagery_ls {
-                                    // Available = imagery tiles that are loaded.
-                                    // Elevation will be looked up with parent fallback below.
                                     let available: HashSet<TileCoord> =
                                         img_ls.tile_textures.keys().copied().collect();
-                                    let renderable = x_planets_core::pipeline::resolve_fallbacks(
-                                        &visible, &available,
-                                    );
 
                                     // Imagery texture views from companion layer
                                     let imagery_views: HashMap<TileCoord, &wgpu::TextureView> =
@@ -1119,22 +1549,65 @@ impl ApplicationHandler for NativeApp {
                                             .map(|(k, v)| (*k, &v.view))
                                             .collect();
 
-                                    // Elevation data with parent fallback:
-                                    // If elevation for a tile's exact coord isn't available,
-                                    // walk up to parent coords until we find one.
-                                    // Value = (data, source_coord) so the renderer can compute
-                                    // the correct UV sub-rect for parent-tile sampling.
+                                    // ── Cross-fade for terrain imagery ──
+                                    // Same principle as raster: exclude fading child
+                                    // tiles so the base pass uses parent fallback,
+                                    // then render child as overlay at fade opacity.
+                                    let mut available_for_base = available.clone();
+                                    let mut crossfade_tiles: Vec<(TileCoord, f32)> = Vec::new();
+
+                                    for &coord in &visible {
+                                        if !available.contains(&coord) { continue; }
+                                        if let Some(&start) =
+                                            self.anim.tile_fade_start.get(&coord)
+                                        {
+                                            let elapsed = now.duration_since(start).as_secs_f64();
+                                            if elapsed < FADE_DURATION {
+                                                let has_parent = {
+                                                    let mut c = coord.parent();
+                                                    let mut found = false;
+                                                    while let Some(p) = c {
+                                                        if available.contains(&p) {
+                                                            found = true;
+                                                            break;
+                                                        }
+                                                        c = p.parent();
+                                                    }
+                                                    found
+                                                };
+                                                if has_parent {
+                                                    available_for_base.remove(&coord);
+                                                    let fade_t = ((elapsed / FADE_DURATION) as f32)
+                                                        .max(1.0 / 60.0)
+                                                        .min(1.0);
+                                                    crossfade_tiles.push((coord, fade_t));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let renderable = x_planets_core::pipeline::resolve_fallbacks(
+                                        &visible, &available_for_base,
+                                    );
+
+                                    // Elevation data with parent fallback.
+                                    // Include coords for both base and overlay tiles.
                                     let mut elevation_data: HashMap<TileCoord, (&TerrainTileData, TileCoord)> =
                                         HashMap::new();
                                     let all_needed: HashSet<TileCoord> = renderable
                                         .iter()
                                         .map(|rt| rt.coord)
+                                        .chain(crossfade_tiles.iter().map(|&(c, _)| c))
                                         .collect();
                                     for &coord in &all_needed {
-                                        // Try exact match first, then walk up to parents
                                         let mut c = Some(coord);
                                         while let Some(candidate) = c {
                                             if let Some(data) = ls.terrain_data.peek(&candidate) {
+                                                // Accept any elevation data including parent
+                                                // PrebuiltMesh tiles.  When a parent QM mesh is
+                                                // used for a child coord the renderer generates a
+                                                // flat placeholder so the imagery is visible
+                                                // immediately during the parent-first loading phase.
                                                 elevation_data.insert(coord, (data, candidate));
                                                 break;
                                             }
@@ -1142,19 +1615,69 @@ impl ApplicationHandler for NativeApp {
                                         }
                                     }
 
-                                    // Terrain tiles always render at full layer opacity.
-                                    // No fade-in — parent fallback provides seamless coverage
-                                    // until each child's own texture loads, then instant swap.
-                                    // This eliminates the zero-opacity frame flicker that
-                                    // occurs when a fading child replaces a full-opacity parent.
+                                    // Debug: report terrain pipeline state on every frame
+                                    // so we can diagnose why rendering stops.
+                                    eprintln!(
+                                        "[terrain-pipeline] '{}': \
+                                         img_available={} renderable={} elev_data={} \
+                                         terrain_data_size=? crossfade={}",
+                                        layer.config.name,
+                                        available.len(),
+                                        renderable.len(),
+                                        elevation_data.len(),
+                                        crossfade_tiles.len(),
+                                    );
+
+                                    // Base terrain layer (parent fallback imagery for
+                                    // crossfading tiles, own imagery for stable tiles).
                                     terrain_layers.push(TerrainLayerData {
                                         name: &layer.config.name,
                                         opacity: layer.config.opacity,
                                         tiles: renderable,
-                                        imagery_views,
-                                        elevation_data,
+                                        imagery_views: imagery_views.clone(),
+                                        elevation_data: elevation_data.clone(),
                                         tile_opacity_overrides: HashMap::new(),
                                     });
+
+                                    // Cross-fade overlay: child imagery fading in.
+                                    // Must be rendered in a SEPARATE render_terrain_layered
+                                    // call because the mesh cache shares uniform buffers
+                                    // per coord — a single call would overwrite the base
+                                    // pass uniforms before submission.
+                                    if !crossfade_tiles.is_empty() {
+                                        let overlay_tiles: Vec<_> = crossfade_tiles
+                                            .iter()
+                                            .map(|&(coord, _)| {
+                                                x_planets_core::pipeline::RenderableTile {
+                                                    coord,
+                                                    texture_coord: coord,
+                                                    uv_rect: [0.0, 0.0, 1.0, 1.0],
+                                                }
+                                            })
+                                            .collect();
+                                        let mut overlay_opacity = HashMap::new();
+                                        for &(coord, fade_t) in &crossfade_tiles {
+                                            overlay_opacity.insert(
+                                                coord,
+                                                layer.config.opacity * fade_t,
+                                            );
+                                        }
+                                        let overlay_elev: HashMap<TileCoord, (&TerrainTileData, TileCoord)> =
+                                            crossfade_tiles
+                                                .iter()
+                                                .filter_map(|&(coord, _)| {
+                                                    elevation_data.get(&coord).map(|&v| (coord, v))
+                                                })
+                                                .collect();
+                                        terrain_overlay_layers.push(TerrainLayerData {
+                                            name: "terrain-crossfade",
+                                            opacity: layer.config.opacity,
+                                            tiles: overlay_tiles,
+                                            imagery_views,
+                                            elevation_data: overlay_elev,
+                                            tile_opacity_overrides: overlay_opacity,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -1168,14 +1691,31 @@ impl ApplicationHandler for NativeApp {
                 renderer.render_frame_layered(gpu, &view, &engine.viewport, &render_layers);
 
                 // Render terrain layers (displaced meshes) on top of raster
-                if !terrain_layers.is_empty() {
+                if !terrain_layers.is_empty() || !terrain_overlay_layers.is_empty() {
                     if let Some(terrain_renderer) = &mut self.terrain_renderer {
-                        terrain_renderer.render_terrain_layered(
-                            gpu,
-                            &view,
-                            &engine.viewport,
-                            &terrain_layers,
-                        );
+                        // Base terrain pass: parent fallback imagery for stable coverage.
+                        if !terrain_layers.is_empty() {
+                            terrain_renderer.render_terrain_layered(
+                                gpu,
+                                &view,
+                                &engine.viewport,
+                                &terrain_layers,
+                            );
+                        }
+                        // Cross-fade overlay pass: child imagery fading in.
+                        // Must be a SEPARATE call because the mesh cache has
+                        // one uniform buffer per tile coord — the overlay needs
+                        // different uniform values (child texture + fade opacity)
+                        // for the same coords.  Separate submission ensures the
+                        // base pass uniforms are consumed before being overwritten.
+                        if !terrain_overlay_layers.is_empty() {
+                            terrain_renderer.render_terrain_layered(
+                                gpu,
+                                &view,
+                                &engine.viewport,
+                                &terrain_overlay_layers,
+                            );
+                        }
                     }
                 }
 

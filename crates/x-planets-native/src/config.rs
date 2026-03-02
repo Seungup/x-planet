@@ -20,6 +20,13 @@
 //! kind = "terrain"
 //! imagery_layer = "imagery"
 //! url  = "https://api.maptiler.com/tiles/terrain-rgb-v2/{z}/{x}/{y}.webp?key=${MAPTILER_KEY}"
+//!
+//! # Quantized Mesh terrain (encoding auto-detected from TileJSON `format` field)
+//! [[layers]]
+//! name = "terrain-qm"
+//! kind = "terrain"
+//! imagery_layer = "imagery"
+//! url  = "https://api.maptiler.com/tiles/terrain-quantized-mesh-v2/tiles.json?key=${MAPTILER_KEY}"
 //! ```
 
 use serde::Deserialize;
@@ -94,7 +101,10 @@ pub struct LayerSection {
     // ── Terrain-specific ──
     /// For `kind = "terrain"`: the raster layer whose imagery is draped.
     pub imagery_layer: Option<String>,
-    /// Terrain encoding format: `"mapbox"` (default) or `"terrarium"` (AWS).
+    /// Terrain encoding format: `"mapbox"` (default), `"terrarium"` (AWS), or
+    /// `"quantized-mesh"` (Cesium/MapTiler).  When using a TileJSON URL the
+    /// encoding is **auto-detected** from the `format` field, so this can be
+    /// omitted for QM sources.
     pub terrain_encoding: Option<String>,
 
     // ── 3D Tiles-specific ──
@@ -214,9 +224,11 @@ fn convert_layer(section: LayerSection, index: usize) -> Result<LayerConfig, Str
 
     let encoding = match section.terrain_encoding.as_deref() {
         Some("terrarium") | Some("aws") => x_planets_tiles::TerrainEncoding::Terrarium,
+        Some("quantized-mesh") | Some("qm") | Some("cesium") => x_planets_tiles::TerrainEncoding::QuantizedMesh,
         Some("mapbox") | Some("maptiler") | None => x_planets_tiles::TerrainEncoding::MapboxRgb,
         Some(other) => return Err(format!(
-            "layer \"{}\": unknown terrain_encoding \"{}\" (expected \"mapbox\" or \"terrarium\")",
+            "layer \"{}\": unknown terrain_encoding \"{}\" \
+             (expected \"mapbox\", \"terrarium\", or \"quantized-mesh\")",
             section.name, other
         )),
     };

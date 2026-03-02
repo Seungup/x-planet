@@ -10,8 +10,8 @@ pub enum DecodeError {
     ImageDecode(String),
     #[error("Unsupported format: {0}")]
     UnsupportedFormat(String),
-    #[error("Invalid tile data")]
-    InvalidData,
+    #[error("Invalid tile data: {0}")]
+    InvalidData(String),
 }
 
 /// Trait for decoding raw tile bytes into a usable format.
@@ -153,6 +153,14 @@ pub enum TerrainEncoding {
     /// Tilezen / AWS Terrarium:
     /// `height = (R*256 + G + B/256) - 32768`
     Terrarium,
+    /// Cesium / MapTiler Quantized Mesh 1.0 binary format.
+    ///
+    /// Unlike the heightmap formats above, Quantized Mesh tiles contain
+    /// pre-built triangle meshes with adaptive vertex density.
+    /// The data is decoded by [`crate::quantized_mesh::parse_quantized_mesh`]
+    /// and converted to GPU geometry by `build_terrain_mesh_from_qm` in
+    /// `x-planets-core`.
+    QuantizedMesh,
 }
 
 // ---------------------------------------------------------------------------

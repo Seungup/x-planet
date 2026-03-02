@@ -374,16 +374,20 @@ pub fn build_terrain_mesh(
     }
     edge_strips.push(strip);
 
-    // Top edge (gy=0, left to right)
+    // Top edge (gy=0, right to left)
+    // Reversed traversal: outward normal is -Y, reversing direction
+    // makes the skirt triangles CW when viewed from outside.
     let mut strip = Vec::new();
-    for gx in 0..verts_per_side {
+    for gx in (0..verts_per_side).rev() {
         strip.push(gx as u32);
     }
     edge_strips.push(strip);
 
-    // Right edge (gx=last, top to bottom)
+    // Right edge (gx=last, bottom to top)
+    // Reversed traversal: outward normal is +X, reversing direction
+    // makes the skirt triangles CW when viewed from outside.
     let mut strip = Vec::new();
-    for gy in 0..verts_per_side {
+    for gy in (0..verts_per_side).rev() {
         strip.push((gy * verts_per_side + grid) as u32);
     }
     edge_strips.push(strip);
@@ -476,6 +480,195 @@ fn sample_elevation_bilinear(
 pub fn compute_height_scale(exaggeration: f64) -> f32 {
     const EARTH_CIRCUMFERENCE_M: f64 = 40_075_000.0;
     (exaggeration / EARTH_CIRCUMFERENCE_M) as f32
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Stage 4c: Quantized Mesh → TerrainVertex conversion
+// ───────────────────────────────────────────────────────────────────
+
+/// Convert a decoded Quantized Mesh tile into `TerrainVertex` + index lists.
+///
+/// Heights in the returned vertices are in **metres** (not scaled).
+/// The caller (`TerrainRenderer::get_or_build_mesh`) applies `height_scale`
+/// when uploading to the GPU so that exaggeration changes work without
+/// re-fetching tiles.
+///
+/// ## Coordinate mapping
+/// - `u`: 0-32767 → 0-1 (west → east across tile)
+/// - `v`: 0-32767 → 0-1 QM south-north; **flipped** here so that v_tile = 0 = north
+///   (matches the existing XYZ / web-Mercator orientation used by `build_terrain_mesh`).
+/// - `height`: 0-32767 → [`header.min_height`, `header.max_height`] metres.
+///
+/// ## Normals
+/// If the tile contains an oct-encoded normals extension, those are decoded and used.
+/// Otherwise, per-vertex normals are computed from the mesh geometry (face-normal
+/// accumulation, area-weighted).
+///
+/// ## Skirts
+/// Edge vertex lists (`west_indices`, `south_indices`, `east_indices`, `north_indices`)
+/// are used to generate skirt quads that prevent cracks between adjacent tiles.
+///
+/// Pure function.
+pub fn build_terrain_mesh_from_qm(
+    coord: &TileCoord,
+    qm: &x_planets_tiles::DecodedQuantizedMesh,
+) -> (Vec<TerrainVertex>, Vec<u32>) {
+    use x_planets_tiles::quantized_mesh::decode_oct_normal;
+
+    let n = coord.extent() as f64;
+    let tile_w = (1.0 / n) as f32;
+    let tile_h = tile_w;
+
+    let min_h = qm.header.min_height;
+    let max_h = qm.header.max_height;
+    let h_range = max_h - min_h;
+    let vertex_count = qm.u.len();
+
+    // ── Pass 1: positions + tex_coords ────────────────────────────
+    let mut positions: Vec<[f32; 3]>   = Vec::with_capacity(vertex_count);
+    let mut tex_coords: Vec<[f32; 2]>  = Vec::with_capacity(vertex_count);
+
+    for i in 0..vertex_count {
+        let u_norm = qm.u[i] as f32 / 32767.0;       // 0-1, west→east
+        let v_norm = qm.v[i] as f32 / 32767.0;       // 0-1, south→north (QM convention)
+        let h_norm = qm.height[i] as f32 / 32767.0;
+
+        // QM v=0 is south, v=1 is north.
+        // The existing pipeline uses v=0 at the top (north in XYZ TMS=false tiles).
+        let v_tile = 1.0 - v_norm; // flip to match existing convention
+
+        let height_m = min_h + h_norm * h_range; // metres (not scaled)
+
+        positions.push([
+            (u_norm - 0.5) * tile_w,
+            (v_tile - 0.5) * tile_h,
+            height_m,            // raw metres; height_scale applied in renderer
+        ]);
+        tex_coords.push([u_norm, v_tile]);
+    }
+
+    // ── Pass 2: normals ────────────────────────────────────────────
+    let normals: Vec<[f32; 3]> = if let Some(oct) = &qm.oct_normals {
+        oct.iter()
+            .map(|&[x, y]| decode_oct_normal(x, y))
+            .collect()
+    } else {
+        compute_normals_from_triangles(&positions, &qm.indices)
+    };
+
+    // ── Assemble surface vertices ─────────────────────────────────
+    let mut vertices: Vec<TerrainVertex> = (0..vertex_count)
+        .map(|i| TerrainVertex {
+            position:  positions[i],
+            normal:    normals[i],
+            tex_coord: tex_coords[i],
+        })
+        .collect();
+
+    let mut indices = qm.indices.clone();
+
+    // ── Skirts (edge vertices → downward quads) ───────────────────
+    // Prevents gaps/cracks between adjacent tiles at different detail.
+    let skirt_depth = tile_w * 0.05;
+    let down_normal = [0.0f32, 0.0, -1.0];
+
+    for edge_indices in [
+        &qm.west_indices,
+        &qm.south_indices,
+        &qm.east_indices,
+        &qm.north_indices,
+    ] {
+        let edge_count = edge_indices.len();
+        if edge_count < 2 {
+            continue;
+        }
+        for i in 0..edge_count - 1 {
+            let top_a = edge_indices[i] as usize;
+            let top_b = edge_indices[i + 1] as usize;
+            if top_a >= positions.len() || top_b >= positions.len() {
+                continue;
+            }
+
+            let skirt_a_idx = vertices.len() as u32;
+            let mut pa = positions[top_a];
+            pa[2] -= skirt_depth;
+            vertices.push(TerrainVertex {
+                position:  pa,
+                normal:    down_normal,
+                tex_coord: tex_coords[top_a],
+            });
+
+            let skirt_b_idx = vertices.len() as u32;
+            let mut pb = positions[top_b];
+            pb[2] -= skirt_depth;
+            vertices.push(TerrainVertex {
+                position:  pb,
+                normal:    down_normal,
+                tex_coord: tex_coords[top_b],
+            });
+
+            // CW winding (matches terrain_renderer pipeline: FrontFace::Cw)
+            let ia = edge_indices[i];
+            let ib = edge_indices[i + 1];
+            indices.push(ia);
+            indices.push(skirt_a_idx);
+            indices.push(ib);
+            indices.push(ib);
+            indices.push(skirt_a_idx);
+            indices.push(skirt_b_idx);
+        }
+    }
+
+    (vertices, indices)
+}
+
+/// Compute per-vertex normals from a triangle mesh.
+///
+/// Uses area-weighted face normal accumulation.
+/// Fallback when oct-encoded normals are not available in the QM tile.
+///
+/// Pure function.
+fn compute_normals_from_triangles(
+    positions: &[[f32; 3]],
+    indices: &[u32],
+) -> Vec<[f32; 3]> {
+    let mut normals = vec![[0.0f32, 0.0, 0.0]; positions.len()];
+
+    for tri in indices.chunks(3) {
+        if tri.len() < 3 {
+            continue;
+        }
+        let (ia, ib, ic) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        if ia >= positions.len() || ib >= positions.len() || ic >= positions.len() {
+            continue;
+        }
+        let a = positions[ia];
+        let b = positions[ib];
+        let c = positions[ic];
+
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+
+        // Cross product (magnitude = 2× triangle area → area-weighted)
+        let nx = ab[1] * ac[2] - ab[2] * ac[1];
+        let ny = ab[2] * ac[0] - ab[0] * ac[2];
+        let nz = ab[0] * ac[1] - ab[1] * ac[0];
+
+        for &idx in &[ia, ib, ic] {
+            normals[idx][0] += nx;
+            normals[idx][1] += ny;
+            normals[idx][2] += nz;
+        }
+    }
+
+    for n in &mut normals {
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-10);
+        n[0] /= len;
+        n[1] /= len;
+        n[2] /= len;
+    }
+
+    normals
 }
 
 // ───────────────────────────────────────────────────────────────────

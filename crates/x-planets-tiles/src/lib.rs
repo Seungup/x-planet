@@ -6,6 +6,7 @@
 pub mod cache;
 pub mod decoder;
 pub mod loader;
+pub mod quantized_mesh;
 pub mod tiles3d;
 
 pub use cache::TileCache;
@@ -14,3 +15,4 @@ pub use decoder::{
     TerrariumDecoder, TileDecoder,
 };
 pub use loader::{LoadError, TileLoader, TileRequest, TileSource};
+pub use quantized_mesh::{parse_quantized_mesh, DecodedQuantizedMesh};
