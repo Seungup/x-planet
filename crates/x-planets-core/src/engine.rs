@@ -12,6 +12,29 @@ use x_planets_projection::ProjectionRegistry;
 // Layer types
 // ═══════════════════════════════════════════════════════════════════
 
+/// The kind of tile layer, determining which rendering pipeline to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayerKind {
+    /// Standard raster imagery (PNG/JPEG tiles rendered as flat quads).
+    Raster,
+    /// Terrain elevation (Mapbox Terrain RGB tiles rendered as displaced meshes).
+    /// The `imagery_layer` names the companion raster layer whose textures are
+    /// draped onto the terrain mesh.
+    Terrain {
+        imagery_layer: String,
+    },
+    /// OGC 3D Tiles (glTF/B3DM models in ECEF coordinates).
+    /// Requires `cesium_ion_token` + `cesium_ion_asset_id` or `google_api_key`
+    /// to be set on the [`LayerConfig`].
+    Tiles3d,
+}
+
+impl Default for LayerKind {
+    fn default() -> Self {
+        Self::Raster
+    }
+}
+
 /// Configuration for a single tile layer.
 #[derive(Debug, Clone)]
 pub struct LayerConfig {
@@ -29,6 +52,14 @@ pub struct LayerConfig {
     pub max_cached_tiles: usize,
     /// Per-layer maximum concurrent tile loads.
     pub max_concurrent_loads: usize,
+    /// Layer rendering kind (raster, terrain, etc.).
+    pub kind: LayerKind,
+    /// Cesium Ion account token (for `Tiles3d` layers).
+    pub cesium_ion_token: Option<String>,
+    /// Cesium Ion asset ID (for `Tiles3d` layers, e.g. 96188 = OSM Buildings).
+    pub cesium_ion_asset_id: Option<u64>,
+    /// Google Maps Platform API key (for `Tiles3d` layers).
+    pub google_api_key: Option<String>,
 }
 
 impl Default for LayerConfig {
@@ -41,6 +72,10 @@ impl Default for LayerConfig {
             z_order: 0,
             max_cached_tiles: 256,
             max_concurrent_loads: 6,
+            kind: LayerKind::Raster,
+            cesium_ion_token: None,
+            cesium_ion_asset_id: None,
+            google_api_key: None,
         }
     }
 }
@@ -125,6 +160,8 @@ impl MapEngine {
                     z_order: 0,
                     max_cached_tiles: config.max_cached_tiles,
                     max_concurrent_loads: config.max_concurrent_loads,
+                    kind: LayerKind::Raster,
+                    ..Default::default()
                 },
             }]
         } else {

@@ -228,4 +228,65 @@ mod tests {
         loader.complete();
         assert!(loader.dequeue().is_some()); // Now can dequeue again
     }
+
+    #[test]
+    fn test_tile_loader_clear_preserves_active_count() {
+        let mut loader = TileLoader::new(4);
+
+        // Enqueue 3 tiles and dequeue 2 (now 2 active, 1 in queue)
+        loader.enqueue(TileRequest { coord: TileCoord::new(1, 0, 0), priority: 1.0 });
+        loader.enqueue(TileRequest { coord: TileCoord::new(1, 1, 0), priority: 2.0 });
+        loader.enqueue(TileRequest { coord: TileCoord::new(1, 0, 1), priority: 3.0 });
+        assert!(loader.dequeue().is_some());
+        assert!(loader.dequeue().is_some());
+        assert_eq!(loader.active_count(), 2);
+        assert_eq!(loader.pending_count(), 1);
+
+        // Clear queue: drops pending but active stays
+        loader.clear();
+        assert_eq!(loader.pending_count(), 0);
+        assert_eq!(loader.active_count(), 2);
+
+        // Re-enqueue new tiles — these should be dequeued (2 active + 2 more = 4 max)
+        loader.enqueue(TileRequest { coord: TileCoord::new(5, 10, 10), priority: 0.5 });
+        loader.enqueue(TileRequest { coord: TileCoord::new(5, 11, 10), priority: 0.8 });
+        assert!(loader.dequeue().is_some()); // active=3
+        assert!(loader.dequeue().is_some()); // active=4
+        assert!(loader.dequeue().is_none()); // at max
+        assert_eq!(loader.active_count(), 4);
+
+        // Complete old tasks → free slots
+        loader.complete();
+        loader.complete();
+        assert_eq!(loader.active_count(), 2);
+    }
+
+    #[test]
+    fn test_tile_loader_abort_and_requeue() {
+        // Simulate: user zooms from z=3 to z=5, stale z=3 tiles should be dropped
+        let mut loader = TileLoader::new(2);
+
+        // Frame 1: enqueue z=3 tiles
+        loader.enqueue(TileRequest { coord: TileCoord::new(3, 1, 1), priority: 1.0 });
+        loader.enqueue(TileRequest { coord: TileCoord::new(3, 2, 1), priority: 2.0 });
+        let req1 = loader.dequeue().unwrap(); // z=3 tile in-flight
+        assert_eq!(req1.coord.z, 3);
+        assert_eq!(loader.active_count(), 1);
+
+        // Frame 2: user zooms to z=5, clear queue and re-enqueue
+        loader.clear(); // drops the remaining z=3 tile in queue
+        loader.enqueue(TileRequest { coord: TileCoord::new(5, 10, 10), priority: 0.5 });
+        loader.enqueue(TileRequest { coord: TileCoord::new(5, 11, 10), priority: 0.8 });
+
+        // Should dequeue z=5 tile (higher priority, current view)
+        let req2 = loader.dequeue().unwrap();
+        assert_eq!(req2.coord.z, 5);
+        assert_eq!(loader.active_count(), 2); // z=3 in-flight + z=5 in-flight
+        assert!(loader.dequeue().is_none()); // at max concurrent
+
+        // z=3 task completes → free slot
+        loader.complete();
+        let req3 = loader.dequeue().unwrap();
+        assert_eq!(req3.coord.z, 5); // now the second z=5 tile
+    }
 }

@@ -1,36 +1,56 @@
-//! GPU tile renderer using raster_tile.wgsl.
+//! GPU terrain renderer using terrain_tile.wgsl.
 //!
-//! Karpathy step: "One pipeline, one draw call per tile, correct on screen."
+//! Renders terrain tiles as displaced 3D meshes (17×17 vertex grid per tile).
+//! Each tile's vertices are displaced by elevation data on the CPU, then
+//! rendered with the imagery texture draped on top.
 //!
-//! This renderer:
-//! - Creates the render pipeline from raster_tile.wgsl
-//! - Manages viewport uniform buffer (group 0)
-//! - Creates per-tile bind groups (group 1: uniforms + texture + sampler)
-//! - Batches tile quads into a single vertex/index buffer
-//!
-//! What it does NOT do (yet):
-//! - Texture atlas (each tile gets its own bind group)
-//! - GPU-side projection (uses CPU view_proj matrix)
-//! - LOD / placeholder tiles
+//! Uses the same bind group layouts as `TileRenderer` (viewport + tile uniforms
+//! + texture + sampler) so the shaders share a uniform interface.
 
 use x_planets_gpu::GpuContext;
 use x_planets_math::{TileCoord, ViewportUniforms};
 
-use crate::pipeline::{build_tile_mesh, tile_uniforms_with_uv, RenderableTile};
-use crate::render::{RenderLayerData, TileVertex};
+use crate::pipeline::{build_terrain_mesh, compute_height_scale, tile_uniforms_with_uv, RenderableTile};
+use crate::render::TerrainVertex;
 use crate::viewport::Viewport;
 use std::collections::HashMap;
 
-const RASTER_TILE_SHADER: &str = include_str!("../../../shaders/rendering/raster_tile.wgsl");
+const TERRAIN_TILE_SHADER: &str = include_str!("../../../shaders/rendering/terrain_tile.wgsl");
 
-/// A tile prepared for rendering (owns its GPU resources).
-pub struct PreparedTile {
-    _buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+/// CPU-side elevation data for a terrain tile.
+pub struct TerrainTileData {
+    pub elevation: Vec<f32>,
+    pub width: u32,
+    pub height: u32,
 }
 
-/// Renders raster tiles to the screen.
-pub struct TileRenderer {
+/// Per-layer terrain data assembled each frame for rendering.
+pub struct TerrainLayerData<'a> {
+    /// Layer name (for debug labels).
+    pub name: &'a str,
+    /// Layer opacity (0.0–1.0).
+    pub opacity: f32,
+    /// Tiles to render (with fallback resolution).
+    pub tiles: Vec<RenderableTile>,
+    /// Imagery texture views (draped onto the terrain mesh).
+    pub imagery_views: HashMap<TileCoord, &'a wgpu::TextureView>,
+    /// Elevation data per tile (used to build displaced mesh on CPU).
+    pub elevation_data: HashMap<TileCoord, &'a TerrainTileData>,
+    /// Per-tile opacity overrides (for fade-in animation).
+    pub tile_opacity_overrides: HashMap<TileCoord, f32>,
+}
+
+/// A terrain tile prepared for rendering (owns its GPU resources).
+struct PreparedTerrainTile {
+    _uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+}
+
+/// Renders terrain tiles with 3D displaced meshes.
+pub struct TerrainRenderer {
     pipeline: wgpu::RenderPipeline,
     _viewport_bgl: wgpu::BindGroupLayout,
     tile_bgl: wgpu::BindGroupLayout,
@@ -41,22 +61,24 @@ pub struct TileRenderer {
     depth_format: wgpu::TextureFormat,
     surface_width: u32,
     surface_height: u32,
+    /// Elevation exaggeration factor (default: 1.5 for visual effect).
+    pub exaggeration: f64,
 }
 
-impl TileRenderer {
-    /// Create a new tile renderer.
+impl TerrainRenderer {
+    /// Create a new terrain renderer.
     ///
     /// Requires a GpuContext with a surface (panics if headless).
     pub fn new(gpu: &GpuContext) -> Self {
         let format = gpu
             .surface_format()
-            .expect("TileRenderer requires a surface");
+            .expect("TerrainRenderer requires a surface");
 
         // ── Bind group layout 0: viewport uniforms ──
         let _viewport_bgl =
             gpu.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("viewport-bgl"),
+                    label: Some("terrain-viewport-bgl"),
                     entries: &[wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::VERTEX,
@@ -73,7 +95,7 @@ impl TileRenderer {
         let tile_bgl =
             gpu.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("tile-bgl"),
+                    label: Some("terrain-tile-bgl"),
                     entries: &[
                         wgpu::BindGroupLayoutEntry {
                             binding: 0,
@@ -113,14 +135,14 @@ impl TileRenderer {
         let shader = gpu
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("raster-tile-shader"),
-                source: wgpu::ShaderSource::Wgsl(RASTER_TILE_SHADER.into()),
+                label: Some("terrain-tile-shader"),
+                source: wgpu::ShaderSource::Wgsl(TERRAIN_TILE_SHADER.into()),
             });
 
         let pipeline_layout =
             gpu.device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("raster-tile-layout"),
+                    label: Some("terrain-tile-layout"),
                     bind_group_layouts: &[&_viewport_bgl, &tile_bgl],
                     push_constant_ranges: &[],
                 });
@@ -128,12 +150,12 @@ impl TileRenderer {
         let pipeline =
             gpu.device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("raster-tile-pipeline"),
+                    label: Some("terrain-tile-pipeline"),
                     layout: Some(&pipeline_layout),
                     vertex: wgpu::VertexState {
                         module: &shader,
                         entry_point: Some("vs_main"),
-                        buffers: &[TileVertex::layout()],
+                        buffers: &[TerrainVertex::layout()],
                         compilation_options: Default::default(),
                     },
                     fragment: Some(wgpu::FragmentState {
@@ -146,7 +168,10 @@ impl TileRenderer {
                         })],
                         compilation_options: Default::default(),
                     }),
-                    primitive: wgpu::PrimitiveState::default(),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        ..Default::default()
+                    },
                     depth_stencil: Some(wgpu::DepthStencilState {
                         format: wgpu::TextureFormat::Depth32Float,
                         depth_write_enabled: true,
@@ -159,17 +184,17 @@ impl TileRenderer {
                     cache: None,
                 });
 
-        // ── Viewport uniform buffer (updated per frame) ──
+        // ── Viewport uniform buffer ──
         let viewport_uniforms = ViewportUniforms {
             view_proj: [0.0; 16],
             resolution: [0.0; 4],
             camera: [0.0; 4],
         };
         let viewport_buffer =
-            gpu.create_uniform_buffer("viewport-uniforms", &viewport_uniforms);
+            gpu.create_uniform_buffer("terrain-viewport-uniforms", &viewport_uniforms);
 
         let viewport_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("viewport-bg"),
+            label: Some("terrain-viewport-bg"),
             layout: &_viewport_bgl,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -179,7 +204,7 @@ impl TileRenderer {
 
         // ── Sampler ──
         let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("tile-sampler"),
+            label: Some("terrain-tile-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
@@ -194,9 +219,14 @@ impl TileRenderer {
             .map(|s| (s.config.width, s.config.height))
             .unwrap_or((800, 600));
         let depth_format = wgpu::TextureFormat::Depth32Float;
-        let depth_view = Self::create_depth_texture(&gpu.device, surface_width, surface_height, depth_format);
+        let depth_view =
+            Self::create_depth_texture(&gpu.device, surface_width, surface_height, depth_format);
 
-        log::info!("TileRenderer created (format: {:?}, depth: {:?})", format, depth_format);
+        log::info!(
+            "TerrainRenderer created (format: {:?}, depth: {:?})",
+            format,
+            depth_format
+        );
 
         Self {
             pipeline,
@@ -209,6 +239,7 @@ impl TileRenderer {
             depth_format,
             surface_width,
             surface_height,
+            exaggeration: 1.5,
         }
     }
 
@@ -220,7 +251,7 @@ impl TileRenderer {
         format: wgpu::TextureFormat,
     ) -> wgpu::TextureView {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("depth-texture"),
+            label: Some("terrain-depth-texture"),
             size: wgpu::Extent3d {
                 width: width.max(1),
                 height: height.max(1),
@@ -241,11 +272,12 @@ impl TileRenderer {
         if width != self.surface_width || height != self.surface_height {
             self.surface_width = width;
             self.surface_height = height;
-            self.depth_view = Self::create_depth_texture(device, width, height, self.depth_format);
+            self.depth_view =
+                Self::create_depth_texture(device, width, height, self.depth_format);
         }
     }
 
-    /// Prepare a tile for rendering: create uniform buffer + bind group.
+    /// Prepare a single terrain tile: build displaced mesh + create bind group.
     fn prepare_tile(
         &self,
         gpu: &GpuContext,
@@ -253,17 +285,38 @@ impl TileRenderer {
         texture_view: &wgpu::TextureView,
         opacity: f32,
         uv_rect: [f32; 4],
-    ) -> PreparedTile {
+        elevation: &TerrainTileData,
+    ) -> PreparedTerrainTile {
+        let height_scale = compute_height_scale(self.exaggeration);
+
+        // Build displaced mesh from elevation data
+        let (vertices, indices) = build_terrain_mesh(
+            coord,
+            &elevation.elevation,
+            elevation.width,
+            elevation.height,
+            height_scale,
+        );
+
+        let vertex_buffer = gpu.create_vertex_buffer(
+            &format!("terrain-verts-{}-{}-{}", coord.z, coord.x, coord.y),
+            &vertices,
+        );
+        let index_buffer = gpu.create_index_buffer(
+            &format!("terrain-idx-{}-{}-{}", coord.z, coord.x, coord.y),
+            &indices,
+        );
+
         let uniforms = tile_uniforms_with_uv(coord, opacity, uv_rect);
-        let buffer = gpu.create_uniform_buffer("tile-uniforms", &uniforms);
+        let uniform_buffer = gpu.create_uniform_buffer("terrain-tile-uniforms", &uniforms);
 
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("tile-bg"),
+            label: Some("terrain-tile-bg"),
             layout: &self.tile_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -276,52 +329,31 @@ impl TileRenderer {
             ],
         });
 
-        PreparedTile {
-            _buffer: buffer,
+        PreparedTerrainTile {
+            _uniform_buffer: uniform_buffer,
             bind_group,
+            vertex_buffer,
+            index_buffer,
+            index_count: indices.len() as u32,
         }
     }
 
-    /// Render a single layer of tiles (backward-compatible convenience wrapper).
+    /// Render terrain layers to the target surface.
     ///
-    /// `tiles` — renderable tiles (with fallback resolution).
-    /// `texture_views` — map from TileCoord → GPU TextureView.
-    pub fn render_frame(
+    /// Terrain layers use `LoadOp::Load` for color (preserves raster layers already drawn)
+    /// and `LoadOp::Load` for depth (shares depth with raster layers for proper occlusion).
+    pub fn render_terrain_layered(
         &self,
         gpu: &GpuContext,
         target: &wgpu::TextureView,
         viewport: &Viewport,
-        tiles: &[RenderableTile],
-        texture_views: &HashMap<TileCoord, &wgpu::TextureView>,
-    ) {
-        let single = RenderLayerData {
-            name: "base",
-            opacity: 1.0,
-            tiles: tiles.to_vec(),
-            texture_views: texture_views.clone(),
-            tile_opacity_overrides: HashMap::new(),
-        };
-        self.render_frame_layered(gpu, target, viewport, &[single]);
-    }
-
-    /// Render multiple layers to the target surface.
-    ///
-    /// Layers are drawn bottom-to-top (the caller should pass them in z-order).
-    /// Each layer gets its own render pass:
-    /// - First layer: `Clear` color + depth
-    /// - Subsequent layers: `Load` color + `Clear` depth (avoids cross-layer z-fighting)
-    pub fn render_frame_layered(
-        &self,
-        gpu: &GpuContext,
-        target: &wgpu::TextureView,
-        viewport: &Viewport,
-        layers: &[RenderLayerData],
+        layers: &[TerrainLayerData],
     ) {
         if layers.is_empty() {
             return;
         }
 
-        // 1. Update viewport uniforms (shared across all layers)
+        // Update viewport uniforms
         let uniforms = viewport.to_uniforms();
         gpu.update_buffer(&self.viewport_buffer, &uniforms);
 
@@ -329,97 +361,43 @@ impl TileRenderer {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        for (layer_idx, layer) in layers.iter().enumerate() {
-            if layer.tiles.is_empty() {
-                // Still need the first layer to clear, even if empty
-                if layer_idx == 0 {
-                    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("tile-clear-pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: target,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: 0.08, g: 0.12, b: 0.18, a: 1.0,
-                                }),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                            view: &self.depth_view,
-                            depth_ops: Some(wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(1.0),
-                                store: wgpu::StoreOp::Discard,
-                            }),
-                            stencil_ops: None,
-                        }),
-                        ..Default::default()
-                    });
-                    // pass drops → ends
-                }
-                continue;
-            }
-
-            // 2. Build batched vertex/index mesh for this layer
-            let coords: Vec<TileCoord> = layer.tiles.iter().map(|t| t.coord).collect();
-            let (vertices, indices) = build_tile_mesh(&coords);
-
-            if vertices.is_empty() {
-                continue;
-            }
-
-            let vertex_buffer = gpu.create_vertex_buffer(
-                &format!("tile-vertices-{}", layer.name),
-                &vertices,
-            );
-            let index_buffer = gpu.create_index_buffer(
-                &format!("tile-indices-{}", layer.name),
-                &indices,
-            );
-
-            // 3. Prepare per-tile bind groups (per-tile opacity override or layer opacity)
-            let prepared: Vec<PreparedTile> = layer
+        for layer in layers {
+            // Prepare tiles that have both imagery textures and elevation data
+            let prepared: Vec<PreparedTerrainTile> = layer
                 .tiles
                 .iter()
                 .filter_map(|rt| {
-                    layer.texture_views.get(&rt.texture_coord).map(|tex_view| {
-                        let tile_opacity = layer
-                            .tile_opacity_overrides
-                            .get(&rt.coord)
-                            .copied()
-                            .unwrap_or(layer.opacity);
-                        self.prepare_tile(gpu, &rt.coord, tex_view, tile_opacity, rt.uv_rect)
-                    })
+                    let tex_view = layer.imagery_views.get(&rt.texture_coord)?;
+                    let elev = layer.elevation_data.get(&rt.coord)?;
+                    let tile_opacity = layer
+                        .tile_opacity_overrides
+                        .get(&rt.coord)
+                        .copied()
+                        .unwrap_or(layer.opacity);
+                    Some(self.prepare_tile(gpu, &rt.coord, tex_view, tile_opacity, rt.uv_rect, elev))
                 })
                 .collect();
 
-            // 4. Encode render pass for this layer
-            let is_first = layer_idx == 0;
-            let color_load = if is_first {
-                wgpu::LoadOp::Clear(wgpu::Color {
-                    r: 0.08, g: 0.12, b: 0.18, a: 1.0,
-                })
-            } else {
-                wgpu::LoadOp::Load
-            };
-            // Always clear depth per layer to avoid cross-layer z-fighting
-            let depth_load = wgpu::LoadOp::Clear(1.0);
+            if prepared.is_empty() {
+                continue;
+            }
 
+            // Render pass: Load color (preserve raster), Load depth (share depth buffer)
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("tile-render-pass"),
+                    label: Some("terrain-render-pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: target,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: color_load,
+                            load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &self.depth_view,
                         depth_ops: Some(wgpu::Operations {
-                            load: depth_load,
+                            load: wgpu::LoadOp::Clear(1.0),
                             store: wgpu::StoreOp::Discard,
                         }),
                         stencil_ops: None,
@@ -429,18 +407,16 @@ impl TileRenderer {
 
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.viewport_bg, &[]);
-                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-                for (i, tile) in prepared.iter().enumerate() {
+                for tile in &prepared {
                     pass.set_bind_group(1, &tile.bind_group, &[]);
-                    let start = (i * 6) as u32;
-                    pass.draw_indexed(start..start + 6, 0, 0..1);
+                    pass.set_vertex_buffer(0, tile.vertex_buffer.slice(..));
+                    pass.set_index_buffer(tile.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..tile.index_count, 0, 0..1);
                 }
             }
         }
 
-        // 5. Submit all passes at once
         gpu.queue.submit(std::iter::once(encoder.finish()));
     }
 }

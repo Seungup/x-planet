@@ -9,6 +9,7 @@ description = "Core map engine: rendering pipeline, viewport, and tile layer man
 x-planets-math = { workspace = true }
 x-planets-gpu = { workspace = true }
 x-planets-projection = { workspace = true }
+x-planets-tiles = { workspace = true }
 wgpu = { workspace = true }
 glam = { workspace = true }
 bytemuck = { workspace = true }

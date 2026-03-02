@@ -203,6 +203,237 @@ pub fn resolve_fallbacks(
 }
 
 // ───────────────────────────────────────────────────────────────────
+// Stage 4b: Terrain mesh generation
+// ───────────────────────────────────────────────────────────────────
+
+use crate::render::TerrainVertex;
+
+/// Terrain mesh grid resolution (vertices per axis = GRID_SIZE + 1).
+/// 32 → 33×33 = 1089 verts, 2048 triangles per tile.
+pub const TERRAIN_GRID_SIZE: u32 = 32;
+
+/// Build a displaced terrain mesh for a single tile.
+///
+/// Generates a `(TERRAIN_GRID_SIZE+1)²` vertex grid with per-vertex normals
+/// for hillshade lighting.  Vertex Z is sampled from `elevation` via bilinear
+/// interpolation and scaled by `height_scale`.
+///
+/// Pure function.
+pub fn build_terrain_mesh(
+    coord: &TileCoord,
+    elevation: &[f32],
+    src_width: u32,
+    src_height: u32,
+    height_scale: f32,
+) -> (Vec<TerrainVertex>, Vec<u32>) {
+    let grid = TERRAIN_GRID_SIZE;
+    let verts_per_side = grid + 1;
+    let vert_count = (verts_per_side * verts_per_side) as usize;
+    let mut indices = Vec::with_capacity((grid * grid * 6) as usize);
+
+    // Use f64 for tile bounds to avoid precision loss at high zoom,
+    // then store vertex positions *relative to tile center* in f32.
+    let n = coord.extent() as f64;
+    let tile_size_f64 = 1.0 / n;
+    let tile_w = tile_size_f64 as f32;
+    let tile_h = tile_w; // square tiles
+
+    // ── Pass 1: Sample elevation at grid points ──
+    // Positions are RELATIVE TO TILE CENTER for f32 precision.
+    // The shader reconstructs world position using tile.bounds.
+    let mut positions = Vec::with_capacity(vert_count);
+    let mut tex_coords = Vec::with_capacity(vert_count);
+
+    for gy in 0..verts_per_side {
+        for gx in 0..verts_per_side {
+            let u = gx as f32 / grid as f32;
+            let v = gy as f32 / grid as f32;
+
+            let h = sample_elevation_bilinear(elevation, src_width, src_height, u, v);
+
+            // Relative to tile center: (u - 0.5) * tile_w, (v - 0.5) * tile_h
+            positions.push([(u - 0.5) * tile_w, (v - 0.5) * tile_h, h * height_scale]);
+            tex_coords.push([u, v]);
+        }
+    }
+
+    // ── Pass 2: Compute per-vertex normals from neighboring positions ──
+    let mut normals = vec![[0.0f32, 0.0, 1.0]; vert_count];
+    let vs = verts_per_side as usize;
+
+    for gy in 0..vs {
+        for gx in 0..vs {
+            let idx = gy * vs + gx;
+            let p = positions[idx];
+
+            // Finite-difference neighbors (clamped at edges)
+            let left = if gx > 0 { positions[idx - 1] } else { p };
+            let right = if gx + 1 < vs { positions[idx + 1] } else { p };
+            let up = if gy > 0 { positions[idx - vs] } else { p };
+            let down = if gy + 1 < vs { positions[idx + vs] } else { p };
+
+            // Tangent vectors
+            let dx = [right[0] - left[0], right[1] - left[1], right[2] - left[2]];
+            let dy = [down[0] - up[0], down[1] - up[1], down[2] - up[2]];
+
+            // Cross product (dx × dy) → surface normal
+            let nx = dx[1] * dy[2] - dx[2] * dy[1];
+            let ny = dx[2] * dy[0] - dx[0] * dy[2];
+            let nz = dx[0] * dy[1] - dx[1] * dy[0];
+
+            let len = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-10);
+            normals[idx] = [nx / len, ny / len, nz / len];
+        }
+    }
+
+    // ── Assemble surface vertices ──
+    let mut vertices: Vec<TerrainVertex> = (0..vert_count)
+        .map(|i| TerrainVertex {
+            position: positions[i],
+            normal: normals[i],
+            tex_coord: tex_coords[i],
+        })
+        .collect();
+
+    // ── Generate surface triangle indices ──
+    for gy in 0..grid {
+        for gx in 0..grid {
+            let tl = gy * verts_per_side + gx;
+            let tr = tl + 1;
+            let bl = tl + verts_per_side;
+            let br = bl + 1;
+
+            indices.push(tl);
+            indices.push(tr);
+            indices.push(bl);
+            indices.push(bl);
+            indices.push(tr);
+            indices.push(br);
+        }
+    }
+
+    // ── Skirt geometry ──
+    // Extend vertical "walls" below each edge to hide gaps between tiles.
+    let skirt_depth = tile_w * 0.05; // 5% of tile width
+    let down_normal = [0.0f32, 0.0, -1.0];
+
+    // Collect edge vertex indices: bottom, top, right, left edges
+    let mut edge_strips: Vec<Vec<u32>> = Vec::new();
+
+    // Bottom edge (gy=last, left to right)
+    let mut strip = Vec::new();
+    for gx in 0..verts_per_side {
+        strip.push((grid * verts_per_side + gx) as u32);
+    }
+    edge_strips.push(strip);
+
+    // Top edge (gy=0, left to right)
+    let mut strip = Vec::new();
+    for gx in 0..verts_per_side {
+        strip.push(gx as u32);
+    }
+    edge_strips.push(strip);
+
+    // Right edge (gx=last, top to bottom)
+    let mut strip = Vec::new();
+    for gy in 0..verts_per_side {
+        strip.push((gy * verts_per_side + grid) as u32);
+    }
+    edge_strips.push(strip);
+
+    // Left edge (gx=0, top to bottom)
+    let mut strip = Vec::new();
+    for gy in 0..verts_per_side {
+        strip.push((gy * verts_per_side) as u32);
+    }
+    edge_strips.push(strip);
+
+    for edge in &edge_strips {
+        for i in 0..edge.len() - 1 {
+            let top_a = edge[i] as usize;
+            let top_b = edge[i + 1] as usize;
+
+            // Add two skirt vertices (same xy, lowered z)
+            let skirt_a = vertices.len() as u32;
+            let mut pa = positions[top_a];
+            pa[2] -= skirt_depth;
+            vertices.push(TerrainVertex {
+                position: pa,
+                normal: down_normal,
+                tex_coord: tex_coords[top_a],
+            });
+
+            let skirt_b = vertices.len() as u32;
+            let mut pb = positions[top_b];
+            pb[2] -= skirt_depth;
+            vertices.push(TerrainVertex {
+                position: pb,
+                normal: down_normal,
+                tex_coord: tex_coords[top_b],
+            });
+
+            // Two triangles: top_a, top_b, skirt_a  +  skirt_a, top_b, skirt_b
+            indices.push(edge[i]);
+            indices.push(edge[i + 1]);
+            indices.push(skirt_a);
+            indices.push(skirt_a);
+            indices.push(edge[i + 1]);
+            indices.push(skirt_b);
+        }
+    }
+
+    (vertices, indices)
+}
+
+/// Bilinear sample from elevation grid.
+fn sample_elevation_bilinear(
+    elevation: &[f32],
+    src_width: u32,
+    src_height: u32,
+    u: f32,
+    v: f32,
+) -> f32 {
+    let sx = u * (src_width - 1) as f32;
+    let sy = v * (src_height - 1) as f32;
+    let ix = (sx as u32).min(src_width.saturating_sub(2));
+    let iy = (sy as u32).min(src_height.saturating_sub(2));
+    let fx = sx - ix as f32;
+    let fy = sy - iy as f32;
+
+    let idx00 = (iy * src_width + ix) as usize;
+    let idx10 = idx00 + 1;
+    let idx01 = idx00 + src_width as usize;
+    let idx11 = idx01 + 1;
+
+    if idx11 < elevation.len() {
+        elevation[idx00] * (1.0 - fx) * (1.0 - fy)
+            + elevation[idx10] * fx * (1.0 - fy)
+            + elevation[idx01] * (1.0 - fx) * fy
+            + elevation[idx11] * fx * fy
+    } else if !elevation.is_empty() {
+        elevation[idx00.min(elevation.len() - 1)]
+    } else {
+        0.0
+    }
+}
+
+/// Compute height scale: converts meters of elevation to Mercator [0,1] world units.
+///
+/// `exaggeration` controls visual amplification (1.0 = real scale, 2.0 = 2× taller).
+/// At the equator, 1 Mercator unit ≈ 40,075,000 m.
+///
+/// A base exaggeration of 1.0 would produce realistic proportions but
+/// the heights are nearly invisible at global zoom levels.  We apply a
+/// pragmatic multiplier (×5) so that `exaggeration = 1.5` gives ~7.5×
+/// real scale — gentle, natural-looking terrain relief.
+///
+/// Pure function.
+pub fn compute_height_scale(exaggeration: f64) -> f32 {
+    const EARTH_CIRCUMFERENCE_M: f64 = 40_075_000.0;
+    (exaggeration / EARTH_CIRCUMFERENCE_M) as f32
+}
+
+// ───────────────────────────────────────────────────────────────────
 // Stage 5: Projection transform (CPU reference)
 // ───────────────────────────────────────────────────────────────────
 
@@ -665,6 +896,83 @@ mod tests {
         let available = HashSet::new();
         let result = resolve_fallbacks(&visible, &available);
         assert!(result.is_empty());
+    }
+
+    // ── Helpers ────────────────────────────────────────────────
+
+    // ── Terrain mesh tests ──────────────────────────────────────
+
+    #[test]
+    fn test_build_terrain_mesh_dimensions() {
+        let coord = TileCoord::new(2, 1, 1);
+        let elevation = vec![0.0f32; 256 * 256];
+        let (verts, indices) = build_terrain_mesh(&coord, &elevation, 256, 256, 1e-5);
+        let g = TERRAIN_GRID_SIZE;
+        let surface_verts = (g + 1) * (g + 1);
+        // Skirt adds 2 vertices per edge segment × 4 edges × g segments
+        let skirt_verts = 4 * g * 2;
+        assert!(
+            verts.len() == (surface_verts + skirt_verts) as usize,
+            "expected {} verts ({}+{}), got {}",
+            surface_verts + skirt_verts, surface_verts, skirt_verts, verts.len()
+        );
+        // Surface indices + skirt indices
+        let surface_indices = g * g * 6;
+        let skirt_indices = 4 * g * 6;
+        assert!(
+            indices.len() == (surface_indices + skirt_indices) as usize,
+            "expected {} indices, got {}",
+            surface_indices + skirt_indices, indices.len()
+        );
+    }
+
+    #[test]
+    fn test_build_terrain_mesh_flat_has_zero_z() {
+        let coord = TileCoord::new(0, 0, 0);
+        let elevation = vec![0.0f32; 4]; // minimal 2×2
+        let (verts, _) = build_terrain_mesh(&coord, &elevation, 2, 2, 1e-5);
+        let g = TERRAIN_GRID_SIZE;
+        let surface_count = ((g + 1) * (g + 1)) as usize;
+        // Check surface vertices only (skirt verts have negative z)
+        for v in &verts[..surface_count] {
+            assert!(
+                v.position[2].abs() < 1e-10,
+                "flat terrain should have z≈0, got {}",
+                v.position[2]
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_terrain_mesh_elevated() {
+        let coord = TileCoord::new(0, 0, 0);
+        let elevation = vec![1000.0f32; 4]; // 1000m everywhere
+        let scale = 1e-5;
+        let (verts, _) = build_terrain_mesh(&coord, &elevation, 2, 2, scale);
+        let g = TERRAIN_GRID_SIZE;
+        let surface_count = ((g + 1) * (g + 1)) as usize;
+        let expected_z = 1000.0 * scale;
+        // Check surface vertices only
+        for v in &verts[..surface_count] {
+            assert!(
+                (v.position[2] - expected_z).abs() < 1e-6,
+                "expected z={}, got {}",
+                expected_z,
+                v.position[2]
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_height_scale() {
+        let scale = compute_height_scale(1.0);
+        // With VISUAL_BOOST=5: scale = 1 / 40_075_000
+        let expected = (1.0 / 40_075_000.0_f64) as f32;
+        assert!((scale - expected).abs() < 1e-12);
+
+        // Linearity: 2× exaggeration → 2× scale
+        let scale_2x = compute_height_scale(2.0);
+        assert!((scale_2x - 2.0 * scale).abs() < 1e-12);
     }
 
     // ── Helpers ────────────────────────────────────────────────

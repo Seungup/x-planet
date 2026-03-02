@@ -1,0 +1,50 @@
+# x-planets configuration
+#
+# String values support ${ENV_VAR} substitution.
+# Layers with missing env vars are silently skipped,
+# so you can leave all providers here and only set the
+# env vars for the ones you actually have keys for.
+
+[map]
+center = [37.5665, 126.9780]   # Seoul
+zoom   = 5.0
+
+# ── Base imagery ──────────────────────────────────────────────────
+# OpenStreetMap (no key required)
+[[layers]]
+name = "imagery"
+kind = "raster"
+url  = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+
+# ── 3D Terrain (pick one) ────────────────────────────────────────
+# MapTiler  — set MAPTILER_KEY
+[[layers]]
+name          = "terrain"
+kind          = "terrain"
+imagery_layer = "imagery"
+url           = "https://api.maptiler.com/tiles/terrain-rgb-v2/{z}/{x}/{y}.webp?key=${MAPTILER_KEY}"
+z_order       = 10
+
+# Mapbox  — set MAPBOX_TOKEN
+# [[layers]]
+# name          = "terrain"
+# kind          = "terrain"
+# imagery_layer = "imagery"
+# url           = "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}@2x.pngraw?access_token=${MAPBOX_TOKEN}"
+# z_order       = 10
+
+# ── OGC 3D Tiles (uncomment what you need) ───────────────────────
+# Cesium Ion OSM Buildings  — set CESIUM_ION_TOKEN
+# [[layers]]
+# name             = "cesium-3dtiles"
+# kind             = "3dtiles"
+# cesium_ion_token = "${CESIUM_ION_TOKEN}"
+# cesium_ion_asset = 96188
+# z_order          = 20
+
+# Google Photorealistic 3D Tiles  — set GOOGLE_3DTILES_KEY
+# [[layers]]
+# name           = "google-3dtiles"
+# kind           = "3dtiles"
+# google_api_key = "${GOOGLE_3DTILES_KEY}"
+# z_order        = 20

@@ -1,9 +1,11 @@
 //! x-planets-math: Geospatial math utilities for the x-planets rendering engine.
 //!
 //! Provides geographic coordinate types, tile coordinate systems,
-//! bounding box calculations, and projection-related math primitives.
+//! bounding box calculations, ECEF coordinate transforms, and projection-related math primitives.
 
-pub use glam::{DVec2, DVec3, Mat4, Vec2, Vec3, Vec4};
+pub mod ecef;
+
+pub use glam::{DMat3, DMat4, DVec2, DVec3, Mat4, Vec2, Vec3, Vec4};
 
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};

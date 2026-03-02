@@ -8,3 +8,4 @@ Cargo.lock
 /pkg
 /web_viewer/dist
 .claude/
+.env

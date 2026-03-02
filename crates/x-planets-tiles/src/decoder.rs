@@ -139,6 +139,57 @@ pub struct DecodedTerrainTile {
     pub max_elevation: f32,
 }
 
+// ---------------------------------------------------------------------------
+// Terrain RGB Decoder (Mapbox Terrain RGB → elevation)
+// ---------------------------------------------------------------------------
+
+/// Decodes Mapbox Terrain RGB tiles into elevation data.
+///
+/// Height formula: `height = -10000 + ((R * 256 * 256 + G * 256 + B) * 0.1)`
+///
+/// Data source: `https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}@2x.pngraw?access_token=TOKEN`
+pub struct TerrainRgbDecoder;
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+impl TileDecoder for TerrainRgbDecoder {
+    type Output = DecodedTerrainTile;
+
+    async fn decode(&self, coord: TileCoord, data: &[u8]) -> Result<Self::Output, DecodeError> {
+        let img = image::load_from_memory(data)
+            .map_err(|e| DecodeError::ImageDecode(e.to_string()))?;
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+
+        let mut elevation = Vec::with_capacity((width * height) as usize);
+        let mut min_elev = f32::MAX;
+        let mut max_elev = f32::MIN;
+
+        for pixel in rgba.pixels() {
+            let r = pixel[0] as f32;
+            let g = pixel[1] as f32;
+            let b = pixel[2] as f32;
+            let h = -10000.0 + (r * 256.0 * 256.0 + g * 256.0 + b) * 0.1;
+            min_elev = min_elev.min(h);
+            max_elev = max_elev.max(h);
+            elevation.push(h);
+        }
+
+        Ok(DecodedTerrainTile {
+            coord,
+            width,
+            height,
+            elevation,
+            min_elevation: min_elev,
+            max_elevation: max_elev,
+        })
+    }
+
+    fn extension(&self) -> &str {
+        "pngraw"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
