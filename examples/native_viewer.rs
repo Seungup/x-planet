@@ -18,6 +18,7 @@ fn main() {
         center: GeoCoord::new(37.5665, 126.9780), // Seoul
         zoom: 5.0,
         projection: "Web Mercator".to_string(),
+        tile_source_url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png".to_string(),
         max_concurrent_loads: 8,
         max_cached_tiles: 512,
     };
@@ -35,9 +36,6 @@ fn main() {
                 .unwrap_or_default()
         })
     );
-
-    // Update to determine visible tiles
-    engine.update();
 
     let visible = engine.viewport.visible_tiles();
     log::info!(
@@ -58,7 +56,6 @@ fn main() {
     // Test pan and zoom
     engine.pan(100.0, 50.0);
     engine.zoom(1.0);
-    engine.update();
 
     let visible_after = engine.viewport.visible_tiles();
     log::info!(
@@ -74,8 +71,12 @@ fn main() {
         log::info!("Switched to Equirectangular projection");
     }
 
-    log::info!("Pending tile loads: {}", engine.tile_loader.pending_count());
-    log::info!("Cached tiles: {}", engine.tile_cache.len());
+    log::info!("Layers: {}", engine.layer_count());
+    for layer in &engine.layers {
+        log::info!("  Layer '{}' (z={}, opacity={}, visible={})",
+            layer.config.name, layer.config.z_order,
+            layer.config.opacity, layer.config.visible);
+    }
 
     log::info!("Native viewer demo complete.");
     log::info!("Full winit event loop integration coming in Phase 2.");

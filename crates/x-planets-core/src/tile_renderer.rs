@@ -17,7 +17,7 @@ use x_planets_gpu::GpuContext;
 use x_planets_math::{TileCoord, ViewportUniforms};
 
 use crate::pipeline::{build_tile_mesh, tile_uniforms_with_uv, RenderableTile};
-use crate::render::TileVertex;
+use crate::render::{RenderLayerData, TileVertex};
 use crate::viewport::Viewport;
 use std::collections::HashMap;
 
@@ -282,7 +282,7 @@ impl TileRenderer {
         }
     }
 
-    /// Render visible tiles to the target surface.
+    /// Render a single layer of tiles (backward-compatible convenience wrapper).
     ///
     /// `tiles` — renderable tiles (with fallback resolution).
     /// `texture_views` — map from TileCoord → GPU TextureView.
@@ -294,77 +294,147 @@ impl TileRenderer {
         tiles: &[RenderableTile],
         texture_views: &HashMap<TileCoord, &wgpu::TextureView>,
     ) {
-        // 1. Update viewport uniforms
-        let uniforms = viewport.to_uniforms();
-        gpu.update_buffer(&self.viewport_buffer, &uniforms);
+        let single = RenderLayerData {
+            name: "base",
+            opacity: 1.0,
+            tiles: tiles.to_vec(),
+            texture_views: texture_views.clone(),
+        };
+        self.render_frame_layered(gpu, target, viewport, &[single]);
+    }
 
-        // 2. Build batched vertex/index mesh for all tiles
-        let coords: Vec<TileCoord> = tiles.iter().map(|t| t.coord).collect();
-        let (vertices, indices) = build_tile_mesh(&coords);
-
-        if vertices.is_empty() {
+    /// Render multiple layers to the target surface.
+    ///
+    /// Layers are drawn bottom-to-top (the caller should pass them in z-order).
+    /// Each layer gets its own render pass:
+    /// - First layer: `Clear` color + depth
+    /// - Subsequent layers: `Load` color + `Clear` depth (avoids cross-layer z-fighting)
+    pub fn render_frame_layered(
+        &self,
+        gpu: &GpuContext,
+        target: &wgpu::TextureView,
+        viewport: &Viewport,
+        layers: &[RenderLayerData],
+    ) {
+        if layers.is_empty() {
             return;
         }
 
-        let vertex_buffer = gpu.create_vertex_buffer("tile-vertices", &vertices);
-        let index_buffer = gpu.create_index_buffer("tile-indices", &indices);
+        // 1. Update viewport uniforms (shared across all layers)
+        let uniforms = viewport.to_uniforms();
+        gpu.update_buffer(&self.viewport_buffer, &uniforms);
 
-        // 3. Prepare per-tile bind groups (using texture_coord for texture lookup)
-        let prepared: Vec<PreparedTile> = tiles
-            .iter()
-            .filter_map(|rt| {
-                texture_views
-                    .get(&rt.texture_coord)
-                    .map(|tex_view| self.prepare_tile(gpu, &rt.coord, tex_view, 1.0, rt.uv_rect))
-            })
-            .collect();
-
-        // 4. Encode render commands
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("tile-render-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.08,
-                            g: 0.12,
-                            b: 0.18,
-                            a: 1.0,
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            if layer.tiles.is_empty() {
+                // Still need the first layer to clear, even if empty
+                if layer_idx == 0 {
+                    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("tile-clear-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.08, g: 0.12, b: 0.18, a: 1.0,
+                                }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(1.0),
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
                         }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
+                        ..Default::default()
+                    });
+                    // pass drops → ends
+                }
+                continue;
+            }
+
+            // 2. Build batched vertex/index mesh for this layer
+            let coords: Vec<TileCoord> = layer.tiles.iter().map(|t| t.coord).collect();
+            let (vertices, indices) = build_tile_mesh(&coords);
+
+            if vertices.is_empty() {
+                continue;
+            }
+
+            let vertex_buffer = gpu.create_vertex_buffer(
+                &format!("tile-vertices-{}", layer.name),
+                &vertices,
+            );
+            let index_buffer = gpu.create_index_buffer(
+                &format!("tile-indices-{}", layer.name),
+                &indices,
+            );
+
+            // 3. Prepare per-tile bind groups (layer opacity × tile opacity)
+            let prepared: Vec<PreparedTile> = layer
+                .tiles
+                .iter()
+                .filter_map(|rt| {
+                    layer.texture_views.get(&rt.texture_coord).map(|tex_view| {
+                        self.prepare_tile(gpu, &rt.coord, tex_view, layer.opacity, rt.uv_rect)
+                    })
+                })
+                .collect();
+
+            // 4. Encode render pass for this layer
+            let is_first = layer_idx == 0;
+            let color_load = if is_first {
+                wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.08, g: 0.12, b: 0.18, a: 1.0,
+                })
+            } else {
+                wgpu::LoadOp::Load
+            };
+            // Always clear depth per layer to avoid cross-layer z-fighting
+            let depth_load = wgpu::LoadOp::Clear(1.0);
+
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("tile-render-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: color_load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: depth_load,
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
                     }),
-                    stencil_ops: None,
-                }),
-                ..Default::default()
-            });
+                    ..Default::default()
+                });
 
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.viewport_bg, &[]);
-            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.viewport_bg, &[]);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-            // Draw each tile with its own bind group (group 1)
-            for (i, tile) in prepared.iter().enumerate() {
-                pass.set_bind_group(1, &tile.bind_group, &[]);
-                let start = (i * 6) as u32;
-                pass.draw_indexed(start..start + 6, 0, 0..1);
+                for (i, tile) in prepared.iter().enumerate() {
+                    pass.set_bind_group(1, &tile.bind_group, &[]);
+                    let start = (i * 6) as u32;
+                    pass.draw_indexed(start..start + 6, 0, 0..1);
+                }
             }
         }
 
-        // 5. Submit
+        // 5. Submit all passes at once
         gpu.queue.submit(std::iter::once(encoder.finish()));
     }
 }

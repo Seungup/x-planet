@@ -13,7 +13,8 @@ pub mod tile_renderer;
 pub mod verify_chain;
 pub mod viewport;
 
-pub use engine::MapEngine;
+pub use engine::{LayerConfig, MapEngine, TileLayer};
 pub use pipeline::FrameSummary;
+pub use render::RenderLayerData;
 pub use tile_renderer::TileRenderer;
 pub use viewport::{CameraController, Viewport};

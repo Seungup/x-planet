@@ -22,8 +22,23 @@ pub enum LoadError {
 ///
 /// Implement this trait to provide tile data from different backends
 /// (HTTP, local files, IndexedDB, etc.)
+///
+/// On native platforms the trait requires `Send + Sync` for multi-threaded use.
+/// On wasm32 it is single-threaded so these bounds are relaxed.
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 pub trait TileSource: Send + Sync {
+    /// Fetch raw tile bytes for a given coordinate.
+    async fn fetch(&self, coord: TileCoord) -> Result<Vec<u8>, LoadError>;
+
+    /// Build the URL/path for a tile coordinate.
+    fn tile_url(&self, coord: &TileCoord) -> String;
+}
+
+/// Tile data source abstraction (wasm32 — single-threaded, no Send/Sync).
+#[cfg(target_arch = "wasm32")]
+#[async_trait(?Send)]
+pub trait TileSource {
     /// Fetch raw tile bytes for a given coordinate.
     async fn fetch(&self, coord: TileCoord) -> Result<Vec<u8>, LoadError>;
 

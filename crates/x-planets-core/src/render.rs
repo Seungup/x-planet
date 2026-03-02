@@ -1,6 +1,30 @@
 //! Render pipeline for tile layers.
 
+use std::collections::HashMap;
+
 use x_planets_math::TileCoord;
+
+use crate::pipeline::RenderableTile;
+
+// ═══════════════════════════════════════════════════════════════════
+// Per-frame render data (passed to TileRenderer per layer)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Per-layer data assembled each frame and handed to `TileRenderer::render_frame_layered`.
+pub struct RenderLayerData<'a> {
+    /// Layer name (for debug labels).
+    pub name: &'a str,
+    /// Layer opacity (0.0–1.0).
+    pub opacity: f32,
+    /// Tiles with fallback resolution.
+    pub tiles: Vec<RenderableTile>,
+    /// Map from TileCoord → GPU TextureView (both own + fallback textures).
+    pub texture_views: HashMap<TileCoord, &'a wgpu::TextureView>,
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Legacy layer types (step07 example compat)
+// ═══════════════════════════════════════════════════════════════════
 
 /// Describes a tile ready to be rendered.
 pub struct RenderTile {

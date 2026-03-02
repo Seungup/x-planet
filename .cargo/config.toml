@@ -1,0 +1,4 @@
+# Limit parallel compilation to avoid OOM on release builds.
+# System has 16 logical cores; cap at 8 to leave headroom.
+[build]
+jobs = 8

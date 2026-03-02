@@ -15,9 +15,26 @@ pub enum DecodeError {
 }
 
 /// Trait for decoding raw tile bytes into a usable format.
+///
+/// On native: requires `Send + Sync` for multi-threaded decoding.
+/// On wasm32: single-threaded, no Send/Sync required.
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 pub trait TileDecoder: Send + Sync {
     type Output: Send + Sync;
+
+    /// Decode raw bytes into the tile's output format.
+    async fn decode(&self, coord: TileCoord, data: &[u8]) -> Result<Self::Output, DecodeError>;
+
+    /// File extension this decoder handles.
+    fn extension(&self) -> &str;
+}
+
+/// Trait for decoding raw tile bytes (wasm32 — single-threaded).
+#[cfg(target_arch = "wasm32")]
+#[async_trait(?Send)]
+pub trait TileDecoder {
+    type Output;
 
     /// Decode raw bytes into the tile's output format.
     async fn decode(&self, coord: TileCoord, data: &[u8]) -> Result<Self::Output, DecodeError>;
@@ -56,7 +73,8 @@ impl Default for RasterTileDecoder {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl TileDecoder for RasterTileDecoder {
     type Output = DecodedRasterTile;
 

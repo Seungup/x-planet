@@ -5,6 +5,8 @@
 //!
 //! Phase 1.2: TileRenderer + MapEngine + keyboard/mouse pan/zoom/pitch/rotate.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,11 +18,29 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 use x_planets_core::engine::MapConfig;
+use x_planets_core::render::RenderLayerData;
 use x_planets_core::{MapEngine, TileRenderer};
 use x_planets_gpu::{GpuContext, GpuTexture, TextureManager};
 use x_planets_math::TileCoord;
-use x_planets_tiles::{TileCache, TileSource};
-use std::collections::HashMap;
+use x_planets_tiles::{
+    DecodedRasterTile, RasterTileDecoder, TileCache, TileDecoder, TileLoader, TileRequest,
+    TileSource,
+};
+
+/// Result from a layer tile fetch+decode, tagged with the layer name.
+struct LayerTileResult {
+    layer_name: String,
+    result: Result<DecodedRasterTile, (TileCoord, String)>,
+}
+
+/// Per-layer GPU state: tile source, texture cache, loader, pending set.
+struct NativeLayerState {
+    name: String,
+    tile_source: Arc<NativeTileSource>,
+    tile_textures: TileCache<GpuTexture>,
+    tile_loader: TileLoader,
+    pending_coords: HashSet<TileCoord>,
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // Tile Source
@@ -108,6 +128,14 @@ pub fn run_native(config: MapConfig) -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     log::info!("Starting x-planets native viewer...");
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+
+    let (tile_tx, tile_rx) = mpsc::channel();
+
     let event_loop = EventLoop::new()?;
     let mut app = NativeApp {
         config,
@@ -116,7 +144,13 @@ pub fn run_native(config: MapConfig) -> Result<(), Box<dyn std::error::Error>> {
         engine: None,
         renderer: None,
         tex_manager: None,
-        tile_textures: TileCache::new(256),
+        // Per-layer GPU state (created in `resumed`)
+        layer_states: Vec::new(),
+        // Shared async tile channel
+        rt,
+        tile_tx,
+        tile_rx,
+        // Mouse state
         mouse_pressed: false,
         last_mouse_pos: None,
         right_mouse_pressed: false,
@@ -136,7 +170,12 @@ struct NativeApp {
     engine: Option<MapEngine>,
     renderer: Option<TileRenderer>,
     tex_manager: Option<TextureManager>,
-    tile_textures: TileCache<GpuTexture>,
+    /// Per-layer tile source, texture cache, loader, pending set.
+    layer_states: Vec<NativeLayerState>,
+    // Shared async tile channel (results tagged with layer name)
+    rt: tokio::runtime::Runtime,
+    tile_tx: mpsc::Sender<LayerTileResult>,
+    tile_rx: mpsc::Receiver<LayerTileResult>,
     // Left-click drag: pan
     mouse_pressed: bool,
     last_mouse_pos: Option<(f64, f64)>,
@@ -182,8 +221,30 @@ impl ApplicationHandler for NativeApp {
         let config = std::mem::take(&mut self.config);
         let engine = MapEngine::new(config, size.width, size.height);
 
+        // ── Per-layer GPU state ──
+        self.layer_states = engine
+            .layers
+            .iter()
+            .map(|layer| {
+                let cfg = &layer.config;
+                log::info!(
+                    "Creating layer '{}' → {} (max_concurrent={}, max_cached={})",
+                    cfg.name, cfg.tile_source_url,
+                    cfg.max_concurrent_loads, cfg.max_cached_tiles,
+                );
+                NativeLayerState {
+                    name: cfg.name.clone(),
+                    tile_source: Arc::new(NativeTileSource::new(&cfg.tile_source_url)),
+                    tile_textures: TileCache::new(cfg.max_cached_tiles),
+                    tile_loader: TileLoader::new(cfg.max_concurrent_loads),
+                    pending_coords: HashSet::new(),
+                }
+            })
+            .collect();
+
         log::info!(
-            "Engine ready: center=({:.2},{:.2}) zoom={:.1}",
+            "Engine ready: {} layers, center=({:.2},{:.2}) zoom={:.1}",
+            engine.layers.len(),
             engine.viewport.center.lat,
             engine.viewport.center.lon,
             engine.viewport.zoom,
@@ -368,60 +429,119 @@ impl ApplicationHandler for NativeApp {
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
 
-                // ── Tile texture management ──
+                // ── Per-layer async tile loading pipeline ──
                 let visible = engine.viewport.visible_tiles();
+                let camera_center = x_planets_math::geo_to_mercator(&engine.viewport.center);
 
-                // Create at most N new textures per frame to avoid stalls.
-                // TileCache handles LRU eviction automatically on insert.
-                const MAX_TEX_PER_FRAME: usize = 16;
-                let mut created = 0;
-                for &coord in &visible {
-                    if created >= MAX_TEX_PER_FRAME {
-                        break;
+                // 1. For each layer: enqueue missing tiles & spawn fetch tasks
+                for ls in &mut self.layer_states {
+                    // Enqueue
+                    for &coord in &visible {
+                        if ls.tile_textures.contains(&coord) || ls.pending_coords.contains(&coord) {
+                            continue;
+                        }
+                        let tile_center = coord.mercator_center();
+                        let dist = (tile_center - camera_center).length() as f32;
+                        ls.tile_loader.enqueue(TileRequest { coord, priority: dist });
+                        ls.pending_coords.insert(coord);
                     }
-                    if !self.tile_textures.contains(&coord) {
-                        let pixels = x_planets_gpu::test_utils::tile_label_rgba(
-                            256, 256,
-                            coord.z as u32, coord.x, coord.y,
-                        );
-                        let tex = tex_mgr.create_rgba_texture(
-                            &gpu.device, &gpu.queue,
-                            &format!("tile-{}-{}-{}", coord.z, coord.x, coord.y),
-                            256, 256, &pixels,
-                        );
-                        self.tile_textures.insert(coord, tex);
-                        created += 1;
+
+                    // Dequeue & spawn
+                    while let Some(req) = ls.tile_loader.dequeue() {
+                        let source = Arc::clone(&ls.tile_source);
+                        let tx = self.tile_tx.clone();
+                        let layer_name = ls.name.clone();
+                        self.rt.spawn(async move {
+                            let result = match source.fetch(req.coord).await {
+                                Ok(bytes) => {
+                                    let decoder = RasterTileDecoder::default();
+                                    match decoder.decode(req.coord, &bytes).await {
+                                        Ok(decoded) => Ok(decoded),
+                                        Err(e) => Err((req.coord, e.to_string())),
+                                    }
+                                }
+                                Err(e) => Err((req.coord, e.to_string())),
+                            };
+                            let _ = tx.send(LayerTileResult { layer_name, result });
+                        });
                     }
                 }
 
-                // Touch visible tiles so they stay in cache (LRU bump).
-                for &coord in &visible {
-                    let _ = self.tile_textures.get(&coord);
+                // 2. Poll completed tiles & create GPU textures (dispatched by layer name)
+                while let Ok(msg) = self.tile_rx.try_recv() {
+                    if let Some(ls) = self.layer_states.iter_mut().find(|s| s.name == msg.layer_name) {
+                        ls.tile_loader.complete();
+                        match msg.result {
+                            Ok(decoded) => {
+                                log::debug!(
+                                    "[{}] Tile loaded: z={} x={} y={} ({}×{})",
+                                    ls.name,
+                                    decoded.coord.z, decoded.coord.x, decoded.coord.y,
+                                    decoded.width, decoded.height,
+                                );
+                                ls.pending_coords.remove(&decoded.coord);
+                                let tex = tex_mgr.create_rgba_texture(
+                                    &gpu.device, &gpu.queue,
+                                    &format!("{}-tile-{}-{}-{}", ls.name,
+                                        decoded.coord.z, decoded.coord.x, decoded.coord.y),
+                                    decoded.width, decoded.height, &decoded.pixels,
+                                );
+                                ls.tile_textures.insert(decoded.coord, tex);
+                            }
+                            Err((coord, err_msg)) => {
+                                log::warn!("[{}] Tile load failed {}: {}", ls.name, coord, err_msg);
+                                ls.pending_coords.remove(&coord);
+                            }
+                        }
+                    }
                 }
 
-                // Resolve fallbacks: every visible tile gets SOME texture
-                // (its own or nearest ancestor's, with UV sub-rect).
-                let available: std::collections::HashSet<TileCoord> =
-                    self.tile_textures.keys().copied().collect();
-                let renderable = x_planets_core::pipeline::resolve_fallbacks(&visible, &available);
+                // 3a. LRU bump all layers (mutable pass)
+                for ls in &mut self.layer_states {
+                    for &coord in &visible {
+                        let _ = ls.tile_textures.get(&coord);
+                    }
+                }
 
-                // Build texture view map (peek: read-only, no LRU update).
-                let texture_views: HashMap<TileCoord, &wgpu::TextureView> = self
-                    .tile_textures
-                    .iter()
-                    .map(|(k, v)| (*k, &v.view))
-                    .collect();
-
+                // 3b. Build RenderLayerData for each visible layer (immutable pass)
                 let engine = self.engine.as_ref().unwrap();
+                let mut render_layers: Vec<RenderLayerData> = Vec::new();
+
+                for layer in engine.visible_layers() {
+                    if let Some(ls) = self.layer_states.iter().find(|s| s.name == layer.config.name) {
+                        // Resolve fallbacks
+                        let available: HashSet<TileCoord> =
+                            ls.tile_textures.keys().copied().collect();
+                        let renderable = x_planets_core::pipeline::resolve_fallbacks(&visible, &available);
+
+                        // Build texture view map
+                        let texture_views: HashMap<TileCoord, &wgpu::TextureView> = ls
+                            .tile_textures
+                            .iter()
+                            .map(|(k, v)| (*k, &v.view))
+                            .collect();
+
+                        render_layers.push(RenderLayerData {
+                            name: &layer.config.name,
+                            opacity: layer.config.opacity,
+                            tiles: renderable,
+                            texture_views,
+                        });
+                    }
+                }
+
                 let renderer = self.renderer.as_ref().unwrap();
                 let gpu = self.gpu.as_ref().unwrap();
 
-                renderer.render_frame(gpu, &view, &engine.viewport, &renderable, &texture_views);
+                renderer.render_frame_layered(gpu, &view, &engine.viewport, &render_layers);
                 frame.present();
 
-                // Only request redraw when textures are still loading.
-                let all_ready = visible.iter().all(|c| self.tile_textures.contains(c));
-                if !all_ready {
+                // Request redraw when any layer is still loading.
+                let any_pending = self.layer_states.iter().any(|ls| {
+                    !ls.pending_coords.is_empty()
+                        || visible.iter().any(|c| !ls.tile_textures.contains(c))
+                });
+                if any_pending {
                     self.window.as_ref().unwrap().request_redraw();
                 }
             }
