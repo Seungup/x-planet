@@ -70,6 +70,7 @@ impl UrlTileSource {
 }
 
 impl UrlTileSource {
+    #[cfg(test)]
     fn build_url(&self, coord: &TileCoord) -> String {
         let y = if self.tms {
             (1 << coord.z) - 1 - coord.y
@@ -133,6 +134,11 @@ impl TileLoader {
         }
     }
 
+    /// Returns the maximum number of concurrent tile loads.
+    pub fn max_concurrent(&self) -> usize {
+        self.max_concurrent
+    }
+
     /// Enqueue a tile request.
     pub fn enqueue(&mut self, request: TileRequest) {
         self.queue.push(request);
@@ -143,9 +149,8 @@ impl TileLoader {
         if self.active_count >= self.max_concurrent {
             return None;
         }
-        self.queue.pop().map(|req| {
+        self.queue.pop().inspect(|_req| {
             self.active_count += 1;
-            req
         })
     }
 

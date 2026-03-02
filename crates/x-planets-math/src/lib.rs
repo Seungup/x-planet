@@ -144,6 +144,17 @@ impl TileCoord {
         DVec2::new((self.x + 1) as f64 / n, (self.y + 1) as f64 / n)
     }
 
+    /// Clamp this tile to `max_zoom` by computing its ancestor at that zoom level.
+    ///
+    /// Returns `self` unchanged if already at or below `max_zoom`.
+    pub fn clamp_to_zoom(&self, max_zoom: u8) -> Self {
+        if self.z <= max_zoom {
+            return *self;
+        }
+        let dz = self.z - max_zoom;
+        Self::new(max_zoom, self.x >> dz, self.y >> dz)
+    }
+
     /// Create a TileCoord from a geographic position and zoom level (Web Mercator).
     pub fn from_geo(coord: &GeoCoord, zoom: u8) -> Self {
         let n = (1u32 << zoom) as f64;

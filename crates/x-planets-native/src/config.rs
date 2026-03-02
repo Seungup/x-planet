@@ -56,6 +56,11 @@ pub struct MapSection {
     pub zoom: f64,
     #[serde(default = "default_projection")]
     pub projection: String,
+    /// Terrain height exaggeration factor.
+    /// Higher values make mountains more prominent.
+    /// Default: 20.0 (good for z=5–12 in Mercator view).
+    #[serde(default = "default_terrain_exaggeration")]
+    pub terrain_exaggeration: f64,
 }
 
 impl Default for MapSection {
@@ -64,6 +69,7 @@ impl Default for MapSection {
             center: default_center(),
             zoom: default_zoom(),
             projection: default_projection(),
+            terrain_exaggeration: default_terrain_exaggeration(),
         }
     }
 }
@@ -76,6 +82,9 @@ fn default_zoom() -> f64 {
 }
 fn default_projection() -> String {
     "Web Mercator".to_string()
+}
+fn default_terrain_exaggeration() -> f64 {
+    1.5
 }
 
 #[derive(Deserialize)]
@@ -205,6 +214,7 @@ impl FileConfig {
             center: GeoCoord::new(self.map.center[0], self.map.center[1]),
             zoom: self.map.zoom,
             projection: self.map.projection,
+            terrain_exaggeration: self.map.terrain_exaggeration,
             layers,
             ..Default::default()
         }
@@ -271,6 +281,7 @@ fn convert_layer(section: LayerSection, index: usize) -> Result<LayerConfig, Str
         cesium_ion_token,
         cesium_ion_asset_id: section.cesium_ion_asset,
         google_api_key,
+        terrain_encoding_explicit: section.terrain_encoding.is_some(),
     })
 }
 

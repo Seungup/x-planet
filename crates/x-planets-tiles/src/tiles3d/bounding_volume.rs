@@ -53,13 +53,11 @@ impl BoundingVolume {
                     DVec3::new(b[9], b[10], b[11]),
                 ),
             })
-        } else if let Some(s) = &self.sphere {
-            Some(BoundingVolumeKind::Sphere {
+        } else {
+            self.sphere.as_ref().map(|s| BoundingVolumeKind::Sphere {
                 center: DVec3::new(s[0], s[1], s[2]),
                 radius: s[3],
             })
-        } else {
-            None
         }
     }
 }

@@ -12,7 +12,7 @@ pub fn checkerboard_rgba(width: u32, height: u32, cell_size: u32) -> Vec<u8> {
         for x in 0..width {
             let cx = x / cell_size;
             let cy = y / cell_size;
-            let is_white = (cx + cy) % 2 == 0;
+            let is_white = (cx + cy).is_multiple_of(2);
 
             if is_white {
                 pixels.extend_from_slice(&[255, 255, 255, 255]);
@@ -145,6 +145,7 @@ fn font_glyph(c: char) -> Option<&'static [u8; 7]> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_glyph(pixels: &mut [u8], stride: u32, glyph: &[u8; 7], ox: u32, oy: u32, scale: u32, fg: [u8; 4], total_h: u32) {
     for (row, &bits) in glyph.iter().enumerate() {
         for col in 0u32..5 {

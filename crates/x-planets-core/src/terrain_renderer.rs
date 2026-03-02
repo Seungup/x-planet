@@ -49,6 +49,14 @@ pub enum TerrainTileData {
         vertices: Vec<crate::render::TerrainVertex>,
         /// Triangle indices.
         indices: Vec<u32>,
+        /// Regular grid heightmap rasterized from the QM mesh.
+        /// Used for over-zoom fallback: when a child tile beyond `max_zoom`
+        /// needs elevation from this parent tile, it can sub-sample this
+        /// heightmap via `elev_uv_rect` instead of rendering a flat placeholder.
+        /// Grid is `fallback_grid_size × fallback_grid_size`, values in metres.
+        fallback_heightmap: Vec<f32>,
+        /// Side length of the square fallback heightmap grid.
+        fallback_grid_size: u32,
     },
 }
 
@@ -105,7 +113,7 @@ pub struct TerrainRenderer {
     depth_format: wgpu::TextureFormat,
     surface_width: u32,
     surface_height: u32,
-    /// Elevation exaggeration factor (default: 1.5 for visual effect).
+    /// Elevation exaggeration factor (default: 20.0 for visible terrain in Mercator view).
     pub exaggeration: f64,
     /// Cached vertex/index buffers keyed by render coord.
     mesh_cache: HashMap<TileCoord, CachedMesh>,
@@ -219,7 +227,9 @@ impl TerrainRenderer {
                     }),
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleList,
-                        front_face: wgpu::FrontFace::Cw,
+                        // Ccw because the VP matrix includes a flip_x (-1 on x-axis)
+                        // which reverses winding order in clip space.
+                        front_face: wgpu::FrontFace::Ccw,
                         cull_mode: Some(wgpu::Face::Back),
                         ..Default::default()
                     },
@@ -332,6 +342,14 @@ impl TerrainRenderer {
         }
     }
 
+    /// Invalidate a cached mesh so it's rebuilt next frame.
+    ///
+    /// Used when terrain data is re-resampled (e.g., multi-source
+    /// geographic heightmap update eliminates cliff walls).
+    pub fn invalidate_mesh(&mut self, coord: &TileCoord) {
+        self.mesh_cache.remove(coord);
+    }
+
     /// Get or build the cached mesh for a terrain tile.
     ///
     /// Returns the cached vertex/index buffers if the elevation source
@@ -356,16 +374,25 @@ impl TerrainRenderer {
                 TerrainTileData::Heightmap { elevation: elev, width, height } => {
                     build_terrain_mesh(coord, elev, *width, *height, height_scale, elev_uv_rect)
                 }
-                TerrainTileData::PrebuiltMesh { vertices, indices } => {
+                TerrainTileData::PrebuiltMesh {
+                    vertices,
+                    indices,
+                    fallback_heightmap,
+                    fallback_grid_size,
+                } => {
                     if elev_source != *coord {
                         // Parent's QM mesh covers the parent tile area, not this
-                        // child's sub-region.  Using the parent geometry would
-                        // stretch / mis-register the imagery.
-                        // Generate a flat placeholder (all elevation = 0) so the
-                        // imagery is visible immediately during the parent-first
-                        // loading phase.  The real QM mesh will replace this as
-                        // soon as the child tile finishes loading.
-                        build_terrain_mesh(coord, &[0.0], 1, 1, 0.0, elev_uv_rect)
+                        // child's sub-region.  Use the rasterized fallback heightmap
+                        // to provide elevation data.  `build_terrain_mesh` will
+                        // sub-sample via `elev_uv_rect` just like regular heightmaps.
+                        build_terrain_mesh(
+                            coord,
+                            fallback_heightmap,
+                            *fallback_grid_size,
+                            *fallback_grid_size,
+                            height_scale,
+                            elev_uv_rect,
+                        )
                     } else {
                         // Pre-built mesh: apply height_scale to the z component.
                         // Heights are stored in metres; scale here so exaggeration

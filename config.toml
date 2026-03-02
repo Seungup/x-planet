@@ -18,20 +18,20 @@ url  = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 
 # ── 3D Terrain (pick one) ────────────────────────────────────────
 # AWS Terrain Tiles (Terrarium) — free, no API key required
-[[layers]]
-name             = "terrain"
-kind             = "terrain"
-imagery_layer    = "imagery"
-terrain_encoding = "terrarium"
-url              = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
-z_order          = 10
-
 # [[layers]]
-# name                = "terrain"
-# kind                = "terrain"
-# imagery_layer       = "imagery"
-# url                 = "https://api.maptiler.com/tiles/terrain-quantized-mesh-v2/tiles.json?key=${MAPTILER_KEY}"
-# terrain_encoding    = "quantized-mesh"
+# name             = "terrain"
+# kind             = "terrain"
+# imagery_layer    = "imagery"
+# terrain_encoding = "terrarium"
+# url              = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+# z_order          = 10
+
+[[layers]]
+name                = "terrain"
+kind                = "terrain"
+imagery_layer       = "imagery"
+url                 = "https://api.maptiler.com/tiles/terrain-quantized-mesh-v2/tiles.json?key=${MAPTILER_KEY}"
+terrain_encoding    = "quantized-mesh"
 
 # MapTiler  — set MAPTILER_KEY
 # [[layers]]

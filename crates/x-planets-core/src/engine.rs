@@ -14,9 +14,10 @@ use x_planets_tiles::TerrainEncoding;
 // ═══════════════════════════════════════════════════════════════════
 
 /// The kind of tile layer, determining which rendering pipeline to use.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum LayerKind {
     /// Standard raster imagery (PNG/JPEG tiles rendered as flat quads).
+    #[default]
     Raster,
     /// Terrain elevation tiles rendered as displaced meshes.
     /// The `imagery_layer` names the companion raster layer whose textures are
@@ -30,12 +31,6 @@ pub enum LayerKind {
     /// Requires `cesium_ion_token` + `cesium_ion_asset_id` or `google_api_key`
     /// to be set on the [`LayerConfig`].
     Tiles3d,
-}
-
-impl Default for LayerKind {
-    fn default() -> Self {
-        Self::Raster
-    }
 }
 
 /// Configuration for a single tile layer.
@@ -63,6 +58,9 @@ pub struct LayerConfig {
     pub cesium_ion_asset_id: Option<u64>,
     /// Google Maps Platform API key (for `Tiles3d` layers).
     pub google_api_key: Option<String>,
+    /// Whether the terrain encoding was explicitly set in config.
+    /// When `false`, TileJSON auto-detection may override the encoding.
+    pub terrain_encoding_explicit: bool,
 }
 
 impl Default for LayerConfig {
@@ -79,6 +77,7 @@ impl Default for LayerConfig {
             cesium_ion_token: None,
             cesium_ion_asset_id: None,
             google_api_key: None,
+            terrain_encoding_explicit: false,
         }
     }
 }
@@ -109,6 +108,9 @@ pub struct MapConfig {
     /// Explicit layer stack.  When non-empty, `tile_source_url` / concurrent / cached
     /// fields above are ignored and each [`LayerConfig`] is used instead.
     pub layers: Vec<LayerConfig>,
+    /// Terrain height exaggeration factor (default: 1.5).
+    /// Higher values make mountains more prominent in the Mercator view.
+    pub terrain_exaggeration: f64,
 }
 
 impl Default for MapConfig {
@@ -121,6 +123,7 @@ impl Default for MapConfig {
             max_concurrent_loads: 6,
             max_cached_tiles: 256,
             layers: Vec::new(),
+            terrain_exaggeration: 1.5,
         }
     }
 }

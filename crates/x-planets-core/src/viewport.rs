@@ -90,7 +90,7 @@ impl Viewport {
             cam_h * pitch_rad.cos(),
         );
         let target = glam::DVec3::new(cx, cy, 0.0);
-        let up_hint = glam::DVec3::new(sin_b as f64, -cos_b as f64, 0.0);
+        let up_hint = glam::DVec3::new(sin_b, -cos_b, 0.0);
 
         // Camera basis (matches glam look_at_rh convention).
         let f = (target - eye).normalize();

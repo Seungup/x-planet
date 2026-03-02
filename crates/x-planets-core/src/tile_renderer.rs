@@ -319,6 +319,40 @@ impl TileRenderer {
         layers: &[RenderLayerData],
     ) {
         if layers.is_empty() {
+            // No raster layers to draw, but we still need to clear the surface
+            // so subsequent passes (terrain, 3D tiles) compositing with
+            // LoadOp::Load don't read undefined/stale data.
+            let mut encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            {
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("tile-clear-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.08,
+                                g: 0.12,
+                                b: 0.18,
+                                a: 1.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.depth_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+            }
+            gpu.queue.submit(Some(encoder.finish()));
             return;
         }
 

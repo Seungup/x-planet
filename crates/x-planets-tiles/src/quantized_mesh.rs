@@ -151,7 +151,7 @@ pub fn parse_quantized_mesh(
     // 4-byte alignment for u32 indices.
     let use_u32_indices = vertex_count >= 65536;
     let align = if use_u32_indices { 4 } else { 2 };
-    if cur % align != 0 {
+    if !cur.is_multiple_of(align) {
         cur += align - (cur % align);
     }
 
@@ -387,19 +387,17 @@ fn parse_extensions(data: &[u8], cur: &mut usize, vertex_count: usize) -> Option
             break; // Corrupt / truncated extension — stop parsing
         }
 
-        match ext_id {
-            1 => {
-                // Oct-encoded per-vertex normals: 2 bytes per vertex
-                if ext_len == vertex_count * 2 {
-                    let normals: Vec<[u8; 2]> = data[*cur..*cur + ext_len]
-                        .chunks_exact(2)
-                        .map(|b| [b[0], b[1]])
-                        .collect();
-                    oct_normals = Some(normals);
-                }
+        if ext_id == 1 {
+            // Oct-encoded per-vertex normals: 2 bytes per vertex
+            if ext_len == vertex_count * 2 {
+                let normals: Vec<[u8; 2]> = data[*cur..*cur + ext_len]
+                    .chunks_exact(2)
+                    .map(|b| [b[0], b[1]])
+                    .collect();
+                oct_normals = Some(normals);
             }
-            _ => {} // Water mask (2), metadata (4), etc. — skip
         }
+        // Water mask (2), metadata (4), etc. — skip
 
         *cur += ext_len;
     }

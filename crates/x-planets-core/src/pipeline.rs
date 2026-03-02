@@ -343,6 +343,10 @@ pub fn build_terrain_mesh(
         .collect();
 
     // ── Generate surface triangle indices ──
+    // Winding: CW in tile-local (y-down) space.
+    // After VP flip_x + y-inversion, this becomes CCW in clip space,
+    // matching the terrain pipeline's FrontFace::Ccw setting.
+    // (Same winding convention as QM PrebuiltMesh indices.)
     for gy in 0..grid {
         for gx in 0..grid {
             let tl = gy * verts_per_side + gx;
@@ -351,10 +355,10 @@ pub fn build_terrain_mesh(
             let br = bl + 1;
 
             indices.push(tl);
-            indices.push(tr);
-            indices.push(bl);
             indices.push(bl);
             indices.push(tr);
+            indices.push(tr);
+            indices.push(bl);
             indices.push(br);
         }
     }
@@ -370,7 +374,7 @@ pub fn build_terrain_mesh(
     // Bottom edge (gy=last, left to right)
     let mut strip = Vec::new();
     for gx in 0..verts_per_side {
-        strip.push((grid * verts_per_side + gx) as u32);
+        strip.push(grid * verts_per_side + gx);
     }
     edge_strips.push(strip);
 
@@ -379,7 +383,7 @@ pub fn build_terrain_mesh(
     // makes the skirt triangles CW when viewed from outside.
     let mut strip = Vec::new();
     for gx in (0..verts_per_side).rev() {
-        strip.push(gx as u32);
+        strip.push(gx);
     }
     edge_strips.push(strip);
 
@@ -388,14 +392,14 @@ pub fn build_terrain_mesh(
     // makes the skirt triangles CW when viewed from outside.
     let mut strip = Vec::new();
     for gy in (0..verts_per_side).rev() {
-        strip.push((gy * verts_per_side + grid) as u32);
+        strip.push(gy * verts_per_side + grid);
     }
     edge_strips.push(strip);
 
     // Left edge (gx=0, top to bottom)
     let mut strip = Vec::new();
     for gy in 0..verts_per_side {
-        strip.push((gy * verts_per_side) as u32);
+        strip.push(gy * verts_per_side);
     }
     edge_strips.push(strip);
 
@@ -423,13 +427,14 @@ pub fn build_terrain_mesh(
                 tex_coord: tex_coords[top_b],
             });
 
-            // Two triangles: top_a, top_b, skirt_a  +  skirt_a, top_b, skirt_b
+            // Two triangles (reversed winding to match surface):
+            // top_a, skirt_a, top_b  +  skirt_a, skirt_b, top_b
             indices.push(edge[i]);
-            indices.push(edge[i + 1]);
-            indices.push(skirt_a);
             indices.push(skirt_a);
             indices.push(edge[i + 1]);
+            indices.push(skirt_a);
             indices.push(skirt_b);
+            indices.push(edge[i + 1]);
         }
     }
 
@@ -569,7 +574,15 @@ pub fn build_terrain_mesh_from_qm(
 
     // ── Skirts (edge vertices → downward quads) ───────────────────
     // Prevents gaps/cracks between adjacent tiles at different detail.
-    let skirt_depth = tile_w * 0.05;
+    //
+    // QM positions store z in **metres**, not in scaled tile-local space
+    // (height_scale is applied later in the renderer).  The skirt depth
+    // must therefore also be in metres so it remains proportional after
+    // scaling.  We use ~2 % of the tile's equatorial width in metres,
+    // which gives a consistent 2-3 % depth relative to tile_w in the
+    // final coordinate space regardless of exaggeration.
+    let tile_extent_m = 40_075_000.0_f64 / n;
+    let skirt_depth = (tile_extent_m * 0.02) as f32;
     let down_normal = [0.0f32, 0.0, -1.0];
 
     for edge_indices in [
@@ -607,7 +620,8 @@ pub fn build_terrain_mesh_from_qm(
                 tex_coord: tex_coords[top_b],
             });
 
-            // CW winding (matches terrain_renderer pipeline: FrontFace::Cw)
+            // CW winding in tile-local space → CCW in clip space after VP flip_x
+            // (matches terrain_renderer pipeline: FrontFace::Ccw)
             let ia = edge_indices[i];
             let ib = edge_indices[i + 1];
             indices.push(ia);
@@ -620,6 +634,76 @@ pub fn build_terrain_mesh_from_qm(
     }
 
     (vertices, indices)
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Stage 4c-geo: Project QM mesh from EPSG:4326 to EPSG:3857
+// ───────────────────────────────────────────────────────────────────
+
+/// Re-project a QM mesh from EPSG:4326 tile-local space to EPSG:3857
+/// tile-local space **in place**.
+///
+/// After `build_terrain_mesh_from_qm` the vertex tex_coords are in the
+/// 4326 tile's UV space: u ∈ [0,1] west→east, v ∈ [0,1] north→south.
+/// This function converts every vertex's position and tex_coord so
+/// that they live in the target 3857 tile's local space instead.
+///
+/// ## Why this matters
+/// The rasterize → resample pipeline loses edge continuity:
+/// adjacent 3857 tiles that straddle a 4326 latitude boundary
+/// rasterize DIFFERENT QM TIN meshes, producing different
+/// interpolated heights at the shared seam → cliff walls.
+///
+/// By projecting the QM mesh directly, edge vertices that are
+/// shared between adjacent 4326 tiles (guaranteed by the QM spec)
+/// map to the same 3857 positions, preserving continuity.
+///
+/// ## Vertex transformation
+/// - `tex_coord` → geographic (lon, lat) → 3857 normalised → 3857 tile-local UV
+/// - `position[0..2]` → recalculated from the new UV + original height
+/// - `position[2]` (height in metres) is **unchanged**
+///
+/// Pure function (modifies `vertices` in place).
+pub fn project_qm_vertices_4326_to_3857(
+    vertices: &mut [crate::render::TerrainVertex],
+    merc_coord: &TileCoord,
+    geo_west: f64,
+    geo_east: f64,
+    geo_north: f64,
+    geo_south: f64,
+) {
+    let pi = std::f64::consts::PI;
+    let n = (1u64 << merc_coord.z) as f64;
+    let tile_w = (1.0 / n) as f32;
+
+    let geo_lon_range = geo_east - geo_west;
+    let geo_lat_range = geo_north - geo_south;
+
+    for v in vertices.iter_mut() {
+        let u_4326 = v.tex_coord[0] as f64;
+        let v_4326 = v.tex_coord[1] as f64;
+
+        // 4326 UV → geographic degrees
+        let lon_deg = geo_west + u_4326 * geo_lon_range;
+        let lat_deg = geo_north - v_4326 * geo_lat_range;
+
+        // Geographic → 3857 normalised [0,1]×[0,1]
+        let merc_nx = (lon_deg + 180.0) / 360.0;
+        let lat_rad = lat_deg.to_radians();
+        let merc_ny = 0.5 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / (2.0 * pi);
+
+        // 3857 normalised → tile-local UV
+        let u_3857 = merc_nx * n - merc_coord.x as f64;
+        let v_3857 = merc_ny * n - merc_coord.y as f64;
+
+        // Update position (tile-local coords in 3857 grid).
+        // position[2] (height in metres) stays unchanged.
+        v.position[0] = (u_3857 as f32 - 0.5) * tile_w;
+        v.position[1] = (v_3857 as f32 - 0.5) * tile_w;
+
+        // Update tex_coord to 3857 tile-local UV (for imagery draping)
+        v.tex_coord = [u_3857 as f32, v_3857 as f32];
+    }
 }
 
 /// Compute per-vertex normals from a triangle mesh.
@@ -669,6 +753,376 @@ fn compute_normals_from_triangles(
     }
 
     normals
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Stage 4d: QM mesh → regular heightmap rasterization (over-zoom fallback)
+// ───────────────────────────────────────────────────────────────────
+
+/// Rasterize a Quantized Mesh triangle mesh into a regular grid heightmap.
+///
+/// Used to create the `fallback_heightmap` stored alongside `PrebuiltMesh`.
+/// When a child tile beyond `max_zoom` needs elevation from a parent QM tile,
+/// it sub-samples this heightmap using `build_terrain_mesh()` with the appropriate
+/// `elev_uv_rect`, just like heightmap-based terrain (Terrain RGB / Terrarium).
+///
+/// The grid is `grid_size × grid_size` and covers the full [0,1]² UV space of the
+/// tile.  Heights are in metres (matching `TerrainVertex::position[2]`).
+///
+/// Pure function.
+pub fn rasterize_qm_to_heightmap(
+    vertices: &[crate::render::TerrainVertex],
+    indices: &[u32],
+    grid_size: u32,
+) -> Vec<f32> {
+    let gs = grid_size as usize;
+    let mut heightmap = vec![0.0f32; gs * gs];
+    // Track which cells have been written for gap-filling later.
+    let mut filled = vec![false; gs * gs];
+
+    let inv = 1.0 / (grid_size - 1) as f32;
+
+    // Rasterize each triangle: for each grid cell whose center falls inside
+    // the triangle (in tex_coord / UV space), compute height via barycentric
+    // interpolation.
+    for tri in indices.chunks(3) {
+        if tri.len() < 3 {
+            continue;
+        }
+        let (ia, ib, ic) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        if ia >= vertices.len() || ib >= vertices.len() || ic >= vertices.len() {
+            continue;
+        }
+
+        let a_uv = vertices[ia].tex_coord;
+        let b_uv = vertices[ib].tex_coord;
+        let c_uv = vertices[ic].tex_coord;
+        let a_h = vertices[ia].position[2];
+        let b_h = vertices[ib].position[2];
+        let c_h = vertices[ic].position[2];
+
+        // Bounding box of the triangle in grid coordinates
+        let min_u = a_uv[0].min(b_uv[0]).min(c_uv[0]);
+        let max_u = a_uv[0].max(b_uv[0]).max(c_uv[0]);
+        let min_v = a_uv[1].min(b_uv[1]).min(c_uv[1]);
+        let max_v = a_uv[1].max(b_uv[1]).max(c_uv[1]);
+
+        let col_min = ((min_u / inv).floor() as usize).min(gs - 1);
+        let col_max = ((max_u / inv).ceil() as usize).min(gs - 1);
+        let row_min = ((min_v / inv).floor() as usize).min(gs - 1);
+        let row_max = ((max_v / inv).ceil() as usize).min(gs - 1);
+
+        for row in row_min..=row_max {
+            for col in col_min..=col_max {
+                let pu = col as f32 * inv;
+                let pv = row as f32 * inv;
+
+                // Barycentric coordinates
+                let (w0, w1, w2) = barycentric(
+                    pu, pv,
+                    a_uv[0], a_uv[1],
+                    b_uv[0], b_uv[1],
+                    c_uv[0], c_uv[1],
+                );
+
+                if w0 >= -1e-4 && w1 >= -1e-4 && w2 >= -1e-4 {
+                    let idx = row * gs + col;
+                    let h = w0 * a_h + w1 * b_h + w2 * c_h;
+                    heightmap[idx] = h;
+                    filled[idx] = true;
+                }
+            }
+        }
+    }
+
+    // Fill unfilled cells with nearest filled neighbor (simple flood fill).
+    // This handles tiny gaps due to floating-point precision.
+    fill_gaps(&mut heightmap, &filled, gs);
+
+    heightmap
+}
+
+/// Barycentric coordinates of point (px, py) with respect to triangle (ax,ay)-(bx,by)-(cx,cy).
+fn barycentric(
+    px: f32, py: f32,
+    ax: f32, ay: f32,
+    bx: f32, by: f32,
+    cx: f32, cy: f32,
+) -> (f32, f32, f32) {
+    let v0x = bx - ax;
+    let v0y = by - ay;
+    let v1x = cx - ax;
+    let v1y = cy - ay;
+    let v2x = px - ax;
+    let v2y = py - ay;
+
+    let d00 = v0x * v0x + v0y * v0y;
+    let d01 = v0x * v1x + v0y * v1y;
+    let d11 = v1x * v1x + v1y * v1y;
+    let d20 = v2x * v0x + v2y * v0y;
+    let d21 = v2x * v1x + v2y * v1y;
+
+    let denom = d00 * d11 - d01 * d01;
+    if denom.abs() < 1e-12 {
+        return (-1.0, -1.0, -1.0); // Degenerate triangle
+    }
+    let inv_denom = 1.0 / denom;
+    let v = (d11 * d20 - d01 * d21) * inv_denom;
+    let w = (d00 * d21 - d01 * d20) * inv_denom;
+    let u = 1.0 - v - w;
+
+    (u, v, w)
+}
+
+/// Fill unfilled cells with the nearest filled cell's value.
+/// Simple iterative spreading — runs at most `gs` passes.
+fn fill_gaps(heightmap: &mut [f32], filled: &[bool], gs: usize) {
+    let unfilled_count = filled.iter().filter(|&&f| !f).count();
+    if unfilled_count == 0 {
+        return;
+    }
+
+    let mut current_filled = filled.to_vec();
+    let offsets: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
+
+    for _ in 0..gs {
+        let mut any_changed = false;
+        let prev_filled = current_filled.clone();
+        for row in 0..gs {
+            for col in 0..gs {
+                let idx = row * gs + col;
+                if prev_filled[idx] {
+                    continue;
+                }
+                // Find any filled neighbor
+                let mut sum = 0.0f32;
+                let mut count = 0u32;
+                for &(dr, dc) in &offsets {
+                    let nr = row as i32 + dr;
+                    let nc = col as i32 + dc;
+                    if nr >= 0 && nr < gs as i32 && nc >= 0 && nc < gs as i32 {
+                        let ni = nr as usize * gs + nc as usize;
+                        if prev_filled[ni] {
+                            sum += heightmap[ni];
+                            count += 1;
+                        }
+                    }
+                }
+                if count > 0 {
+                    heightmap[idx] = sum / count as f32;
+                    current_filled[idx] = true;
+                    any_changed = true;
+                }
+            }
+        }
+        if !any_changed {
+            break;
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Stage 4e: EPSG:4326 → EPSG:3857 heightmap resampling
+// ───────────────────────────────────────────────────────────────────
+
+/// Resample a heightmap from EPSG:4326 (Geographic) tile UV space to
+/// EPSG:3857 (Web Mercator) tile UV space.
+///
+/// The input heightmap lives in the UV space of a 4326 tile with the given
+/// geographic bounds.  This function creates a new heightmap for a 3857 tile
+/// by mapping each output grid point to geographic (lon, lat) coordinates
+/// (using the Mercator projection), then sampling the input heightmap.
+///
+/// This is necessary because the two projections use fundamentally different
+/// tile grids:
+/// - EPSG:3857 tiles are square in Mercator space (latitude varies non-linearly)
+/// - EPSG:4326 tiles are rectangular in lat/lon space (uniform degree spacing)
+///
+/// ## Parameters
+/// - `src_heightmap`: input heightmap in 4326 UV space (row-major, north→south)
+/// - `src_grid_size`: side length of the square source grid
+/// - `geo_west/east/north/south`: geographic bounds of the 4326 tile (degrees)
+/// - `merc_coord`: the 3857 tile coordinate to produce the output for
+/// - `out_grid_size`: side length of the square output grid
+///
+/// ## Returns
+/// A `Vec<f32>` heightmap in 3857 UV space, `out_grid_size × out_grid_size`,
+/// with heights in metres.
+///
+/// Pure function.
+pub fn resample_geographic_to_mercator(
+    src_heightmap: &[f32],
+    src_grid_size: u32,
+    geo_west: f64,
+    geo_east: f64,
+    geo_north: f64,
+    geo_south: f64,
+    merc_coord: &x_planets_math::TileCoord,
+    out_grid_size: u32,
+) -> Vec<f32> {
+    let ogs = out_grid_size as usize;
+    let mut out = vec![0.0f32; ogs * ogs];
+
+    let n_3857 = (1u64 << merc_coord.z) as f64;
+    let inv = 1.0 / (out_grid_size - 1) as f64;
+
+    let geo_lon_range = geo_east - geo_west;
+    let geo_lat_range = geo_north - geo_south; // positive (north > south)
+
+    for row in 0..ogs {
+        for col in 0..ogs {
+            let u_merc = col as f64 * inv;
+            let v_merc = row as f64 * inv;
+
+            // Convert (u_merc, v_merc) to geographic (lon, lat).
+            // Longitude is linear within a Mercator tile:
+            let lon = (merc_coord.x as f64 + u_merc) / n_3857 * 360.0 - 180.0;
+
+            // Latitude requires the Mercator Y → latitude conversion:
+            let merc_y = std::f64::consts::PI
+                * (1.0 - 2.0 * (merc_coord.y as f64 + v_merc) / n_3857);
+            let lat = merc_y.sinh().atan().to_degrees();
+
+            // Map (lon, lat) to the source 4326 tile's UV space.
+            let u_4326 = if geo_lon_range.abs() > 1e-12 {
+                (lon - geo_west) / geo_lon_range
+            } else {
+                0.5
+            };
+            // 4326 heightmap: row 0 = north, row (gs-1) = south
+            let v_4326 = if geo_lat_range.abs() > 1e-12 {
+                (geo_north - lat) / geo_lat_range
+            } else {
+                0.5
+            };
+
+            // Clamp to [0, 1] — edge samples for areas outside the 4326 tile.
+            let u_clamped = u_4326.clamp(0.0, 1.0) as f32;
+            let v_clamped = v_4326.clamp(0.0, 1.0) as f32;
+
+            let h = sample_elevation_bilinear(
+                src_heightmap,
+                src_grid_size,
+                src_grid_size,
+                u_clamped,
+                v_clamped,
+            );
+            out[row * ogs + col] = h;
+        }
+    }
+
+    out
+}
+
+/// A single EPSG:4326 heightmap source for multi-source resampling.
+pub struct GeoHeightmapSource<'a> {
+    pub heightmap: &'a [f32],
+    pub grid_size: u32,
+    pub west: f64,
+    pub east: f64,
+    pub north: f64,
+    pub south: f64,
+}
+
+/// Resample from **multiple** EPSG:4326 heightmaps to a single EPSG:3857 tile.
+///
+/// For each output pixel, the function finds the 4326 source whose geographic
+/// bounds contain the pixel's (lon, lat) and samples from that source.  If no
+/// source covers the point, the nearest edge of the nearest source is used
+/// (clamping, same as the single-source variant).
+///
+/// This eliminates cliff walls at 4326 tile boundaries: when a 3857 tile
+/// straddles two 4326 tiles, both are provided as sources and the correct
+/// one is chosen per-pixel.
+///
+/// Pure function.
+pub fn resample_geographic_to_mercator_multi(
+    sources: &[GeoHeightmapSource<'_>],
+    merc_coord: &x_planets_math::TileCoord,
+    out_grid_size: u32,
+) -> Vec<f32> {
+    if sources.is_empty() {
+        return vec![0.0f32; (out_grid_size * out_grid_size) as usize];
+    }
+    // Fast path: single source → delegate to avoid overhead.
+    if sources.len() == 1 {
+        let s = &sources[0];
+        return resample_geographic_to_mercator(
+            s.heightmap, s.grid_size,
+            s.west, s.east, s.north, s.south,
+            merc_coord, out_grid_size,
+        );
+    }
+
+    let ogs = out_grid_size as usize;
+    let mut out = vec![0.0f32; ogs * ogs];
+
+    let n_3857 = (1u64 << merc_coord.z) as f64;
+    let inv = 1.0 / (out_grid_size - 1) as f64;
+
+    for row in 0..ogs {
+        for col in 0..ogs {
+            let u_merc = col as f64 * inv;
+            let v_merc = row as f64 * inv;
+
+            // Geographic coordinates of this output pixel.
+            let lon = (merc_coord.x as f64 + u_merc) / n_3857 * 360.0 - 180.0;
+            let merc_y = std::f64::consts::PI
+                * (1.0 - 2.0 * (merc_coord.y as f64 + v_merc) / n_3857);
+            let lat = merc_y.sinh().atan().to_degrees();
+
+            // Find the source that contains (lon, lat).
+            let mut best_h = 0.0f32;
+            let mut found = false;
+            for s in sources {
+                let lon_range = s.east - s.west;
+                let lat_range = s.north - s.south;
+
+                let u_4326 = if lon_range.abs() > 1e-12 {
+                    (lon - s.west) / lon_range
+                } else { 0.5 };
+                let v_4326 = if lat_range.abs() > 1e-12 {
+                    (s.north - lat) / lat_range
+                } else { 0.5 };
+
+                // Check if this source covers the point (within [0,1]).
+                if u_4326 >= -1e-6 && u_4326 <= 1.0 + 1e-6
+                    && v_4326 >= -1e-6 && v_4326 <= 1.0 + 1e-6
+                {
+                    let u_c = u_4326.clamp(0.0, 1.0) as f32;
+                    let v_c = v_4326.clamp(0.0, 1.0) as f32;
+                    best_h = sample_elevation_bilinear(
+                        s.heightmap, s.grid_size, s.grid_size, u_c, v_c,
+                    );
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                // No source covers this point — clamp to nearest source edge.
+                // Use the first source (primary).
+                let s = &sources[0];
+                let lon_range = s.east - s.west;
+                let lat_range = s.north - s.south;
+                let u_4326 = if lon_range.abs() > 1e-12 {
+                    (lon - s.west) / lon_range
+                } else { 0.5 };
+                let v_4326 = if lat_range.abs() > 1e-12 {
+                    (s.north - lat) / lat_range
+                } else { 0.5 };
+                let u_c = u_4326.clamp(0.0, 1.0) as f32;
+                let v_c = v_4326.clamp(0.0, 1.0) as f32;
+                best_h = sample_elevation_bilinear(
+                    s.heightmap, s.grid_size, s.grid_size, u_c, v_c,
+                );
+            }
+
+            out[row * ogs + col] = best_h;
+        }
+    }
+
+    out
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -1269,6 +1723,904 @@ mod tests {
         // Linearity: 2× exaggeration → 2× scale
         let scale_2x = compute_height_scale(2.0);
         assert!((scale_2x - 2.0 * scale).abs() < 1e-12);
+    }
+
+    // ── Stage 4d: rasterize_qm_to_heightmap ────────────────────
+
+    #[test]
+    fn test_rasterize_flat_triangle() {
+        // A single triangle covering the full [0,1]² UV space with constant height.
+        let height = 500.0f32;
+        let vertices = vec![
+            TerrainVertex {
+                position: [-0.5, -0.5, height],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [0.0, 0.0],
+            },
+            TerrainVertex {
+                position: [0.5, -0.5, height],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [1.0, 0.0],
+            },
+            TerrainVertex {
+                position: [-0.5, 0.5, height],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [0.0, 1.0],
+            },
+        ];
+        let indices = vec![0, 1, 2];
+        let hm = rasterize_qm_to_heightmap(&vertices, &indices, 5);
+        // All cells inside the triangle should be ~500.
+        // The lower-right half might be unfilled (gap-filled).
+        let inside_count = hm.iter().filter(|&&h| (h - height).abs() < 1.0).count();
+        assert!(
+            inside_count >= 6,
+            "at least 6 of 25 cells should be inside triangle, got {}",
+            inside_count
+        );
+    }
+
+    #[test]
+    fn test_rasterize_two_triangles_full_coverage() {
+        // Two triangles covering the full [0,1]² UV space (a quad).
+        let h = 1000.0f32;
+        let vertices = vec![
+            TerrainVertex {
+                position: [-0.5, -0.5, h],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [0.0, 0.0],
+            },
+            TerrainVertex {
+                position: [0.5, -0.5, h],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [1.0, 0.0],
+            },
+            TerrainVertex {
+                position: [-0.5, 0.5, h],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [0.0, 1.0],
+            },
+            TerrainVertex {
+                position: [0.5, 0.5, h],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [1.0, 1.0],
+            },
+        ];
+        let indices = vec![0, 1, 2, 1, 3, 2];
+        let hm = rasterize_qm_to_heightmap(&vertices, &indices, 9);
+        // Full coverage → all 81 cells should be ~1000m.
+        for (i, &val) in hm.iter().enumerate() {
+            assert!(
+                (val - h).abs() < 1.0,
+                "cell {} should be {}m, got {}m",
+                i, h, val
+            );
+        }
+    }
+
+    #[test]
+    fn test_rasterize_sloped_surface() {
+        // A sloped surface: height varies linearly with u_tex.
+        // TL(0,0)=0m, TR(1,0)=1000m, BL(0,1)=0m, BR(1,1)=1000m.
+        let vertices = vec![
+            TerrainVertex {
+                position: [-0.5, -0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [0.0, 0.0],
+            },
+            TerrainVertex {
+                position: [0.5, -0.5, 1000.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [1.0, 0.0],
+            },
+            TerrainVertex {
+                position: [-0.5, 0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [0.0, 1.0],
+            },
+            TerrainVertex {
+                position: [0.5, 0.5, 1000.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [1.0, 1.0],
+            },
+        ];
+        let indices = vec![0, 1, 2, 1, 3, 2];
+        let gs = 5u32;
+        let hm = rasterize_qm_to_heightmap(&vertices, &indices, gs);
+
+        // Verify the slope: each column should have roughly the same height,
+        // increasing from left to right.
+        for col in 0..gs as usize {
+            let u = col as f32 / (gs - 1) as f32;
+            let expected = u * 1000.0;
+            let actual = hm[col]; // row 0
+            assert!(
+                (actual - expected).abs() < 50.0,
+                "col {} (u={:.2}): expected ~{:.0}m, got {:.0}m",
+                col, u, expected, actual
+            );
+        }
+    }
+
+    #[test]
+    fn test_rasterize_grid_size_matches() {
+        let h = 100.0f32;
+        let vertices = vec![
+            TerrainVertex {
+                position: [-0.5, -0.5, h],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [0.0, 0.0],
+            },
+            TerrainVertex {
+                position: [0.5, -0.5, h],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [1.0, 0.0],
+            },
+            TerrainVertex {
+                position: [0.5, 0.5, h],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [1.0, 1.0],
+            },
+            TerrainVertex {
+                position: [-0.5, 0.5, h],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [0.0, 1.0],
+            },
+        ];
+        let indices = vec![0, 1, 2, 0, 2, 3];
+
+        for gs in [5u32, 17, 33, 65] {
+            let hm = rasterize_qm_to_heightmap(&vertices, &indices, gs);
+            assert_eq!(
+                hm.len(),
+                (gs * gs) as usize,
+                "grid_size={}: expected {} cells, got {}",
+                gs, gs * gs, hm.len()
+            );
+        }
+    }
+
+    // ── Stage 4e: resample_geographic_to_mercator ───────────────
+
+    #[test]
+    fn test_resample_constant_height() {
+        // A constant heightmap should remain constant after resampling.
+        let h = 2500.0f32;
+        let gs = 9u32;
+        let src = vec![h; (gs * gs) as usize];
+
+        // 4326 tile at z=5, x=32, y=8 (equatorial)
+        let (west, east, north, south) = (0.0, 5.625, 5.625, 0.0);
+
+        // 3857 tile z=6 (somewhere near equator)
+        let merc = TileCoord::new(6, 33, 31);
+        let out = resample_geographic_to_mercator(
+            &src, gs, west, east, north, south, &merc, gs,
+        );
+
+        assert_eq!(out.len(), (gs * gs) as usize);
+        for (i, &val) in out.iter().enumerate() {
+            assert!(
+                (val - h).abs() < 1.0,
+                "cell {}: expected {}m, got {}m",
+                i, h, val
+            );
+        }
+    }
+
+    #[test]
+    fn test_resample_output_size() {
+        let gs = 17u32;
+        let src = vec![0.0f32; (gs * gs) as usize];
+        let merc = TileCoord::new(5, 16, 15);
+
+        for out_gs in [5u32, 17, 33, 65] {
+            let out = resample_geographic_to_mercator(
+                &src, gs, -5.625, 0.0, 5.625, 0.0, &merc, out_gs,
+            );
+            assert_eq!(
+                out.len(),
+                (out_gs * out_gs) as usize,
+                "out_grid_size={}: expected {} cells",
+                out_gs, out_gs * out_gs
+            );
+        }
+    }
+
+    #[test]
+    fn test_resample_north_south_gradient() {
+        // Height increases from north to south in the 4326 tile.
+        // After resampling to 3857, the gradient should be preserved
+        // (though non-linearly due to Mercator projection).
+        let gs = 33u32;
+        let mut src = vec![0.0f32; (gs * gs) as usize];
+        for row in 0..gs {
+            for col in 0..gs {
+                // row 0 = north (0m), row gs-1 = south (1000m)
+                src[(row * gs + col) as usize] = row as f32 / (gs - 1) as f32 * 1000.0;
+            }
+        }
+
+        // 4326 tile bounds: near equator, [-5.625°, 0°] lon, [5.625°, 0°] lat
+        let west = -5.625;
+        let east = 0.0;
+        let north = 5.625;
+        let south = 0.0;
+        // 3857 z=6, y=31: top=lat≈5.63°, bottom=lat≈0° — matches the 4326 tile
+        let merc = TileCoord::new(6, 31, 31);
+
+        let out_gs = 17u32;
+        let out = resample_geographic_to_mercator(
+            &src, gs, west, east, north, south, &merc, out_gs,
+        );
+
+        // Verify gradient is preserved: top row (north, ~5.6°) should have lower
+        // values than bottom row (south, ~0°) since src row 0=north=0m, row last=south=1000m.
+        let top_avg: f32 = (0..out_gs).map(|c| out[c as usize]).sum::<f32>() / out_gs as f32;
+        let bot_avg: f32 = (0..out_gs)
+            .map(|c| out[((out_gs - 1) * out_gs + c) as usize])
+            .sum::<f32>()
+            / out_gs as f32;
+
+        assert!(
+            bot_avg > top_avg,
+            "bottom average ({:.1}) should be > top average ({:.1})",
+            bot_avg, top_avg
+        );
+    }
+
+    #[test]
+    fn test_resample_equatorial_symmetry() {
+        // A symmetric heightmap (constant E-W, varying N-S) centered on equator
+        // should produce roughly symmetric results in the resampled 3857 tile
+        // (since Mercator is approximately linear near the equator).
+        let gs = 33u32;
+        let mut src = vec![0.0f32; (gs * gs) as usize];
+        let mid = (gs - 1) as f32 / 2.0;
+        for row in 0..gs {
+            for col in 0..gs {
+                // Parabolic: peaks at center, 0 at edges
+                let v = (row as f32 - mid).abs() / mid;
+                src[(row * gs + col) as usize] = (1.0 - v) * 1000.0;
+            }
+        }
+
+        // Symmetric around equator: [-2.8125°, 2.8125°] lat
+        let merc = TileCoord::new(7, 64, 63); // centered near equator
+        let out = resample_geographic_to_mercator(
+            &src, gs, -2.8125, 2.8125, 2.8125, -2.8125, &merc, 17,
+        );
+
+        // Near equator, Mercator ≈ linear, so center row should be highest
+        let mid_row = 8;
+        let center_h = out[mid_row * 17 + 8];
+        let edge_h = out[0 * 17 + 8]; // top edge
+        assert!(
+            center_h > edge_h,
+            "center ({:.1}) should be higher than edge ({:.1})",
+            center_h, edge_h
+        );
+    }
+
+    // ── sample_elevation_bilinear ───────────────────────────────
+
+    #[test]
+    fn test_bilinear_corners() {
+        // 2×2 grid: corners should sample exactly.
+        let elev = vec![0.0, 100.0, 200.0, 300.0];
+        assert!((sample_elevation_bilinear(&elev, 2, 2, 0.0, 0.0) - 0.0).abs() < 1e-3);
+        assert!((sample_elevation_bilinear(&elev, 2, 2, 1.0, 0.0) - 100.0).abs() < 1e-3);
+        assert!((sample_elevation_bilinear(&elev, 2, 2, 0.0, 1.0) - 200.0).abs() < 1e-3);
+        assert!((sample_elevation_bilinear(&elev, 2, 2, 1.0, 1.0) - 300.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_bilinear_center() {
+        // 2×2 grid: center should be average of all 4 corners.
+        let elev = vec![0.0, 100.0, 200.0, 300.0];
+        let center = sample_elevation_bilinear(&elev, 2, 2, 0.5, 0.5);
+        let expected = (0.0 + 100.0 + 200.0 + 300.0) / 4.0;
+        assert!(
+            (center - expected).abs() < 1e-3,
+            "center should be {}, got {}",
+            expected, center
+        );
+    }
+
+    #[test]
+    fn test_bilinear_edge_midpoint() {
+        // 2×2 grid: midpoint of top edge (u=0.5, v=0).
+        let elev = vec![0.0, 100.0, 200.0, 300.0];
+        let mid_top = sample_elevation_bilinear(&elev, 2, 2, 0.5, 0.0);
+        assert!(
+            (mid_top - 50.0).abs() < 1e-3,
+            "top edge midpoint should be 50, got {}",
+            mid_top
+        );
+    }
+
+    #[test]
+    fn test_bilinear_constant_surface() {
+        // All values the same → any sample should return that value.
+        let h = 777.0f32;
+        let elev = vec![h; 65 * 65];
+        for u in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            for v in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let val = sample_elevation_bilinear(&elev, 65, 65, u, v);
+                assert!(
+                    (val - h).abs() < 1e-3,
+                    "constant surface at ({}, {}): expected {}, got {}",
+                    u, v, h, val
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bilinear_larger_grid() {
+        // 3×3 grid with known pattern
+        let elev = vec![
+            0.0, 100.0, 200.0,
+            300.0, 400.0, 500.0,
+            600.0, 700.0, 800.0,
+        ];
+        // Center (0.5, 0.5) should be 400.0 (the center cell)
+        let center = sample_elevation_bilinear(&elev, 3, 3, 0.5, 0.5);
+        assert!(
+            (center - 400.0).abs() < 1e-3,
+            "3×3 center should be 400, got {}",
+            center
+        );
+    }
+
+    // ── Over-zoom fallback integration ──────────────────────────
+
+    #[test]
+    fn test_overzoom_fallback_heightmap_workflow() {
+        // Simulate the over-zoom workflow:
+        // 1. QM tile is rasterized to a heightmap at max_zoom
+        // 2. Child tile at max_zoom+1 uses parent's heightmap with fallback_uv_rect
+
+        // Step 1: Create a synthetic "rasterized" heightmap for parent
+        let parent_gs = 33u32;
+        let mut parent_hm = vec![0.0f32; (parent_gs * parent_gs) as usize];
+        // Height gradient: increases from TL to BR
+        for row in 0..parent_gs {
+            for col in 0..parent_gs {
+                let u = col as f32 / (parent_gs - 1) as f32;
+                let v = row as f32 / (parent_gs - 1) as f32;
+                parent_hm[(row * parent_gs + col) as usize] = (u + v) * 500.0;
+            }
+        }
+
+        // Step 2: Build child mesh using parent's heightmap
+        let parent = TileCoord::new(13, 4096, 3072);
+        let child = TileCoord::new(14, 8192, 6144); // top-left child
+
+        let elev_uv = fallback_uv_rect(&child, &parent);
+        // Top-left child → uv = [0.0, 0.0, 0.5, 0.5]
+        assert!((elev_uv[0] - 0.0).abs() < 1e-4, "u_min={}", elev_uv[0]);
+        assert!((elev_uv[1] - 0.0).abs() < 1e-4, "v_min={}", elev_uv[1]);
+        assert!((elev_uv[2] - 0.5).abs() < 1e-4, "u_max={}", elev_uv[2]);
+        assert!((elev_uv[3] - 0.5).abs() < 1e-4, "v_max={}", elev_uv[3]);
+
+        let scale = compute_height_scale(1.5);
+        let (verts, _) = build_terrain_mesh(
+            &child, &parent_hm, parent_gs, parent_gs, scale, elev_uv,
+        );
+
+        // Verify: the child's top-left (u=0,v=0 → eu=0,ev=0) maps to parent's TL (h≈0)
+        // and bottom-right (u=1,v=1 → eu=0.5,ev=0.5) maps to parent's center (h≈500)
+        let tl_h = verts[0].position[2] / scale;
+        let g = TERRAIN_GRID_SIZE;
+        let br_idx = g as usize * (g as usize + 1) + g as usize;
+        let br_h = verts[br_idx].position[2] / scale;
+
+        assert!(
+            tl_h.abs() < 20.0,
+            "child TL should be ~0m, got {}m",
+            tl_h
+        );
+        assert!(
+            (br_h - 500.0).abs() < 50.0,
+            "child BR should be ~500m, got {}m",
+            br_h
+        );
+    }
+
+    #[test]
+    fn test_overzoom_multiple_levels() {
+        // Over-zoom by 2 levels: grandchild using grandparent's heightmap
+        let ancestor = TileCoord::new(13, 4096, 3072);
+        let grandchild = TileCoord::new(15, 16384, 12288); // top-left of top-left child
+
+        let elev_uv = fallback_uv_rect(&grandchild, &ancestor);
+        // grandchild is in the top-left quarter of the top-left quarter
+        // → uv = [0.0, 0.0, 0.25, 0.25]
+        assert!((elev_uv[0] - 0.0).abs() < 1e-4, "u_min={}", elev_uv[0]);
+        assert!((elev_uv[1] - 0.0).abs() < 1e-4, "v_min={}", elev_uv[1]);
+        assert!((elev_uv[2] - 0.25).abs() < 1e-4, "u_max={}", elev_uv[2]);
+        assert!((elev_uv[3] - 0.25).abs() < 1e-4, "v_max={}", elev_uv[3]);
+    }
+
+    // ── Skirt exclusion regression (cliff wall fix) ────────────
+
+    #[test]
+    fn test_rasterize_skirt_excluded_preserves_edge_heights() {
+        // Safety test: the `indices[..surface_idx_count]` slicing in
+        // tile_upload.rs excludes skirt geometry from the rasterizer.
+        //
+        // Real QM skirt triangles are UV-degenerate (all vertices lie
+        // along a single tile edge → zero area in UV space), so the
+        // barycentric test already rejects them.  The slicing is a
+        // defence-in-depth guard that also saves computation.
+        //
+        // This test verifies that surface-only rasterization produces
+        // correct heights, and that hypothetical non-degenerate skirt
+        // triangles (UV inset far enough to cover grid cells) WOULD
+        // corrupt the heightmap if included.
+
+        let h = 500.0f32;
+        let skirt_depth = 300.0f32;
+
+        // Surface: a flat quad at height `h`, covering full [0,1]² UV.
+        let surface_verts = vec![
+            TerrainVertex { position: [-0.5, -0.5, h], normal: [0.0, 0.0, 1.0], tex_coord: [0.0, 0.0] },
+            TerrainVertex { position: [ 0.5, -0.5, h], normal: [0.0, 0.0, 1.0], tex_coord: [1.0, 0.0] },
+            TerrainVertex { position: [ 0.5,  0.5, h], normal: [0.0, 0.0, 1.0], tex_coord: [1.0, 1.0] },
+            TerrainVertex { position: [-0.5,  0.5, h], normal: [0.0, 0.0, 1.0], tex_coord: [0.0, 1.0] },
+        ];
+        let surface_indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
+        let surface_idx_count = surface_indices.len();
+
+        // Hypothetical bad skirt: vertices with large UV inset (0.3)
+        // so they form a non-degenerate quad overlapping the surface.
+        let mut all_verts = surface_verts.clone();
+        let skirt_a_idx = all_verts.len() as u32;
+        all_verts.push(TerrainVertex {
+            position: [-0.5, -0.5, h - skirt_depth],
+            normal: [0.0, 0.0, -1.0],
+            tex_coord: [0.3, 0.0],  // large UV inset
+        });
+        let skirt_b_idx = all_verts.len() as u32;
+        all_verts.push(TerrainVertex {
+            position: [-0.5, 0.5, h - skirt_depth],
+            normal: [0.0, 0.0, -1.0],
+            tex_coord: [0.3, 1.0],  // large UV inset
+        });
+        let mut all_indices = surface_indices.clone();
+        all_indices.extend_from_slice(&[0, skirt_a_idx, 3, 3, skirt_a_idx, skirt_b_idx]);
+
+        let gs = 17u32;
+
+        // Surface-only: all cells should be ~h (flat surface).
+        let without_skirts = rasterize_qm_to_heightmap(
+            &all_verts, &all_indices[..surface_idx_count], gs,
+        );
+        for row in 0..gs {
+            for col in 0..gs {
+                let idx = (row * gs + col) as usize;
+                assert!(
+                    (without_skirts[idx] - h).abs() < 1.0,
+                    "skirt-excluded: ({},{}) should be ~{}m, got {}m",
+                    row, col, h, without_skirts[idx]
+                );
+            }
+        }
+
+        // With bad skirts: cells near the west edge (small u) should
+        // be corrupted because the skirt triangle covers u=0..0.3.
+        let with_skirts = rasterize_qm_to_heightmap(&all_verts, &all_indices, gs);
+        // col=2 → u = 2/16 = 0.125, well inside u=[0, 0.3] range
+        let corrupted_col = 2usize;
+        let mut found_corruption = false;
+        for row in 0..gs {
+            let idx = (row as usize) * (gs as usize) + corrupted_col;
+            if (with_skirts[idx] - h).abs() > 10.0 {
+                found_corruption = true;
+                break;
+            }
+        }
+        assert!(
+            found_corruption,
+            "inset-UV skirts (u=0.3) should corrupt cells near col=2 (u=0.125)",
+        );
+    }
+
+    #[test]
+    fn test_build_terrain_mesh_from_qm_surface_vs_total_indices() {
+        // Verify that `qm.indices.len()` gives the surface-only count,
+        // and `build_terrain_mesh_from_qm` returns more indices (surface + skirts).
+        let coord = TileCoord::new(5, 16, 12);
+        let qm = x_planets_tiles::DecodedQuantizedMesh {
+            coord,
+            header: x_planets_tiles::quantized_mesh::QmHeader {
+                center_x: 0.0, center_y: 0.0, center_z: 0.0,
+                min_height: 0.0, max_height: 1000.0,
+                bounding_sphere_radius: 1.0,
+                horizon_occlusion_point_x: 0.0,
+                horizon_occlusion_point_y: 0.0,
+                horizon_occlusion_point_z: 0.0,
+            },
+            // Simple 4-vertex quad
+            u: vec![0, 32767, 32767, 0],
+            v: vec![0, 0, 32767, 32767],
+            height: vec![16383, 16383, 16383, 16383], // ~500m
+            indices: vec![0, 1, 2, 0, 2, 3],
+            west_indices: vec![0, 3],
+            south_indices: vec![0, 1],
+            east_indices: vec![1, 2],
+            north_indices: vec![3, 2],
+            oct_normals: None,
+        };
+
+        let surface_idx_count = qm.indices.len();
+        assert_eq!(surface_idx_count, 6, "surface should have 6 indices (2 triangles)");
+
+        let (_vertices, indices) = build_terrain_mesh_from_qm(&coord, &qm);
+        assert!(
+            indices.len() > surface_idx_count,
+            "total indices ({}) should be > surface-only ({}) due to skirts",
+            indices.len(), surface_idx_count
+        );
+
+        // Verify: slicing with surface_idx_count gives only surface triangles
+        let surface_only = &indices[..surface_idx_count];
+        assert_eq!(surface_only.len(), 6);
+        // All surface indices should reference original vertices (0..3)
+        for &idx in surface_only {
+            assert!(idx < 4, "surface index {} should be < 4", idx);
+        }
+    }
+
+    // ── project_qm_vertices_4326_to_3857 ──────────────────────
+
+    /// Helper: compute 4326 tile bounds (same logic as tile_source::geographic_tile_bounds).
+    fn geo_tile_bounds(gx: u32, gy: u32, gz: u8) -> (f64, f64, f64, f64) {
+        let n_x = (1u32 << (gz + 1)) as f64;
+        let n_y = (1u32 << gz) as f64;
+        let west  = gx as f64 / n_x * 360.0 - 180.0;
+        let east  = (gx + 1) as f64 / n_x * 360.0 - 180.0;
+        let north = 90.0 - gy as f64 / n_y * 180.0;
+        let south = 90.0 - (gy + 1) as f64 / n_y * 180.0;
+        (west, east, north, south)
+    }
+
+    #[test]
+    fn test_project_4326_to_3857_center_maps_correctly() {
+        // A vertex at the center of the 4326 tile (u=0.5, v=0.5)
+        // should project within the corresponding 3857 tile.
+        //
+        // Use equatorial tiles where 4326 and 3857 nearly align:
+        // 3857 tile z=6, x=33, y=31 (near equator, positive lat)
+        // 4326 tile gz=5, gx=33, gy=15 (covers lat ~2.8° to ~5.6°)
+        let merc = TileCoord::new(6, 33, 31);
+        let (geo_west, geo_east, geo_north, geo_south) = geo_tile_bounds(33, 15, 5);
+
+        let mut verts = vec![
+            TerrainVertex {
+                position: [0.0, 0.0, 1000.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [0.5, 0.5], // center of 4326 tile
+            },
+        ];
+
+        project_qm_vertices_4326_to_3857(
+            &mut verts, &merc,
+            geo_west, geo_east, geo_north, geo_south,
+        );
+
+        // Longitude aligns exactly → u should be 0.5
+        assert!(
+            (verts[0].tex_coord[0] - 0.5).abs() < 0.01,
+            "projected u should be 0.5, got {}",
+            verts[0].tex_coord[0]
+        );
+        // The center of the 4326 tile in latitude maps somewhere inside
+        // the 3857 tile (v between -0.5 and 1.5 due to lat extent mismatch,
+        // but close to 0.5 near equator)
+        assert!(
+            verts[0].tex_coord[1] > -0.5 && verts[0].tex_coord[1] < 1.5,
+            "projected v should be approximately in tile range, got {}",
+            verts[0].tex_coord[1]
+        );
+        // Height is preserved
+        assert_eq!(verts[0].position[2], 1000.0);
+    }
+
+    #[test]
+    fn test_project_4326_to_3857_preserves_height() {
+        let merc = TileCoord::new(5, 16, 16);
+        let (geo_west, geo_east, geo_north, geo_south) = geo_tile_bounds(16, 7, 4);
+
+        let heights = [0.0, 100.0, 500.0, 8848.0, -420.0];
+        for &h in &heights {
+            let mut verts = vec![TerrainVertex {
+                position: [0.0, 0.0, h],
+                normal: [0.0, 0.0, 1.0],
+                tex_coord: [0.5, 0.5],
+            }];
+            project_qm_vertices_4326_to_3857(
+                &mut verts, &merc,
+                geo_west, geo_east, geo_north, geo_south,
+            );
+            assert_eq!(
+                verts[0].position[2], h,
+                "height {}m should be preserved after projection", h
+            );
+        }
+    }
+
+    #[test]
+    fn test_project_4326_to_3857_edge_continuity() {
+        // The key property: two adjacent 4326 tiles share an edge.
+        // A vertex at the shared edge should project to the SAME 3857
+        // position regardless of which tile it belongs to.
+        //
+        // This tests the fix for cliff walls at 4326 tile boundaries.
+
+        // Two vertically-adjacent 4326 tiles at gz=4
+        let (west_a, east_a, north_a, south_a) = geo_tile_bounds(16, 7, 4);
+        let (west_b, east_b, north_b, south_b) = geo_tile_bounds(16, 8, 4);
+
+        // The shared edge: tile A's south = tile B's north
+        assert!(
+            (south_a - north_b).abs() < 1e-10,
+            "tiles should share edge: A.south={}, B.north={}",
+            south_a, north_b
+        );
+
+        // A vertex on tile A's south edge (v=1.0)
+        let merc = TileCoord::new(5, 32, 16);
+        let h = 750.0f32;
+        let u_shared = 0.3;
+
+        let mut vert_a = vec![TerrainVertex {
+            position: [0.0, 0.0, h],
+            normal: [0.0, 0.0, 1.0],
+            tex_coord: [u_shared, 1.0],
+        }];
+        project_qm_vertices_4326_to_3857(
+            &mut vert_a, &merc,
+            west_a, east_a, north_a, south_a,
+        );
+
+        // Same vertex on tile B's north edge (v=0.0)
+        let mut vert_b = vec![TerrainVertex {
+            position: [0.0, 0.0, h],
+            normal: [0.0, 0.0, 1.0],
+            tex_coord: [u_shared, 0.0],
+        }];
+        project_qm_vertices_4326_to_3857(
+            &mut vert_b, &merc,
+            west_b, east_b, north_b, south_b,
+        );
+
+        // Both should project to the same 3857 position (no cliff wall!)
+        let dx = (vert_a[0].position[0] - vert_b[0].position[0]).abs();
+        let dy = (vert_a[0].position[1] - vert_b[0].position[1]).abs();
+        assert!(
+            dx < 1e-6 && dy < 1e-6,
+            "shared edge vertices should project to same position: \
+             A=({}, {}), B=({}, {}), diff=({}, {})",
+            vert_a[0].position[0], vert_a[0].position[1],
+            vert_b[0].position[0], vert_b[0].position[1],
+            dx, dy,
+        );
+        assert_eq!(vert_a[0].position[2], vert_b[0].position[2]);
+    }
+
+    #[test]
+    fn test_project_4326_to_3857_full_tile_coverage() {
+        // The projected vertices' tex_coords (3857 UV) should cover
+        // approximately [0,1]² for a tile near the equator.
+        let merc = TileCoord::new(6, 33, 31);
+        let (geo_west, geo_east, geo_north, geo_south) = geo_tile_bounds(33, 15, 5);
+
+        let mut verts = vec![
+            TerrainVertex { position: [0.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0], tex_coord: [0.0, 0.0] },
+            TerrainVertex { position: [0.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0], tex_coord: [1.0, 0.0] },
+            TerrainVertex { position: [0.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0], tex_coord: [0.0, 1.0] },
+            TerrainVertex { position: [0.0, 0.0, 0.0], normal: [0.0, 0.0, 1.0], tex_coord: [1.0, 1.0] },
+        ];
+
+        project_qm_vertices_4326_to_3857(
+            &mut verts, &merc,
+            geo_west, geo_east, geo_north, geo_south,
+        );
+
+        // Longitude aligns exactly: u should be 0.0 and 1.0
+        assert!((verts[0].tex_coord[0] - 0.0).abs() < 0.01, "NW u={}", verts[0].tex_coord[0]);
+        assert!((verts[1].tex_coord[0] - 1.0).abs() < 0.01, "NE u={}", verts[1].tex_coord[0]);
+
+        // Latitude approximately covers [0, 1]
+        let v_min = verts.iter().map(|v| v.tex_coord[1]).fold(f32::MAX, f32::min);
+        let v_max = verts.iter().map(|v| v.tex_coord[1]).fold(f32::MIN, f32::max);
+        assert!(
+            v_min < 0.1 && v_max > 0.9,
+            "projected v range [{}, {}] should approximately cover [0, 1]",
+            v_min, v_max
+        );
+    }
+
+    // ── Multi-source resampling tests ─────────────────────────
+
+    #[test]
+    fn test_multi_source_single_source_matches_original() {
+        // Multi-source with 1 source should produce identical output
+        // as the single-source function.
+        let grid_size = 5u32;
+        let heightmap: Vec<f32> = (0..(grid_size * grid_size))
+            .map(|i| 100.0 + i as f32 * 10.0)
+            .collect();
+        let merc_coord = TileCoord::new(3, 4, 3);
+        let (west, east, north, south) = (-45.0, -22.5, 45.0, 33.75);
+        let out_grid_size = 5u32;
+
+        let single = resample_geographic_to_mercator(
+            &heightmap, grid_size,
+            west, east, north, south,
+            &merc_coord, out_grid_size,
+        );
+        let multi = resample_geographic_to_mercator_multi(
+            &[GeoHeightmapSource {
+                heightmap: &heightmap,
+                grid_size,
+                west, east, north, south,
+            }],
+            &merc_coord, out_grid_size,
+        );
+
+        for (i, (s, m)) in single.iter().zip(multi.iter()).enumerate() {
+            assert!(
+                (s - m).abs() < 1e-4,
+                "Mismatch at index {}: single={}, multi={}",
+                i, s, m,
+            );
+        }
+    }
+
+    #[test]
+    fn test_multi_source_two_tiles_no_clamping() {
+        // Two adjacent 4326 tiles fully covering the 3857 tile.
+        // Heights should come from the correct source per-pixel,
+        // with no clamped (constant) region.
+        //
+        // Setup: 3857 tile z=5, x=17, y=12
+        // Primary 4326 tile gz=4, gy=4: north=45°, south=33.75°
+        // Secondary 4326 tile gz=4, gy=5: north=33.75°, south=22.5°
+        // The 3857 tile extends below 33.75° → needs secondary tile.
+
+        let grid_size = 5u32;
+        // Tile A (north): constant height 1000m
+        let heightmap_a: Vec<f32> = vec![1000.0; (grid_size * grid_size) as usize];
+        // Tile B (south): constant height 500m
+        let heightmap_b: Vec<f32> = vec![500.0; (grid_size * grid_size) as usize];
+
+        // 4326 tile gy=4: north=45°, south=33.75°
+        let source_a = GeoHeightmapSource {
+            heightmap: &heightmap_a,
+            grid_size,
+            west: 123.75,
+            east: 135.0,
+            north: 45.0,
+            south: 33.75,
+        };
+        // 4326 tile gy=5: north=33.75°, south=22.5°
+        let source_b = GeoHeightmapSource {
+            heightmap: &heightmap_b,
+            grid_size,
+            west: 123.75,
+            east: 135.0,
+            north: 33.75,
+            south: 22.5,
+        };
+
+        let merc_coord = TileCoord::new(5, 27, 12);
+        let out_grid_size = 9u32;
+
+        // Multi-source: should pick correct tile per pixel.
+        let multi = resample_geographic_to_mercator_multi(
+            &[source_a, source_b],
+            &merc_coord, out_grid_size,
+        );
+
+        // Single-source (only tile A): would clamp southern pixels.
+        let single = resample_geographic_to_mercator(
+            &heightmap_a, grid_size,
+            123.75, 135.0, 45.0, 33.75,
+            &merc_coord, out_grid_size,
+        );
+
+        // In multi-source, pixels in the south part should get 500m (from tile B).
+        // In single-source, ALL pixels get 1000m (clamped to tile A).
+        let has_500 = multi.iter().any(|&h| (h - 500.0).abs() < 1.0);
+        let single_all_1000 = single.iter().all(|&h| (h - 1000.0).abs() < 1.0);
+
+        assert!(
+            has_500,
+            "Multi-source should sample from tile B (500m) for southern pixels"
+        );
+        assert!(
+            single_all_1000,
+            "Single-source should clamp all to tile A (1000m)"
+        );
+    }
+
+    #[test]
+    fn test_multi_source_smooth_boundary() {
+        // At the boundary between two 4326 tiles, heights should
+        // transition smoothly (no cliff wall).
+        //
+        // Create two tiles with a gradient that matches at the boundary:
+        // Tile A: height varies from 1000m (north) to 500m (south)
+        // Tile B: height varies from 500m (north) to 0m (south)
+        // At the boundary (tile A south / tile B north), both have 500m.
+
+        let grid_size = 33u32;
+        let gs = grid_size as usize;
+
+        // Tile A: linear gradient 1000 → 500
+        let heightmap_a: Vec<f32> = (0..gs * gs)
+            .map(|i| {
+                let row = i / gs;
+                let t = row as f32 / (gs - 1) as f32; // 0 at north, 1 at south
+                1000.0 - 500.0 * t
+            })
+            .collect();
+
+        // Tile B: linear gradient 500 → 0
+        let heightmap_b: Vec<f32> = (0..gs * gs)
+            .map(|i| {
+                let row = i / gs;
+                let t = row as f32 / (gs - 1) as f32;
+                500.0 - 500.0 * t
+            })
+            .collect();
+
+        // Verify boundary match
+        assert!(
+            (heightmap_a[gs * (gs - 1)] - heightmap_b[0]).abs() < 1.0,
+            "Tile edge heights should match"
+        );
+
+        let source_a = GeoHeightmapSource {
+            heightmap: &heightmap_a,
+            grid_size,
+            west: 0.0, east: 11.25, north: 45.0, south: 33.75,
+        };
+        let source_b = GeoHeightmapSource {
+            heightmap: &heightmap_b,
+            grid_size,
+            west: 0.0, east: 11.25, north: 33.75, south: 22.5,
+        };
+
+        let merc_coord = TileCoord::new(5, 16, 12);
+        let out_grid_size = 33u32;
+        let multi = resample_geographic_to_mercator_multi(
+            &[source_a, source_b],
+            &merc_coord, out_grid_size,
+        );
+
+        // Check that no adjacent rows have a height jump > 100m.
+        // With smooth input data, the output should also be smooth.
+        let ogs = out_grid_size as usize;
+        let mut max_jump = 0.0f32;
+        for row in 1..ogs {
+            for col in 0..ogs {
+                let h_prev = multi[(row - 1) * ogs + col];
+                let h_curr = multi[row * ogs + col];
+                let jump = (h_curr - h_prev).abs();
+                if jump > max_jump {
+                    max_jump = jump;
+                }
+            }
+        }
+        assert!(
+            max_jump < 100.0,
+            "Max row-to-row height jump {:.1}m exceeds 100m — cliff wall detected!",
+            max_jump,
+        );
     }
 
     // ── Helpers ────────────────────────────────────────────────

@@ -385,6 +385,7 @@ impl Model3dRenderer {
     /// `model_matrix` transforms from local/ECEF coordinates to world space.
     /// `opacity` is 0.0–1.0 for blending.
     /// `texture_view` is optional; if None, a white placeholder is used.
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_mesh(
         &self,
         gpu: &GpuContext,

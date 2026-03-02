@@ -136,13 +136,15 @@ pub async fn fetch_tile_content(
 // Messages (async → main thread)
 // ═══════════════════════════════════════════════════════════════════
 
+/// Result of 3D Tiles initialization: (tileset, base_url, access_token).
+pub type Tiles3dInitResult = Result<(Tileset, String, Option<String>), String>;
+
 /// Messages sent from async tasks back to the main render loop.
 pub enum Tiles3dMessage {
     /// Auth resolved + tileset.json fetched and parsed.
     Initialized {
         layer_name: String,
-        /// Ok((tileset, base_url, access_token)) or Err(error_message).
-        result: Result<(Tileset, String, Option<String>), String>,
+        result: Box<Tiles3dInitResult>,
     },
     /// A tile's content (B3DM/GLB) has been fetched and decoded.
     ContentLoaded {
@@ -192,10 +194,7 @@ impl Tiles3dLayerState {
         Self {
             name,
             auth,
-            client: reqwest::Client::builder()
-                .user_agent("x-planets/0.1")
-                .build()
-                .expect("Failed to create HTTP client"),
+            client: crate::http_client(),
             tileset: None,
             base_url: String::new(),
             access_token: None,
