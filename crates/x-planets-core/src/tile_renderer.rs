@@ -253,8 +253,9 @@ impl TileRenderer {
         texture_view: &wgpu::TextureView,
         opacity: f32,
         uv_rect: [f32; 4],
+        vp_f64: &glam::DMat4,
     ) -> PreparedTile {
-        let uniforms = tile_uniforms_with_uv(coord, opacity, uv_rect);
+        let uniforms = tile_uniforms_with_uv(coord, opacity, uv_rect, vp_f64);
         let buffer = gpu.create_uniform_buffer("tile-uniforms", &uniforms);
 
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -325,6 +326,9 @@ impl TileRenderer {
         let uniforms = viewport.to_uniforms();
         gpu.update_buffer(&self.viewport_buffer, &uniforms);
 
+        // Compute f64 VP for per-tile MVP (eliminates high-zoom jitter)
+        let vp_f64 = viewport.to_view_proj_f64();
+
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -360,7 +364,7 @@ impl TileRenderer {
                 continue;
             }
 
-            // 2. Build batched vertex/index mesh for this layer
+            // 2. Build batched vertex/index mesh for this layer (RTE positions)
             let coords: Vec<TileCoord> = layer.tiles.iter().map(|t| t.coord).collect();
             let (vertices, indices) = build_tile_mesh(&coords);
 
@@ -377,7 +381,7 @@ impl TileRenderer {
                 &indices,
             );
 
-            // 3. Prepare per-tile bind groups (per-tile opacity override or layer opacity)
+            // 3. Prepare per-tile bind groups (per-tile MVP + opacity)
             let prepared: Vec<PreparedTile> = layer
                 .tiles
                 .iter()
@@ -388,7 +392,7 @@ impl TileRenderer {
                             .get(&rt.coord)
                             .copied()
                             .unwrap_or(layer.opacity);
-                        self.prepare_tile(gpu, &rt.coord, tex_view, tile_opacity, rt.uv_rect)
+                        self.prepare_tile(gpu, &rt.coord, tex_view, tile_opacity, rt.uv_rect, &vp_f64)
                     })
                 })
                 .collect();

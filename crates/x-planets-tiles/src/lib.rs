@@ -10,6 +10,7 @@ pub mod tiles3d;
 
 pub use cache::TileCache;
 pub use decoder::{
-    DecodedRasterTile, DecodedTerrainTile, RasterTileDecoder, TerrainRgbDecoder, TileDecoder,
+    DecodedRasterTile, DecodedTerrainTile, RasterTileDecoder, TerrainEncoding, TerrainRgbDecoder,
+    TerrariumDecoder, TileDecoder,
 };
 pub use loader::{LoadError, TileLoader, TileRequest, TileSource};

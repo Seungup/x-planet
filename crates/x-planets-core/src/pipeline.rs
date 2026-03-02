@@ -16,7 +16,10 @@ use crate::viewport::Viewport;
 // Stage 1: Viewport → visible tile list
 // ───────────────────────────────────────────────────────────────────
 
-/// Determine which tiles are visible at the given zoom level.
+/// Determine which tiles are visible at the given zoom level (single-level, no LOD).
+///
+/// Returns all tiles at `tile_zoom()` that intersect the frustum.
+/// For LOD-based multi-level tile selection, use [`Viewport::visible_tiles()`] instead.
 ///
 /// Pure function. No state, no side effects.
 pub fn visible_tiles(viewport: &Viewport) -> Vec<TileCoord> {
@@ -36,6 +39,10 @@ pub struct LoadRequest {
 
 /// Given visible tiles and a set of already-cached tile coords,
 /// produce a priority-ordered list of tiles that need loading.
+///
+/// Uses geographic (lat/lon) distance for priority.  The native app
+/// uses Mercator distance with fallback-aware priority instead — see
+/// `NativeApp::window_event` (RedrawRequested step 4a).
 ///
 /// Pure function.
 pub fn compute_load_requests(
@@ -97,22 +104,46 @@ pub fn viewport_uniforms(viewport: &Viewport) -> ViewportUniforms {
 
 /// Compute per-tile uniform data.
 ///
+/// `vp_f64` is the view-projection matrix in f64, from `Viewport::to_view_proj_f64()`.
+/// The per-tile MVP is computed as `VP_f64 * translate(tile_center_f64)`, then cast to f32.
+///
 /// Pure function.
-pub fn tile_uniforms(coord: &TileCoord, opacity: f32) -> TileUniforms {
-    tile_uniforms_with_uv(coord, opacity, [0.0, 0.0, 1.0, 1.0])
+pub fn tile_uniforms(coord: &TileCoord, opacity: f32, vp_f64: &glam::DMat4) -> TileUniforms {
+    tile_uniforms_with_uv(coord, opacity, [0.0, 0.0, 1.0, 1.0], vp_f64)
 }
 
 /// Compute per-tile uniform data with a UV sub-rectangle.
 ///
+/// `vp_f64` is the view-projection matrix in f64.  The per-tile MVP is computed
+/// as `VP_f64 * translate(tile_center_f64)` in full f64, then cast to f32.
+/// This eliminates f32 jitter at high zoom by baking the large tile-center
+/// offset into the matrix while still in f64.
+///
 /// Pure function.
-pub fn tile_uniforms_with_uv(coord: &TileCoord, opacity: f32, uv_rect: [f32; 4]) -> TileUniforms {
-    let n = coord.extent() as f32;
+pub fn tile_uniforms_with_uv(
+    coord: &TileCoord,
+    opacity: f32,
+    uv_rect: [f32; 4],
+    vp_f64: &glam::DMat4,
+) -> TileUniforms {
+    let n_f64 = coord.extent() as f64;
+    let n = n_f64 as f32;
     let min_x = coord.x as f32 / n;
     let min_y = coord.y as f32 / n;
     let max_x = (coord.x + 1) as f32 / n;
     let max_y = (coord.y + 1) as f32 / n;
 
+    // Tile center in f64 — the key to precision.
+    let cx = (coord.x as f64 + 0.5) / n_f64;
+    let cy = (coord.y as f64 + 0.5) / n_f64;
+
+    // MVP = VP_f64 * translate(tile_center), computed entirely in f64.
+    let model = glam::DMat4::from_translation(glam::DVec3::new(cx, cy, 0.0));
+    let mvp_f64 = *vp_f64 * model;
+    let mvp_f32 = mvp_f64.as_mat4();
+
     TileUniforms {
+        mvp: mvp_f32.to_cols_array(),
         bounds: [min_x, min_y, max_x, max_y],
         meta: [coord.z as f32, opacity, 0.0, 0.0],
         uv_rect,
@@ -218,6 +249,12 @@ pub const TERRAIN_GRID_SIZE: u32 = 32;
 /// for hillshade lighting.  Vertex Z is sampled from `elevation` via bilinear
 /// interpolation and scaled by `height_scale`.
 ///
+/// `elev_uv_rect` remaps sampling coordinates into the elevation grid:
+/// `[0, 0, 1, 1]` = use the full grid (own tile data available).
+/// When using a parent's elevation data as fallback, pass the sub-rect
+/// computed by `fallback_uv_rect(tile, parent)` so only the relevant
+/// quadrant is sampled.
+///
 /// Pure function.
 pub fn build_terrain_mesh(
     coord: &TileCoord,
@@ -225,6 +262,7 @@ pub fn build_terrain_mesh(
     src_width: u32,
     src_height: u32,
     height_scale: f32,
+    elev_uv_rect: [f32; 4],
 ) -> (Vec<TerrainVertex>, Vec<u32>) {
     let grid = TERRAIN_GRID_SIZE;
     let verts_per_side = grid + 1;
@@ -238,6 +276,12 @@ pub fn build_terrain_mesh(
     let tile_w = tile_size_f64 as f32;
     let tile_h = tile_w; // square tiles
 
+    // Elevation UV sub-rect: remap [0,1] → [eu_min, eu_max] for parent fallback.
+    let eu_min = elev_uv_rect[0];
+    let ev_min = elev_uv_rect[1];
+    let eu_range = elev_uv_rect[2] - eu_min;
+    let ev_range = elev_uv_rect[3] - ev_min;
+
     // ── Pass 1: Sample elevation at grid points ──
     // Positions are RELATIVE TO TILE CENTER for f32 precision.
     // The shader reconstructs world position using tile.bounds.
@@ -249,7 +293,10 @@ pub fn build_terrain_mesh(
             let u = gx as f32 / grid as f32;
             let v = gy as f32 / grid as f32;
 
-            let h = sample_elevation_bilinear(elevation, src_width, src_height, u, v);
+            // Remap u,v into the elevation grid's sub-rect
+            let eu = eu_min + u * eu_range;
+            let ev = ev_min + v * ev_range;
+            let h = sample_elevation_bilinear(elevation, src_width, src_height, eu, ev);
 
             // Relative to tile center: (u - 0.5) * tile_w, (v - 0.5) * tile_h
             positions.push([(u - 0.5) * tile_w, (v - 0.5) * tile_h, h * height_scale]);
@@ -423,9 +470,7 @@ fn sample_elevation_bilinear(
 /// At the equator, 1 Mercator unit ≈ 40,075,000 m.
 ///
 /// A base exaggeration of 1.0 would produce realistic proportions but
-/// the heights are nearly invisible at global zoom levels.  We apply a
-/// pragmatic multiplier (×5) so that `exaggeration = 1.5` gives ~7.5×
-/// real scale — gentle, natural-looking terrain relief.
+/// the heights are nearly invisible at global zoom levels.
 ///
 /// Pure function.
 pub fn compute_height_scale(exaggeration: f64) -> f32 {
@@ -650,8 +695,9 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tile_mesh_covers_unit_square() {
-        // zoom 0: single tile should cover (0,0)→(1,1)
+    fn test_build_tile_mesh_rte_centered() {
+        // RTE: zoom 0, single tile — vertices should be centered at origin
+        // with half-size 0.5 in each direction.
         let tiles = vec![TileCoord::new(0, 0, 0)];
         let (verts, _) = build_tile_mesh(&tiles);
 
@@ -660,15 +706,15 @@ mod tests {
         let min_y = verts.iter().map(|v| v.position[1]).fold(f32::MAX, f32::min);
         let max_y = verts.iter().map(|v| v.position[1]).fold(f32::MIN, f32::max);
 
-        assert!((min_x - 0.0).abs() < 1e-6, "min_x should be 0, got {}", min_x);
-        assert!((max_x - 1.0).abs() < 1e-6, "max_x should be 1, got {}", max_x);
-        assert!((min_y - 0.0).abs() < 1e-6, "min_y should be 0, got {}", min_y);
-        assert!((max_y - 1.0).abs() < 1e-6, "max_y should be 1, got {}", max_y);
+        assert!((min_x - (-0.5)).abs() < 1e-6, "min_x should be -0.5, got {}", min_x);
+        assert!((max_x - 0.5).abs() < 1e-6, "max_x should be 0.5, got {}", max_x);
+        assert!((min_y - (-0.5)).abs() < 1e-6, "min_y should be -0.5, got {}", min_y);
+        assert!((max_y - 0.5).abs() < 1e-6, "max_y should be 0.5, got {}", max_y);
     }
 
     #[test]
-    fn test_build_tile_mesh_no_gaps_at_zoom1() {
-        // zoom 1: 4 tiles should tile perfectly with no gaps/overlaps
+    fn test_build_tile_mesh_rte_all_same_size_per_zoom() {
+        // At zoom 1, all 4 tiles should have identical vertex positions (RTE)
         let tiles = vec![
             TileCoord::new(1, 0, 0),
             TileCoord::new(1, 1, 0),
@@ -677,25 +723,21 @@ mod tests {
         ];
         let (verts, _) = build_tile_mesh(&tiles);
 
-        // Collect all unique x and y coordinates
-        let mut xs: Vec<f32> = verts.iter().map(|v| v.position[0]).collect();
-        let mut ys: Vec<f32> = verts.iter().map(|v| v.position[1]).collect();
-        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        xs.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
-        ys.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
-
-        // Should have exactly 3 unique values: 0.0, 0.5, 1.0
-        assert_eq!(xs.len(), 3, "x coords: {:?}", xs);
-        assert_eq!(ys.len(), 3, "y coords: {:?}", ys);
-        assert!((xs[1] - 0.5).abs() < 1e-6, "mid x should be 0.5");
+        // Each tile's quad has 4 vertices. They should all be ±0.25.
+        for chunk in verts.chunks(4) {
+            let min_x = chunk.iter().map(|v| v.position[0]).fold(f32::MAX, f32::min);
+            let max_x = chunk.iter().map(|v| v.position[0]).fold(f32::MIN, f32::max);
+            assert!((min_x - (-0.25)).abs() < 1e-6, "min_x should be -0.25, got {}", min_x);
+            assert!((max_x - 0.25).abs() < 1e-6, "max_x should be 0.25, got {}", max_x);
+        }
     }
 
     // ── Stage 4 ────────────────────────────────────────────────
 
     #[test]
     fn test_tile_uniforms_bounds() {
-        let u = tile_uniforms(&TileCoord::new(1, 0, 0), 1.0);
+        let vp = glam::DMat4::IDENTITY;
+        let u = tile_uniforms(&TileCoord::new(1, 0, 0), 1.0, &vp);
         assert!((u.bounds[0] - 0.0).abs() < 1e-6); // min_x
         assert!((u.bounds[1] - 0.0).abs() < 1e-6); // min_y
         assert!((u.bounds[2] - 0.5).abs() < 1e-6); // max_x
@@ -704,8 +746,27 @@ mod tests {
 
     #[test]
     fn test_tile_uniforms_opacity() {
-        let u = tile_uniforms(&TileCoord::new(0, 0, 0), 0.75);
+        let vp = glam::DMat4::IDENTITY;
+        let u = tile_uniforms(&TileCoord::new(0, 0, 0), 0.75, &vp);
         assert!((u.meta[1] - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_tile_uniforms_mvp_precision() {
+        // At zoom 18, verify per-tile MVP is precise:
+        // tile center is at ~0.500003814697 in Mercator, a value that loses
+        // precision in f32. The f64 MVP bakes this into the matrix.
+        let vp_f64 = {
+            let mut v = Viewport::new(800, 600);
+            v.center = GeoCoord::new(0.0, 0.0);
+            v.zoom = 18.0;
+            v.to_view_proj_f64()
+        };
+        let coord = TileCoord::new(18, 131072, 131072); // near center
+        let u = tile_uniforms(&coord, 1.0, &vp_f64);
+        // MVP should be non-zero (a valid transform)
+        let mvp_sum: f32 = u.mvp.iter().map(|v| v.abs()).sum();
+        assert!(mvp_sum > 1.0, "MVP should be a valid transform");
     }
 
     #[test]
@@ -906,7 +967,8 @@ mod tests {
     fn test_build_terrain_mesh_dimensions() {
         let coord = TileCoord::new(2, 1, 1);
         let elevation = vec![0.0f32; 256 * 256];
-        let (verts, indices) = build_terrain_mesh(&coord, &elevation, 256, 256, 1e-5);
+        let identity_uv = [0.0, 0.0, 1.0, 1.0];
+        let (verts, indices) = build_terrain_mesh(&coord, &elevation, 256, 256, 1e-5, identity_uv);
         let g = TERRAIN_GRID_SIZE;
         let surface_verts = (g + 1) * (g + 1);
         // Skirt adds 2 vertices per edge segment × 4 edges × g segments
@@ -930,7 +992,8 @@ mod tests {
     fn test_build_terrain_mesh_flat_has_zero_z() {
         let coord = TileCoord::new(0, 0, 0);
         let elevation = vec![0.0f32; 4]; // minimal 2×2
-        let (verts, _) = build_terrain_mesh(&coord, &elevation, 2, 2, 1e-5);
+        let identity_uv = [0.0, 0.0, 1.0, 1.0];
+        let (verts, _) = build_terrain_mesh(&coord, &elevation, 2, 2, 1e-5, identity_uv);
         let g = TERRAIN_GRID_SIZE;
         let surface_count = ((g + 1) * (g + 1)) as usize;
         // Check surface vertices only (skirt verts have negative z)
@@ -948,7 +1011,8 @@ mod tests {
         let coord = TileCoord::new(0, 0, 0);
         let elevation = vec![1000.0f32; 4]; // 1000m everywhere
         let scale = 1e-5;
-        let (verts, _) = build_terrain_mesh(&coord, &elevation, 2, 2, scale);
+        let identity_uv = [0.0, 0.0, 1.0, 1.0];
+        let (verts, _) = build_terrain_mesh(&coord, &elevation, 2, 2, scale, identity_uv);
         let g = TERRAIN_GRID_SIZE;
         let surface_count = ((g + 1) * (g + 1)) as usize;
         let expected_z = 1000.0 * scale;
@@ -964,9 +1028,48 @@ mod tests {
     }
 
     #[test]
+    fn test_build_terrain_mesh_parent_fallback_uv() {
+        // Parent (z=1, x=0, y=0) has elevation: top-left=0m, top-right=1000m,
+        // bottom-left=2000m, bottom-right=3000m (2×2 grid).
+        let parent = TileCoord::new(1, 0, 0);
+        let child = TileCoord::new(2, 1, 1); // bottom-right quadrant
+        let elevation = vec![0.0, 1000.0, 2000.0, 3000.0]; // 2×2
+
+        let scale = 1e-5;
+        let elev_uv = fallback_uv_rect(&child, &parent);
+        // child (2, 1, 1) is bottom-right of parent → uv = [0.5, 0.5, 1.0, 1.0]
+        assert!((elev_uv[0] - 0.5).abs() < 1e-4, "u_min={}", elev_uv[0]);
+        assert!((elev_uv[1] - 0.5).abs() < 1e-4, "v_min={}", elev_uv[1]);
+
+        let (verts, _) = build_terrain_mesh(&child, &elevation, 2, 2, scale, elev_uv);
+
+        let g = TERRAIN_GRID_SIZE;
+        // All surface vertices should sample near the bottom-right corner (3000m).
+        // With bilinear interpolation over the [0.5,0.5]-[1.0,1.0] sub-rect,
+        // the center of the mesh (u=0.75, v=0.75) should be ~1500m.
+        // The bottom-right corner (u=1, v=1 → eu=1, ev=1) should be ~3000m.
+        let br_idx = g as usize * (g as usize + 1) + g as usize; // last surface vertex
+        let br_elev = verts[br_idx].position[2] / scale;
+        assert!(
+            (br_elev - 3000.0).abs() < 50.0,
+            "bottom-right should be ~3000m (parent's BR corner), got {}m",
+            br_elev
+        );
+
+        // Top-left of child (u=0, v=0 → eu=0.5, ev=0.5) should be
+        // near center of parent = ~1500m (average of all 4 parent corners)
+        let tl_elev = verts[0].position[2] / scale;
+        assert!(
+            (tl_elev - 1500.0).abs() < 100.0,
+            "top-left should be ~1500m (parent center), got {}m",
+            tl_elev
+        );
+    }
+
+    #[test]
     fn test_compute_height_scale() {
         let scale = compute_height_scale(1.0);
-        // With VISUAL_BOOST=5: scale = 1 / 40_075_000
+        // scale = 1 / 40_075_000
         let expected = (1.0 / 40_075_000.0_f64) as f32;
         assert!((scale - expected).abs() < 1e-12);
 

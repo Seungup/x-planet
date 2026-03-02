@@ -247,9 +247,17 @@ pub struct ViewportUniforms {
 }
 
 /// Per-tile uniforms uploaded to GPU.
+///
+/// Includes a per-tile model-view-projection matrix computed in f64 on the
+/// CPU.  This eliminates f32 jitter at high zoom levels by baking the
+/// tile-center translation into the matrix while still in f64.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct TileUniforms {
+    /// Per-tile model-view-projection matrix.
+    /// `mvp = VP_f64 * translate(tile_center_f64)`, then cast to f32.
+    /// The shader multiplies this by the RTE vertex position directly.
+    pub mvp: [f32; 16],
     /// Tile world-space bounds (min_x, min_y, max_x, max_y)
     pub bounds: [f32; 4],
     /// Tile metadata (zoom_level, opacity, _pad, _pad)

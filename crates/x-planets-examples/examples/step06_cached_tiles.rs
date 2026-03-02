@@ -47,6 +47,7 @@ struct ViewportUniforms {
 };
 
 struct TileUniforms {
+    mvp: mat4x4<f32>,
     bounds: vec4<f32>,
     tile_meta: vec4<f32>, uv_rect: vec4<f32>,
 };
@@ -67,7 +68,7 @@ struct VertexOutput {
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_pos = viewport.view_proj * vec4<f32>(in.position, 0.0, 1.0);
+    out.clip_pos = tile.mvp * vec4<f32>(in.position, 0.0, 1.0);
     out.uv = in.tex_coord;
     return out;
 }
@@ -207,12 +208,13 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 if let Some(gpu) = &self.gpu {
                     let vu = viewport_uniforms(&self.viewport);
+                    let vp_f64 = self.viewport.to_view_proj_f64();
                     gpu.queue.write_buffer(
                         &gpu.viewport_uniform_buffer,
                         0,
                         bytemuck::bytes_of(&vu),
                     );
-                    render_frame(gpu);
+                    render_frame(gpu, &vp_f64);
                     self.window.as_ref().unwrap().request_redraw();
                 }
             }
@@ -364,6 +366,7 @@ async fn init_gpu(window: Arc<Window>, viewport: &Viewport) -> GpuState {
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
     let tu = TileUniforms {
+        mvp: [0.0; 16],
         bounds: [0.0; 4],
         meta: [0.0, 1.0, 0.0, 0.0], uv_rect: [0.0, 0.0, 1.0, 1.0],
     };
@@ -459,7 +462,7 @@ async fn init_gpu(window: Arc<Window>, viewport: &Viewport) -> GpuState {
     }
 }
 
-fn render_frame(gpu: &GpuState) {
+fn render_frame(gpu: &GpuState, vp_f64: &glam::DMat4) {
     let frame = match gpu.surface.get_current_texture() {
         Ok(f) => f,
         Err(_) => return,
@@ -496,7 +499,7 @@ fn render_frame(gpu: &GpuState) {
         for (i, coord) in gpu.visible_tiles.iter().enumerate() {
             let is_cached = gpu.cached_set.contains(coord);
             let opacity = if is_cached { 1.0 } else { 0.3 }; // dim = loading
-            let tu = tile_uniforms(coord, opacity);
+            let tu = tile_uniforms(coord, opacity, vp_f64);
             gpu.queue.write_buffer(&gpu.tile_uniform_buffer, 0, bytemuck::bytes_of(&tu));
 
             pass.set_bind_group(1, &gpu.tile_bind_group, &[]);

@@ -1,8 +1,13 @@
 //! GPU terrain renderer using terrain_tile.wgsl.
 //!
-//! Renders terrain tiles as displaced 3D meshes (17×17 vertex grid per tile).
+//! Renders terrain tiles as displaced 3D meshes (33×33 vertex grid per tile).
 //! Each tile's vertices are displaced by elevation data on the CPU, then
 //! rendered with the imagery texture draped on top.
+//!
+//! **Mesh caching**: vertex/index buffers are built once per tile and cached
+//! until the elevation source changes or exaggeration is adjusted.
+//! Only the per-tile uniform buffer + bind group are recreated each frame
+//! (they depend on the camera's VP matrix).
 //!
 //! Uses the same bind group layouts as `TileRenderer` (viewport + tile uniforms
 //! + texture + sampler) so the shaders share a uniform interface.
@@ -10,10 +15,10 @@
 use x_planets_gpu::GpuContext;
 use x_planets_math::{TileCoord, ViewportUniforms};
 
-use crate::pipeline::{build_terrain_mesh, compute_height_scale, tile_uniforms_with_uv, RenderableTile};
+use crate::pipeline::{build_terrain_mesh, compute_height_scale, fallback_uv_rect, tile_uniforms_with_uv, RenderableTile};
 use crate::render::TerrainVertex;
 use crate::viewport::Viewport;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const TERRAIN_TILE_SHADER: &str = include_str!("../../../shaders/rendering/terrain_tile.wgsl");
 
@@ -35,18 +40,32 @@ pub struct TerrainLayerData<'a> {
     /// Imagery texture views (draped onto the terrain mesh).
     pub imagery_views: HashMap<TileCoord, &'a wgpu::TextureView>,
     /// Elevation data per tile (used to build displaced mesh on CPU).
-    pub elevation_data: HashMap<TileCoord, &'a TerrainTileData>,
+    /// Value is `(data, source_coord)`: when `source_coord != render_coord`,
+    /// the data comes from a parent tile and only the relevant sub-rect
+    /// should be sampled (computed via `fallback_uv_rect`).
+    pub elevation_data: HashMap<TileCoord, (&'a TerrainTileData, TileCoord)>,
     /// Per-tile opacity overrides (for fade-in animation).
     pub tile_opacity_overrides: HashMap<TileCoord, f32>,
 }
 
-/// A terrain tile prepared for rendering (owns its GPU resources).
-struct PreparedTerrainTile {
-    _uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+/// Cached vertex/index buffers for a terrain tile mesh.
+/// These are static once built — they only depend on the tile coord,
+/// elevation data, and exaggeration (height_scale).
+struct CachedMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+    /// Which elevation tile was used (for invalidation).
+    elev_source: TileCoord,
+}
+
+/// Per-frame tile data: uniform buffer + bind group that depend on the
+/// current camera VP, opacity, and imagery texture.
+struct FrameTile {
+    _uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    /// Index into the mesh cache (by TileCoord).
+    coord: TileCoord,
 }
 
 /// Renders terrain tiles with 3D displaced meshes.
@@ -63,6 +82,11 @@ pub struct TerrainRenderer {
     surface_height: u32,
     /// Elevation exaggeration factor (default: 1.5 for visual effect).
     pub exaggeration: f64,
+    /// Cached vertex/index buffers keyed by render coord.
+    mesh_cache: HashMap<TileCoord, CachedMesh>,
+    /// Exaggeration value when the cache was last valid.
+    /// If exaggeration changes, the entire cache is invalidated.
+    cached_exaggeration: f64,
 }
 
 impl TerrainRenderer {
@@ -170,6 +194,8 @@ impl TerrainRenderer {
                     }),
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleList,
+                        front_face: wgpu::FrontFace::Cw,
+                        cull_mode: Some(wgpu::Face::Back),
                         ..Default::default()
                     },
                     depth_stencil: Some(wgpu::DepthStencilState {
@@ -222,6 +248,8 @@ impl TerrainRenderer {
         let depth_view =
             Self::create_depth_texture(&gpu.device, surface_width, surface_height, depth_format);
 
+        let exaggeration = 1.5;
+
         log::info!(
             "TerrainRenderer created (format: {:?}, depth: {:?})",
             format,
@@ -239,7 +267,9 @@ impl TerrainRenderer {
             depth_format,
             surface_width,
             surface_height,
-            exaggeration: 1.5,
+            exaggeration,
+            mesh_cache: HashMap::new(),
+            cached_exaggeration: exaggeration,
         }
     }
 
@@ -277,73 +307,61 @@ impl TerrainRenderer {
         }
     }
 
-    /// Prepare a single terrain tile: build displaced mesh + create bind group.
-    fn prepare_tile(
-        &self,
+    /// Get or build the cached mesh for a terrain tile.
+    ///
+    /// Returns the cached vertex/index buffers if the elevation source
+    /// hasn't changed, otherwise rebuilds the mesh and updates the cache.
+    fn get_or_build_mesh(
+        &mut self,
         gpu: &GpuContext,
         coord: &TileCoord,
-        texture_view: &wgpu::TextureView,
-        opacity: f32,
-        uv_rect: [f32; 4],
         elevation: &TerrainTileData,
-    ) -> PreparedTerrainTile {
-        let height_scale = compute_height_scale(self.exaggeration);
+        elev_uv_rect: [f32; 4],
+        elev_source: TileCoord,
+        height_scale: f32,
+    ) -> &CachedMesh {
+        // Check if cache entry is still valid
+        let needs_rebuild = match self.mesh_cache.get(coord) {
+            Some(cached) => cached.elev_source != elev_source,
+            None => true,
+        };
 
-        // Build displaced mesh from elevation data
-        let (vertices, indices) = build_terrain_mesh(
-            coord,
-            &elevation.elevation,
-            elevation.width,
-            elevation.height,
-            height_scale,
-        );
+        if needs_rebuild {
+            let (vertices, indices) = build_terrain_mesh(
+                coord,
+                &elevation.elevation,
+                elevation.width,
+                elevation.height,
+                height_scale,
+                elev_uv_rect,
+            );
 
-        let vertex_buffer = gpu.create_vertex_buffer(
-            &format!("terrain-verts-{}-{}-{}", coord.z, coord.x, coord.y),
-            &vertices,
-        );
-        let index_buffer = gpu.create_index_buffer(
-            &format!("terrain-idx-{}-{}-{}", coord.z, coord.x, coord.y),
-            &indices,
-        );
+            let vertex_buffer = gpu.create_vertex_buffer(
+                &format!("terrain-verts-{}-{}-{}", coord.z, coord.x, coord.y),
+                &vertices,
+            );
+            let index_buffer = gpu.create_index_buffer(
+                &format!("terrain-idx-{}-{}-{}", coord.z, coord.x, coord.y),
+                &indices,
+            );
 
-        let uniforms = tile_uniforms_with_uv(coord, opacity, uv_rect);
-        let uniform_buffer = gpu.create_uniform_buffer("terrain-tile-uniforms", &uniforms);
-
-        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("terrain-tile-bg"),
-            layout: &self.tile_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-
-        PreparedTerrainTile {
-            _uniform_buffer: uniform_buffer,
-            bind_group,
-            vertex_buffer,
-            index_buffer,
-            index_count: indices.len() as u32,
+            self.mesh_cache.insert(*coord, CachedMesh {
+                vertex_buffer,
+                index_buffer,
+                index_count: indices.len() as u32,
+                elev_source,
+            });
         }
+
+        self.mesh_cache.get(coord).unwrap()
     }
 
     /// Render terrain layers to the target surface.
     ///
     /// Terrain layers use `LoadOp::Load` for color (preserves raster layers already drawn)
-    /// and `LoadOp::Load` for depth (shares depth with raster layers for proper occlusion).
+    /// and `LoadOp::Clear` for depth (own depth buffer).
     pub fn render_terrain_layered(
-        &self,
+        &mut self,
         gpu: &GpuContext,
         target: &wgpu::TextureView,
         viewport: &Viewport,
@@ -353,36 +371,95 @@ impl TerrainRenderer {
             return;
         }
 
+        // Invalidate mesh cache if exaggeration changed.
+        if (self.exaggeration - self.cached_exaggeration).abs() > 1e-9 {
+            self.mesh_cache.clear();
+            self.cached_exaggeration = self.exaggeration;
+        }
+
+        let height_scale = compute_height_scale(self.exaggeration);
+
         // Update viewport uniforms
         let uniforms = viewport.to_uniforms();
         gpu.update_buffer(&self.viewport_buffer, &uniforms);
+
+        // Compute f64 VP for per-tile MVP (eliminates high-zoom jitter)
+        let vp_f64 = viewport.to_view_proj_f64();
+
+        // Track which tiles are rendered this frame for cache eviction.
+        let mut rendered_coords = HashSet::new();
 
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
         for layer in layers {
-            // Prepare tiles that have both imagery textures and elevation data
-            let prepared: Vec<PreparedTerrainTile> = layer
+            // Phase 1: Ensure meshes are cached for all visible tiles.
+            // This is the expensive part — but only runs for NEW tiles.
+            let tile_data: Vec<_> = layer
                 .tiles
                 .iter()
                 .filter_map(|rt| {
                     let tex_view = layer.imagery_views.get(&rt.texture_coord)?;
-                    let elev = layer.elevation_data.get(&rt.coord)?;
+                    let (elev, elev_source) = layer.elevation_data.get(&rt.coord)?;
                     let tile_opacity = layer
                         .tile_opacity_overrides
                         .get(&rt.coord)
                         .copied()
                         .unwrap_or(layer.opacity);
-                    Some(self.prepare_tile(gpu, &rt.coord, tex_view, tile_opacity, rt.uv_rect, elev))
+                    let elev_uv = fallback_uv_rect(&rt.coord, elev_source);
+
+                    Some((rt, *tex_view, *elev, *elev_source, elev_uv, tile_opacity))
                 })
                 .collect();
 
-            if prepared.is_empty() {
+            // Build/fetch cached meshes
+            for &(rt, _, elev, elev_source, elev_uv, _) in &tile_data {
+                self.get_or_build_mesh(gpu, &rt.coord, elev, elev_uv, elev_source, height_scale);
+                rendered_coords.insert(rt.coord);
+            }
+
+            // Phase 2: Create per-frame uniform + bind group (cheap).
+            let frame_tiles: Vec<FrameTile> = tile_data
+                .iter()
+                .filter_map(|&(rt, tex_view, _, _, _, tile_opacity)| {
+                    let _cached = self.mesh_cache.get(&rt.coord)?;
+
+                    let tile_uniforms = tile_uniforms_with_uv(&rt.coord, tile_opacity, rt.uv_rect, &vp_f64);
+                    let uniform_buffer = gpu.create_uniform_buffer("terrain-tile-uniforms", &tile_uniforms);
+
+                    let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("terrain-tile-bg"),
+                        layout: &self.tile_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: uniform_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(tex_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                        ],
+                    });
+
+                    Some(FrameTile {
+                        _uniform_buffer: uniform_buffer,
+                        bind_group,
+                        coord: rt.coord,
+                    })
+                })
+                .collect();
+
+            if frame_tiles.is_empty() {
                 continue;
             }
 
-            // Render pass: Load color (preserve raster), Load depth (share depth buffer)
+            // Phase 3: Render pass — reference cached vertex/index buffers.
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("terrain-render-pass"),
@@ -408,15 +485,23 @@ impl TerrainRenderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.viewport_bg, &[]);
 
-                for tile in &prepared {
-                    pass.set_bind_group(1, &tile.bind_group, &[]);
-                    pass.set_vertex_buffer(0, tile.vertex_buffer.slice(..));
-                    pass.set_index_buffer(tile.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..tile.index_count, 0, 0..1);
+                for ft in &frame_tiles {
+                    if let Some(cached) = self.mesh_cache.get(&ft.coord) {
+                        pass.set_bind_group(1, &ft.bind_group, &[]);
+                        pass.set_vertex_buffer(0, cached.vertex_buffer.slice(..));
+                        pass.set_index_buffer(cached.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..cached.index_count, 0, 0..1);
+                    }
                 }
             }
         }
 
         gpu.queue.submit(std::iter::once(encoder.finish()));
+
+        // Evict cached meshes for tiles no longer visible.
+        // Keep a generous margin — only evict if cache is large AND tile is not rendered.
+        if self.mesh_cache.len() > rendered_coords.len() + 64 {
+            self.mesh_cache.retain(|coord, _| rendered_coords.contains(coord));
+        }
     }
 }

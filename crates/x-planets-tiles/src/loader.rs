@@ -289,4 +289,55 @@ mod tests {
         let req3 = loader.dequeue().unwrap();
         assert_eq!(req3.coord.z, 5); // now the second z=5 tile
     }
+
+    #[test]
+    fn test_clear_and_reenqueue_pattern() {
+        // Reproduces the NativeApp frame loop: enqueue visible tiles, clear()
+        // next frame drops un-dequeued tiles, then re-enqueue them fresh.
+        // This verifies tiles are NOT lost after clear().
+        let mut loader = TileLoader::new(2);
+
+        // Frame 1: enqueue 5 tiles, only 2 dequeued (max_concurrent=2)
+        loader.enqueue(TileRequest { coord: TileCoord::new(5, 0, 0), priority: 1.0 });
+        loader.enqueue(TileRequest { coord: TileCoord::new(5, 1, 0), priority: 2.0 });
+        loader.enqueue(TileRequest { coord: TileCoord::new(5, 0, 1), priority: 3.0 });
+        loader.enqueue(TileRequest { coord: TileCoord::new(5, 1, 1), priority: 4.0 });
+        loader.enqueue(TileRequest { coord: TileCoord::new(5, 2, 0), priority: 5.0 });
+
+        let d1 = loader.dequeue().unwrap(); // priority 1.0
+        let d2 = loader.dequeue().unwrap(); // priority 2.0
+        assert!(loader.dequeue().is_none()); // at max
+        assert_eq!(d1.coord, TileCoord::new(5, 0, 0));
+        assert_eq!(d2.coord, TileCoord::new(5, 1, 0));
+        assert_eq!(loader.pending_count(), 3); // 3 still in queue
+        assert_eq!(loader.active_count(), 2);
+
+        // Frame 2: clear() drops the 3 un-dequeued tiles. One in-flight completes.
+        loader.clear();
+        assert_eq!(loader.pending_count(), 0);
+        assert_eq!(loader.active_count(), 2); // in-flight preserved
+
+        loader.complete(); // d1 done → active=1
+
+        // Re-enqueue the 3 tiles that were dropped (with fresh priorities)
+        loader.enqueue(TileRequest { coord: TileCoord::new(5, 0, 1), priority: 1.5 });
+        loader.enqueue(TileRequest { coord: TileCoord::new(5, 1, 1), priority: 2.5 });
+        loader.enqueue(TileRequest { coord: TileCoord::new(5, 2, 0), priority: 3.5 });
+
+        // Now can dequeue 1 (active=1, max=2)
+        let d3 = loader.dequeue().unwrap();
+        assert_eq!(d3.coord, TileCoord::new(5, 0, 1)); // highest priority
+        assert_eq!(loader.active_count(), 2);
+        assert!(loader.dequeue().is_none()); // at max again
+
+        // d2 completes → active=1
+        loader.complete();
+        let d4 = loader.dequeue().unwrap();
+        assert_eq!(d4.coord, TileCoord::new(5, 1, 1));
+
+        // Verify the last tile can still be dequeued
+        loader.complete();
+        let d5 = loader.dequeue().unwrap();
+        assert_eq!(d5.coord, TileCoord::new(5, 2, 0));
+    }
 }

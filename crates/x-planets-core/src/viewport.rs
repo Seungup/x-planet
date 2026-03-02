@@ -314,6 +314,45 @@ impl Viewport {
         result
     }
 
+    /// Compute the view-projection matrix in f64 for high-precision per-tile MVP.
+    ///
+    /// Same camera geometry as `to_uniforms()` but uses `DMat4` throughout
+    /// to avoid f32 precision loss at high zoom levels.  Each tile computes
+    /// `MVP = VP_f64 * translate(tile_center_f64)` in f64, then casts to f32.
+    /// This eliminates the ~14px jitter at zoom 18+ caused by f32 VP.
+    pub fn to_view_proj_f64(&self) -> glam::DMat4 {
+        let center_merc = geo_to_mercator(&self.center);
+        let scale = 2.0_f64.powf(self.zoom);
+        let aspect = self.width as f64 / self.height as f64;
+        let cx = center_merc.x;
+        let cy = center_merc.y;
+
+        let half_h = 1.0 / scale;
+
+        let fov_y: f64 = std::f64::consts::FRAC_PI_3; // 60°
+        let cam_h = half_h / (fov_y * 0.5).tan();
+
+        let pitch_rad = self.pitch.to_radians();
+        let bearing_rad = self.bearing.to_radians();
+        let sin_b = bearing_rad.sin();
+        let cos_b = bearing_rad.cos();
+
+        let up = glam::DVec3::new(sin_b, -cos_b, 0.0);
+
+        let eye = glam::DVec3::new(
+            cx - sin_b * cam_h * pitch_rad.sin(),
+            cy + cos_b * cam_h * pitch_rad.sin(),
+            cam_h * pitch_rad.cos(),
+        );
+        let target = glam::DVec3::new(cx, cy, 0.0);
+
+        let view = glam::DMat4::look_at_rh(eye, target, up);
+        let proj = glam::DMat4::perspective_rh(fov_y, aspect, cam_h * 0.005, cam_h * 10.0);
+
+        let flip_x = glam::DMat4::from_diagonal(glam::DVec4::new(-1.0, 1.0, 1.0, 1.0));
+        flip_x * proj * view
+    }
+
     /// Compute GPU uniforms for this viewport.
     ///
     /// Uses perspective projection so pitch and bearing work correctly.

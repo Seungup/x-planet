@@ -7,6 +7,7 @@
 use crate::viewport::{CameraController, Viewport};
 use x_planets_math::GeoCoord;
 use x_planets_projection::ProjectionRegistry;
+use x_planets_tiles::TerrainEncoding;
 
 // ═══════════════════════════════════════════════════════════════════
 // Layer types
@@ -17,11 +18,13 @@ use x_planets_projection::ProjectionRegistry;
 pub enum LayerKind {
     /// Standard raster imagery (PNG/JPEG tiles rendered as flat quads).
     Raster,
-    /// Terrain elevation (Mapbox Terrain RGB tiles rendered as displaced meshes).
+    /// Terrain elevation tiles rendered as displaced meshes.
     /// The `imagery_layer` names the companion raster layer whose textures are
     /// draped onto the terrain mesh.
+    /// The `encoding` selects the elevation decoding formula (MapboxRgb or Terrarium).
     Terrain {
         imagery_layer: String,
+        encoding: TerrainEncoding,
     },
     /// OGC 3D Tiles (glTF/B3DM models in ECEF coordinates).
     /// Requires `cesium_ion_token` + `cesium_ion_asset_id` or `google_api_key`

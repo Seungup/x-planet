@@ -99,20 +99,24 @@ impl Default for LayerStack {
     }
 }
 
-/// Quad vertices for a single tile.
-/// Each tile is rendered as two triangles forming a quad.
+/// Quad vertices for a single tile (Relative-To-Center).
+///
+/// Positions are relative to the tile center, NOT absolute Mercator coordinates.
+/// This avoids f32 precision loss at high zoom levels.  The per-tile MVP matrix
+/// (computed in f64 on the CPU) handles the translation to world/clip space.
+///
+/// At zoom z, each tile spans `1 / 2^z` in Mercator space, so the half-size
+/// is `0.5 / 2^z`.  Vertices are at `(±hw, ±hh)` centered on the origin.
 pub fn tile_quad_vertices(coord: &TileCoord) -> [TileVertex; 4] {
     let n = coord.extent() as f32;
-    let x0 = coord.x as f32 / n;
-    let y0 = coord.y as f32 / n;
-    let x1 = (coord.x + 1) as f32 / n;
-    let y1 = (coord.y + 1) as f32 / n;
+    let hw = 0.5 / n; // half-width
+    let hh = 0.5 / n; // half-height
 
     [
-        TileVertex { position: [x0, y0], tex_coord: [0.0, 0.0] },
-        TileVertex { position: [x1, y0], tex_coord: [1.0, 0.0] },
-        TileVertex { position: [x0, y1], tex_coord: [0.0, 1.0] },
-        TileVertex { position: [x1, y1], tex_coord: [1.0, 1.0] },
+        TileVertex { position: [-hw, -hh], tex_coord: [0.0, 0.0] },
+        TileVertex { position: [ hw, -hh], tex_coord: [1.0, 0.0] },
+        TileVertex { position: [-hw,  hh], tex_coord: [0.0, 1.0] },
+        TileVertex { position: [ hw,  hh], tex_coord: [1.0, 1.0] },
     ]
 }
 
@@ -191,12 +195,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tile_quad_vertices() {
+    fn test_tile_quad_vertices_rte() {
+        // RTE: vertices are relative to tile center, NOT absolute Mercator.
         let coord = TileCoord::new(1, 0, 0);
         let verts = tile_quad_vertices(&coord);
-        // At zoom 1, tile (0,0) covers 0..0.5 in both axes
-        assert!((verts[0].position[0] - 0.0).abs() < 1e-6);
+        // At zoom 1, tile half-size = 0.5 / 2 = 0.25
+        // Vertices should be at (-0.25, -0.25) to (0.25, 0.25)
+        assert!((verts[0].position[0] - (-0.25)).abs() < 1e-6);
+        assert!((verts[0].position[1] - (-0.25)).abs() < 1e-6);
+        assert!((verts[3].position[0] - 0.25).abs() < 1e-6);
+        assert!((verts[3].position[1] - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_tile_quad_vertices_zoom0() {
+        // At zoom 0, single tile has half-size = 0.5
+        let coord = TileCoord::new(0, 0, 0);
+        let verts = tile_quad_vertices(&coord);
+        assert!((verts[0].position[0] - (-0.5)).abs() < 1e-6);
         assert!((verts[3].position[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_tile_quad_vertices_area() {
+        // Area should be (1/n)^2 regardless of tile position.
+        for z in 0..=4u8 {
+            let n = 1u32 << z;
+            for x in 0..n {
+                for y in 0..n {
+                    let verts = tile_quad_vertices(&TileCoord::new(z, x, y));
+                    let w = verts[1].position[0] - verts[0].position[0];
+                    let h = verts[2].position[1] - verts[0].position[1];
+                    let expected_size = 1.0 / n as f32;
+                    assert!(
+                        (w - expected_size).abs() < 1e-6,
+                        "z={} x={} y={}: width {} != {}",
+                        z, x, y, w, expected_size
+                    );
+                    assert!(
+                        (h - expected_size).abs() < 1e-6,
+                        "z={} x={} y={}: height {} != {}",
+                        z, x, y, h, expected_size
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_tile_quad_vertices_centered_at_origin() {
+        // All tiles should have vertices centered around (0, 0).
+        for z in 1..=3u8 {
+            let n = 1u32 << z;
+            for x in 0..n {
+                for y in 0..n {
+                    let verts = tile_quad_vertices(&TileCoord::new(z, x, y));
+                    let cx = (verts[0].position[0] + verts[3].position[0]) / 2.0;
+                    let cy = (verts[0].position[1] + verts[3].position[1]) / 2.0;
+                    assert!(
+                        cx.abs() < 1e-6 && cy.abs() < 1e-6,
+                        "z={} x={} y={}: center ({}, {}) should be (0, 0)",
+                        z, x, y, cx, cy
+                    );
+                }
+            }
+        }
     }
 
     #[test]

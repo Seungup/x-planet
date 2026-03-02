@@ -29,8 +29,8 @@ use x_planets_core::{
 use x_planets_gpu::{GpuContext, GpuTexture, TextureManager};
 use x_planets_math::TileCoord;
 use x_planets_tiles::{
-    DecodedRasterTile, DecodedTerrainTile, RasterTileDecoder, TerrainRgbDecoder, TileCache,
-    TileDecoder, TileLoader, TileRequest, TileSource,
+    DecodedRasterTile, DecodedTerrainTile, RasterTileDecoder, TerrainEncoding, TerrainRgbDecoder,
+    TerrariumDecoder, TileCache, TileDecoder, TileLoader, TileRequest, TileSource,
 };
 
 use tiles3d_native::{
@@ -203,6 +203,9 @@ struct NativeLayerState {
     pending_coords: HashSet<TileCoord>,
     /// Elevation data for terrain layers (CPU-side, used for mesh generation).
     terrain_data: HashMap<TileCoord, TerrainTileData>,
+    /// Cooldown for failed tiles: don't retry until the Instant has passed.
+    /// Prevents infinite retry loops when the server returns 429 / transient errors.
+    failed_cooldowns: HashMap<TileCoord, Instant>,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -439,6 +442,7 @@ impl ApplicationHandler for NativeApp {
                     tile_loader: TileLoader::new(cfg.max_concurrent_loads),
                     pending_coords: HashSet::new(),
                     terrain_data: HashMap::new(),
+                    failed_cooldowns: HashMap::new(),
                 }
             })
             .collect();
@@ -757,13 +761,15 @@ impl ApplicationHandler for NativeApp {
 
                 for ls in &mut self.layer_states {
                     // ── Abort stale requests ──
-                    // Clear the priority queue so stale entries from previous frames
-                    // don't block new visible tiles from being dequeued.
+                    // Clear the priority queue every frame.  Tiles that were queued
+                    // but never dequeued (max_concurrent reached) are NOT in
+                    // pending_coords, so they'll be naturally re-enqueued below
+                    // with fresh priorities.
                     ls.tile_loader.clear();
 
                     // Prune pending_coords for tiles at distant zoom levels.
-                    // In-flight tasks will still complete (results cached by LRU),
-                    // but freeing the concurrency slot lets current-view tiles load faster.
+                    // These are truly in-flight (task spawned), so freeing their
+                    // concurrency slot lets current-view tiles load faster.
                     let stale_coords: Vec<TileCoord> = ls.pending_coords
                         .iter()
                         .filter(|c| {
@@ -777,29 +783,89 @@ impl ApplicationHandler for NativeApp {
                         ls.tile_loader.complete(); // free concurrency slot
                     }
 
-                    // Enqueue only currently visible tiles (fresh priorities)
+                    // GC expired cooldowns (once per frame is cheap).
+                    ls.failed_cooldowns.retain(|_, expire| now < *expire);
+
+                    // Enqueue visible tiles that are not yet loaded or in-flight.
+                    // Priority: distance from camera × fallback penalty.
+                    // Tiles with no/distant fallback texture are prioritized
+                    // (lower value = higher priority in the min-heap).
                     for &coord in &visible {
-                        if ls.tile_textures.contains(&coord) || ls.pending_coords.contains(&coord) {
+                        if ls.tile_textures.contains(&coord)
+                            || ls.pending_coords.contains(&coord)
+                            || ls.failed_cooldowns.contains_key(&coord)
+                        {
                             continue;
                         }
                         let tile_center = coord.mercator_center();
                         let dist = (tile_center - camera_center).length() as f32;
-                        ls.tile_loader.enqueue(TileRequest { coord, priority: dist });
-                        ls.pending_coords.insert(coord);
+
+                        // Fallback depth: how many zoom levels up to the nearest
+                        // cached ancestor?  0 = no ancestor at all (blank tile!).
+                        let fallback_depth = {
+                            let mut depth = 0u32;
+                            let mut cur = coord.parent();
+                            loop {
+                                match cur {
+                                    Some(c) if ls.tile_textures.contains(&c) => {
+                                        depth += 1;
+                                        break;
+                                    }
+                                    Some(c) => {
+                                        depth += 1;
+                                        cur = c.parent();
+                                    }
+                                    None => {
+                                        depth = 0; // no ancestor found
+                                        break;
+                                    }
+                                }
+                            }
+                            depth
+                        };
+                        // No fallback (depth=0) → factor=0.5 (boost priority)
+                        // Close fallback (depth=1) → factor=1.5 (deprioritize)
+                        // Distant fallback (depth≥3) → factor=1.0 (normal)
+                        let fallback_factor = match fallback_depth {
+                            0 => 0.5,
+                            1 => 1.5,
+                            2 => 1.2,
+                            _ => 1.0,
+                        };
+                        ls.tile_loader.enqueue(TileRequest {
+                            coord,
+                            priority: dist * fallback_factor,
+                        });
+                        // NOTE: Do NOT insert into pending_coords here!
+                        // pending_coords tracks only truly in-flight tasks (spawned).
+                        // Tiles that stay in the queue are dropped by clear() next
+                        // frame and re-enqueued with fresh priorities.
                     }
 
-                    // Dequeue & spawn (route decoder by layer kind)
-                    let is_terrain = matches!(ls.kind, LayerKind::Terrain { .. });
+                    // Dequeue & spawn (route decoder by layer kind).
+                    // Insert into pending_coords ONLY when a task is actually spawned.
+                    let terrain_encoding = match &ls.kind {
+                        LayerKind::Terrain { encoding, .. } => Some(*encoding),
+                        _ => None,
+                    };
                     while let Some(req) = ls.tile_loader.dequeue() {
+                        ls.pending_coords.insert(req.coord);
                         let source = Arc::clone(&ls.tile_source);
                         let tx = self.tile_tx.clone();
                         let layer_name = ls.name.clone();
-                        if is_terrain {
+                        if let Some(enc) = terrain_encoding {
                             self.rt.spawn(async move {
                                 let result = match source.fetch(req.coord).await {
                                     Ok(bytes) => {
-                                        let decoder = TerrainRgbDecoder;
-                                        match decoder.decode(req.coord, &bytes).await {
+                                        let decoded = match enc {
+                                            TerrainEncoding::MapboxRgb => {
+                                                TerrainRgbDecoder.decode(req.coord, &bytes).await
+                                            }
+                                            TerrainEncoding::Terrarium => {
+                                                TerrariumDecoder.decode(req.coord, &bytes).await
+                                            }
+                                        };
+                                        match decoded {
                                             Ok(decoded) => Ok(TileResult::Terrain(decoded)),
                                             Err(e) => Err((req.coord, e.to_string())),
                                         }
@@ -886,7 +952,16 @@ impl ApplicationHandler for NativeApp {
                                 if ls.pending_coords.remove(&coord) {
                                     ls.tile_loader.complete();
                                 }
-                                log::warn!("[{}] Tile load failed {}: {}", ls.name, coord, err_msg);
+                                // Backoff cooldown: 429 → 30s, other errors → 5s.
+                                let cooldown_secs = if err_msg.contains("429") { 30 } else { 5 };
+                                ls.failed_cooldowns.insert(
+                                    coord,
+                                    now + std::time::Duration::from_secs(cooldown_secs),
+                                );
+                                log::warn!(
+                                    "[{}] Tile load failed {} (retry in {}s): {}",
+                                    ls.name, coord, cooldown_secs, err_msg,
+                                );
                             }
                         }
                     }
@@ -904,14 +979,26 @@ impl ApplicationHandler for NativeApp {
                 let mut render_layers: Vec<RenderLayerData> = Vec::new();
                 let mut terrain_layers: Vec<TerrainLayerData> = Vec::new();
 
+                // Collect raster layer names that are used as imagery for terrain layers.
+                // These will be skipped in the flat raster render pass — they're already
+                // draped onto the 3D terrain mesh.
+                let terrain_imagery_names: HashSet<&str> = engine
+                    .visible_layers()
+                    .filter_map(|l| match &l.config.kind {
+                        LayerKind::Terrain { imagery_layer, .. } => Some(imagery_layer.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+
                 for layer in engine.visible_layers() {
                     if let Some(ls) = self.layer_states.iter().find(|s| s.name == layer.config.name) {
                         match &layer.config.kind {
                             LayerKind::Raster => {
-                                // Companion imagery layers are ALSO rendered flat as a
-                                // background — terrain tiles will render on top with depth
-                                // testing, covering the flat imagery where terrain exists.
-                                // Areas without terrain (gaps, unloaded) show flat imagery.
+                                // Skip raster layers that serve as terrain imagery —
+                                // they're already draped onto the 3D terrain mesh.
+                                if terrain_imagery_names.contains(layer.config.name.as_str()) {
+                                    continue;
+                                }
 
                                 // Resolve fallbacks
                                 let available: HashSet<TileCoord> =
@@ -952,7 +1039,7 @@ impl ApplicationHandler for NativeApp {
                             LayerKind::Tiles3d => {
                                 // 3D Tiles layers are handled separately below.
                             }
-                            LayerKind::Terrain { imagery_layer } => {
+                            LayerKind::Terrain { imagery_layer, .. } => {
                                 // Find companion imagery layer's texture views
                                 let imagery_ls = self
                                     .layer_states
@@ -979,7 +1066,9 @@ impl ApplicationHandler for NativeApp {
                                     // Elevation data with parent fallback:
                                     // If elevation for a tile's exact coord isn't available,
                                     // walk up to parent coords until we find one.
-                                    let mut elevation_data: HashMap<TileCoord, &TerrainTileData> =
+                                    // Value = (data, source_coord) so the renderer can compute
+                                    // the correct UV sub-rect for parent-tile sampling.
+                                    let mut elevation_data: HashMap<TileCoord, (&TerrainTileData, TileCoord)> =
                                         HashMap::new();
                                     let all_needed: HashSet<TileCoord> = renderable
                                         .iter()
@@ -990,7 +1079,7 @@ impl ApplicationHandler for NativeApp {
                                         let mut c = Some(coord);
                                         while let Some(candidate) = c {
                                             if let Some(data) = ls.terrain_data.get(&candidate) {
-                                                elevation_data.insert(coord, data);
+                                                elevation_data.insert(coord, (data, candidate));
                                                 break;
                                             }
                                             c = candidate.parent();
@@ -1035,7 +1124,7 @@ impl ApplicationHandler for NativeApp {
 
                 // Render terrain layers (displaced meshes) on top of raster
                 if !terrain_layers.is_empty() {
-                    if let Some(terrain_renderer) = &self.terrain_renderer {
+                    if let Some(terrain_renderer) = &mut self.terrain_renderer {
                         terrain_renderer.render_terrain_layered(
                             gpu,
                             &view,

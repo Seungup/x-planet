@@ -1,7 +1,7 @@
 // Terrain Tile Rendering Shader
 //
 // Renders terrain mesh tiles with 3D displaced vertices and hillshade lighting.
-// Vertex shader: transforms 3D tile vertices through view-projection.
+// Vertex shader: transforms RTE 3D tile vertices through per-tile MVP to clip space.
 // Fragment shader: samples the imagery texture draped onto the terrain,
 //                  blended with a directional light hillshade.
 
@@ -14,6 +14,7 @@ struct ViewportUniforms {
 };
 
 struct TileUniforms {
+    mvp: mat4x4<f32>,        // Per-tile MVP (VP_f64 * translate(tile_center)), cast to f32
     bounds: vec4<f32>,       // (min_x, min_y, max_x, max_y) in Mercator space
     tile_meta: vec4<f32>,    // (zoom_level, opacity, _pad, _pad)
     uv_rect: vec4<f32>,      // (u_min, v_min, u_max, v_max) sub-rect in texture
@@ -50,12 +51,9 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
 
     // RTE (Relative-To-Center): vertex xy is relative to tile center.
-    // Reconstruct absolute Mercator position from tile bounds.
-    let tile_center = (tile.bounds.xy + tile.bounds.zw) * 0.5;
-    let world_pos = vec4<f32>(input.position.xy + tile_center, input.position.z, 1.0);
-
-    // Apply view-projection matrix
-    output.clip_position = viewport.view_proj * world_pos;
+    // Per-tile MVP already includes the tile-center translation (computed in f64 on CPU).
+    // No need to reconstruct absolute position — just multiply directly.
+    output.clip_position = tile.mvp * vec4<f32>(input.position, 1.0);
 
     // Depth bias: finer (higher zoom) tiles get smaller depth -> render on top.
     let depth_bias = (22.0 - tile.tile_meta.x) * 0.0001;
@@ -75,8 +73,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let uv = mix(tile.uv_rect.xy, tile.uv_rect.zw, input.tex_coord);
     let color = textureSample(tile_texture, tile_sampler, uv);
 
-    // ── Hillshade lighting ──
-    // Sun direction: northwest, 45° elevation (classic cartographic hillshade)
+    // -- Hillshade lighting --
+    // Sun direction: northwest, 45 degree elevation (classic cartographic hillshade)
     let sun_dir = normalize(vec3<f32>(-0.5, -0.5, 0.7));
     let n = normalize(input.normal);
 

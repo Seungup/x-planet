@@ -46,6 +46,7 @@ struct ViewportUniforms {
 };
 
 struct TileUniforms {
+    mvp: mat4x4<f32>,
     bounds: vec4<f32>,
     tile_meta: vec4<f32>,
     uv_rect: vec4<f32>,
@@ -74,7 +75,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     // For Equirectangular, we could remap positions here,
     // but for now both use the same Mercator tile positions
     // (the projection difference is shown via the verification grid).
-    out.clip_pos = viewport.view_proj * vec4<f32>(in.position, 0.0, 1.0);
+    out.clip_pos = tile.mvp * vec4<f32>(in.position, 0.0, 1.0);
     out.uv = in.tex_coord;
     out.world_pos = in.position;
     return out;
@@ -331,6 +332,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 if let Some(gpu) = &self.gpu {
                     let mut vu = viewport_uniforms(&self.viewport);
+                    let vp_f64 = self.viewport.to_view_proj_f64();
                     // Encode projection ID in camera.w
                     vu.camera[3] = self.projection_id();
                     gpu.queue.write_buffer(
@@ -338,7 +340,7 @@ impl ApplicationHandler for App {
                         0,
                         bytemuck::bytes_of(&vu),
                     );
-                    render_frame(gpu);
+                    render_frame(gpu, &vp_f64);
                     self.window.as_ref().unwrap().request_redraw();
                 }
             }
@@ -410,7 +412,7 @@ async fn init_gpu(window: Arc<Window>, viewport: &Viewport) -> GpuState {
         contents: bytemuck::bytes_of(&vu),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
-    let tu = TileUniforms { bounds: [0.0; 4], meta: [0.0, 1.0, 0.0, 0.0], uv_rect: [0.0, 0.0, 1.0, 1.0] };
+    let tu = TileUniforms { mvp: [0.0; 16], bounds: [0.0; 4], meta: [0.0, 1.0, 0.0, 0.0], uv_rect: [0.0, 0.0, 1.0, 1.0] };
     let tile_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("step08-tile-uniforms"),
         contents: bytemuck::bytes_of(&tu),
@@ -499,7 +501,7 @@ async fn init_gpu(window: Arc<Window>, viewport: &Viewport) -> GpuState {
     }
 }
 
-fn render_frame(gpu: &GpuState) {
+fn render_frame(gpu: &GpuState, vp_f64: &glam::DMat4) {
     let frame = match gpu.surface.get_current_texture() {
         Ok(f) => f,
         Err(_) => return,
@@ -534,7 +536,7 @@ fn render_frame(gpu: &GpuState) {
         pass.set_index_buffer(gpu.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
         for (i, coord) in gpu.visible_tiles.iter().enumerate() {
-            let tu = tile_uniforms(coord, 1.0);
+            let tu = tile_uniforms(coord, 1.0, vp_f64);
             gpu.queue.write_buffer(&gpu.tile_uniform_buffer, 0, bytemuck::bytes_of(&tu));
             pass.set_bind_group(1, &gpu.tile_bind_group, &[]);
             let idx_start = (i * 6) as u32;

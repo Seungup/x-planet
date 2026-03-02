@@ -94,6 +94,8 @@ pub struct LayerSection {
     // ── Terrain-specific ──
     /// For `kind = "terrain"`: the raster layer whose imagery is draped.
     pub imagery_layer: Option<String>,
+    /// Terrain encoding format: `"mapbox"` (default) or `"terrarium"` (AWS).
+    pub terrain_encoding: Option<String>,
 
     // ── 3D Tiles-specific ──
     pub cesium_ion_token: Option<String>,
@@ -210,12 +212,22 @@ fn kind_label(kind: &LayerKind) -> &'static str {
 fn convert_layer(section: LayerSection, index: usize) -> Result<LayerConfig, String> {
     let url = expand_env(&section.url)?;
 
+    let encoding = match section.terrain_encoding.as_deref() {
+        Some("terrarium") | Some("aws") => x_planets_tiles::TerrainEncoding::Terrarium,
+        Some("mapbox") | Some("maptiler") | None => x_planets_tiles::TerrainEncoding::MapboxRgb,
+        Some(other) => return Err(format!(
+            "layer \"{}\": unknown terrain_encoding \"{}\" (expected \"mapbox\" or \"terrarium\")",
+            section.name, other
+        )),
+    };
+
     let kind = match section.kind.to_ascii_lowercase().as_str() {
         "raster" => LayerKind::Raster,
         "terrain" => LayerKind::Terrain {
             imagery_layer: section
                 .imagery_layer
                 .ok_or_else(|| format!("layer \"{}\" (terrain) requires `imagery_layer`", section.name))?,
+            encoding,
         },
         "3dtiles" => LayerKind::Tiles3d,
         other => return Err(format!("layer \"{}\": unknown kind \"{}\"", section.name, other)),

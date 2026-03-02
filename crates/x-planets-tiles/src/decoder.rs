@@ -140,6 +140,22 @@ pub struct DecodedTerrainTile {
 }
 
 // ---------------------------------------------------------------------------
+// Terrain encoding selection
+// ---------------------------------------------------------------------------
+
+/// Which elevation encoding format a terrain tile source uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerrainEncoding {
+    /// Mapbox / MapTiler Terrain RGB:
+    /// `height = -10000 + (R*65536 + G*256 + B) * 0.1`
+    #[default]
+    MapboxRgb,
+    /// Tilezen / AWS Terrarium:
+    /// `height = (R*256 + G + B/256) - 32768`
+    Terrarium,
+}
+
+// ---------------------------------------------------------------------------
 // Terrain RGB Decoder (Mapbox Terrain RGB → elevation)
 // ---------------------------------------------------------------------------
 
@@ -190,6 +206,58 @@ impl TileDecoder for TerrainRgbDecoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Terrarium Decoder (AWS / Tilezen Terrarium → elevation)
+// ---------------------------------------------------------------------------
+
+/// Decodes Tilezen Terrarium tiles into elevation data.
+///
+/// Height formula: `height = (R * 256 + G + B / 256) - 32768`
+///
+/// Data source: `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png`
+pub struct TerrariumDecoder;
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+impl TileDecoder for TerrariumDecoder {
+    type Output = DecodedTerrainTile;
+
+    async fn decode(&self, coord: TileCoord, data: &[u8]) -> Result<Self::Output, DecodeError> {
+        let img = image::load_from_memory(data)
+            .map_err(|e| DecodeError::ImageDecode(e.to_string()))?;
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+
+        let mut elevation = Vec::with_capacity((width * height) as usize);
+        let mut min_elev = f32::MAX;
+        let mut max_elev = f32::MIN;
+
+        for pixel in rgba.pixels() {
+            let r = pixel[0] as f32;
+            let g = pixel[1] as f32;
+            let b = pixel[2] as f32;
+            // Terrarium: height = (R * 256 + G + B / 256) - 32768
+            let h = (r * 256.0 + g + b / 256.0) - 32768.0;
+            min_elev = min_elev.min(h);
+            max_elev = max_elev.max(h);
+            elevation.push(h);
+        }
+
+        Ok(DecodedTerrainTile {
+            coord,
+            width,
+            height,
+            elevation,
+            min_elevation: min_elev,
+            max_elevation: max_elev,
+        })
+    }
+
+    fn extension(&self) -> &str {
+        "png"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +268,63 @@ mod tests {
         let coord = TileCoord::new(0, 0, 0);
         let result = decoder.decode(coord, b"not an image").await;
         assert!(result.is_err());
+    }
+
+    /// Helper: create a tiny 1×1 PNG with the given RGB values.
+    fn make_1x1_png(r: u8, g: u8, b: u8) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([r, g, b, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn test_terrain_rgb_sea_level() {
+        // Mapbox terrain-RGB sea level (0m) encodes as:
+        // 0 = -10000 + (R*65536 + G*256 + B)*0.1
+        // → R*65536 + G*256 + B = 100000 → R=1, G=134, B=160
+        let png = make_1x1_png(1, 134, 160);
+        let decoder = TerrainRgbDecoder;
+        let tile = decoder.decode(TileCoord::new(0, 0, 0), &png).await.unwrap();
+        assert_eq!(tile.elevation.len(), 1);
+        assert!((tile.elevation[0]).abs() < 0.2, "expected ~0m, got {}", tile.elevation[0]);
+    }
+
+    #[tokio::test]
+    async fn test_terrarium_sea_level() {
+        // Terrarium sea level (0m):
+        // 0 = (R*256 + G + B/256) - 32768 → R=128, G=0, B=0
+        let png = make_1x1_png(128, 0, 0);
+        let decoder = TerrariumDecoder;
+        let tile = decoder.decode(TileCoord::new(0, 0, 0), &png).await.unwrap();
+        assert_eq!(tile.elevation.len(), 1);
+        assert!((tile.elevation[0]).abs() < 0.01, "expected ~0m, got {}", tile.elevation[0]);
+    }
+
+    #[tokio::test]
+    async fn test_terrarium_everest() {
+        // Terrarium encoding for ~8848m (Everest):
+        // 8848 = (R*256 + G + B/256) - 32768
+        // R*256 + G = 8848 + 32768 = 41616 → R=162, G=144, B=0
+        let png = make_1x1_png(162, 144, 0);
+        let decoder = TerrariumDecoder;
+        let tile = decoder.decode(TileCoord::new(0, 0, 0), &png).await.unwrap();
+        assert!((tile.elevation[0] - 8848.0).abs() < 1.0, "expected ~8848m, got {}", tile.elevation[0]);
+    }
+
+    #[tokio::test]
+    async fn test_terrarium_dead_sea() {
+        // Terrarium encoding for -430m (Dead Sea):
+        // -430 = (R*256 + G + B/256) - 32768
+        // R*256 + G = 32338 → R=126, G=82, B=0
+        let png = make_1x1_png(126, 82, 0);
+        let decoder = TerrariumDecoder;
+        let tile = decoder.decode(TileCoord::new(0, 0, 0), &png).await.unwrap();
+        assert!((tile.elevation[0] - (-430.0)).abs() < 1.0, "expected ~-430m, got {}", tile.elevation[0]);
+    }
+
+    #[test]
+    fn test_terrain_encoding_default() {
+        assert_eq!(TerrainEncoding::default(), TerrainEncoding::MapboxRgb);
     }
 }

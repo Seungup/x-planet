@@ -17,13 +17,22 @@ kind = "raster"
 url  = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 
 # ── 3D Terrain (pick one) ────────────────────────────────────────
-# MapTiler  — set MAPTILER_KEY
+# AWS Terrain Tiles (Terrarium) — free, no API key required
 [[layers]]
-name          = "terrain"
-kind          = "terrain"
-imagery_layer = "imagery"
-url           = "https://api.maptiler.com/tiles/terrain-rgb-v2/{z}/{x}/{y}.webp?key=${MAPTILER_KEY}"
-z_order       = 10
+name             = "terrain"
+kind             = "terrain"
+imagery_layer    = "imagery"
+terrain_encoding = "terrarium"
+url              = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+z_order          = 10
+
+# MapTiler  — set MAPTILER_KEY
+# [[layers]]
+# name          = "terrain"
+# kind          = "terrain"
+# imagery_layer = "imagery"
+# url           = "https://api.maptiler.com/tiles/terrain-rgb-v2/{z}/{x}/{y}.webp?key=${MAPTILER_KEY}"
+# z_order       = 10
 
 # Mapbox  — set MAPBOX_TOKEN
 # [[layers]]

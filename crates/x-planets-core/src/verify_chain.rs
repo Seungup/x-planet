@@ -301,7 +301,7 @@ pub fn phase1_chain() -> VerifyChain {
 
     // ── Level 3: Pipeline pure functions ──────────────────────
 
-    chain.add("build_tile_mesh: zoom 0 covers unit square", || {
+    chain.add("build_tile_mesh: zoom 0 RTE centered at origin", || {
         use crate::pipeline::build_tile_mesh;
 
         let tiles = vec![TileCoord::new(0, 0, 0)];
@@ -314,16 +314,17 @@ pub fn phase1_chain() -> VerifyChain {
             return StepResult::fail(format!("expected 6 indices, got {}", indices.len()));
         }
 
+        // RTE: vertices are centered at origin, half-size = 0.5 at zoom 0
         let min_x = verts.iter().map(|v| v.position[0]).fold(f32::MAX, f32::min);
         let max_x = verts.iter().map(|v| v.position[0]).fold(f32::MIN, f32::max);
         let min_y = verts.iter().map(|v| v.position[1]).fold(f32::MAX, f32::min);
         let max_y = verts.iter().map(|v| v.position[1]).fold(f32::MIN, f32::max);
 
-        if (min_x).abs() > 1e-6 || (max_x - 1.0).abs() > 1e-6
-            || (min_y).abs() > 1e-6 || (max_y - 1.0).abs() > 1e-6
+        if (min_x + 0.5).abs() > 1e-6 || (max_x - 0.5).abs() > 1e-6
+            || (min_y + 0.5).abs() > 1e-6 || (max_y - 0.5).abs() > 1e-6
         {
             return StepResult::fail(format!(
-                "expected (0,0)→(1,1) got ({},{})→({},{})",
+                "expected (-0.5,-0.5)→(0.5,0.5) got ({},{})→({},{})",
                 min_x, min_y, max_x, max_y
             ));
         }
@@ -331,7 +332,7 @@ pub fn phase1_chain() -> VerifyChain {
         StepResult::pass()
     });
 
-    chain.add("build_tile_mesh: zoom 1 tiles with no gaps", || {
+    chain.add("build_tile_mesh: zoom 1 tiles all same RTE size", || {
         use crate::pipeline::build_tile_mesh;
 
         let tiles = vec![
@@ -342,12 +343,16 @@ pub fn phase1_chain() -> VerifyChain {
         ];
         let (verts, _) = build_tile_mesh(&tiles);
 
-        // Total coverage should also be (0,0)→(1,1)
-        let min_x = verts.iter().map(|v| v.position[0]).fold(f32::MAX, f32::min);
-        let max_x = verts.iter().map(|v| v.position[0]).fold(f32::MIN, f32::max);
+        // RTE: each tile's 4 vertices should be at ±0.25 (half-size at zoom 1)
+        for (i, chunk) in verts.chunks(4).enumerate() {
+            let min_x = chunk.iter().map(|v| v.position[0]).fold(f32::MAX, f32::min);
+            let max_x = chunk.iter().map(|v| v.position[0]).fold(f32::MIN, f32::max);
 
-        if (min_x).abs() > 1e-6 || (max_x - 1.0).abs() > 1e-6 {
-            return StepResult::fail(format!("x range: {}→{}", min_x, max_x));
+            if (min_x + 0.25).abs() > 1e-6 || (max_x - 0.25).abs() > 1e-6 {
+                return StepResult::fail(format!(
+                    "tile {}: x range: {}→{}, expected -0.25→0.25", i, min_x, max_x
+                ));
+            }
         }
 
         StepResult::pass_with(format!("{} vertices, 4 tiles", verts.len()))

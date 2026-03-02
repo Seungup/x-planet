@@ -42,6 +42,7 @@ struct ViewportUniforms {
 };
 
 struct TileUniforms {
+    mvp: mat4x4<f32>,
     bounds: vec4<f32>,
     tile_meta: vec4<f32>,  // zoom, opacity, layer_id, _pad
     uv_rect: vec4<f32>,
@@ -63,7 +64,7 @@ struct VertexOutput {
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_pos = viewport.view_proj * vec4<f32>(in.position, 0.0, 1.0);
+    out.clip_pos = tile.mvp * vec4<f32>(in.position, 0.0, 1.0);
     out.uv = in.tex_coord;
     return out;
 }
@@ -234,12 +235,13 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 if let Some(gpu) = &self.gpu {
                     let vu = viewport_uniforms(&self.viewport);
+                    let vp_f64 = self.viewport.to_view_proj_f64();
                     gpu.queue.write_buffer(
                         &gpu.viewport_uniform_buffer,
                         0,
                         bytemuck::bytes_of(&vu),
                     );
-                    render_frame(gpu, &self.layer_stack, self.base_opacity, self.overlay_opacity);
+                    render_frame(gpu, &self.layer_stack, self.base_opacity, self.overlay_opacity, &vp_f64);
                     self.window.as_ref().unwrap().request_redraw();
                 }
             }
@@ -334,7 +336,7 @@ async fn init_gpu(window: Arc<Window>, viewport: &Viewport) -> GpuState {
         contents: bytemuck::bytes_of(&vu),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
-    let tu = TileUniforms { bounds: [0.0; 4], meta: [0.0, 1.0, 0.0, 0.0], uv_rect: [0.0, 0.0, 1.0, 1.0] };
+    let tu = TileUniforms { mvp: [0.0; 16], bounds: [0.0; 4], meta: [0.0, 1.0, 0.0, 0.0], uv_rect: [0.0, 0.0, 1.0, 1.0] };
     let tile_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("step07-tile-uniforms"),
         contents: bytemuck::bytes_of(&tu),
@@ -429,6 +431,7 @@ fn render_frame(
     layer_stack: &LayerStack,
     base_opacity: f32,
     overlay_opacity: f32,
+    vp_f64: &glam::DMat4,
 ) {
     let frame = match gpu.surface.get_current_texture() {
         Ok(f) => f,
@@ -468,7 +471,7 @@ fn render_frame(
             let layer_opacity = if layer_idx == 0 { base_opacity } else { overlay_opacity };
 
             for (i, coord) in gpu.visible_tiles.iter().enumerate() {
-                let mut tu = tile_uniforms(coord, layer_opacity * layer.opacity);
+                let mut tu = tile_uniforms(coord, layer_opacity * layer.opacity, vp_f64);
                 tu.meta[2] = layer_idx as f32; // layer_id for shader
                 gpu.queue.write_buffer(&gpu.tile_uniform_buffer, 0, bytemuck::bytes_of(&tu));
 
