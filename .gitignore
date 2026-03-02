@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+Cargo.lock
+*.swp
+*.swo
+.DS_Store
+*.wasm
+/pkg
+/web_viewer/dist
+.claude/

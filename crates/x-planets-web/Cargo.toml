@@ -1,0 +1,33 @@
+[package]
+name = "x-planets-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Web/WASM platform backend for x-planets"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+x-planets-core = { workspace = true }
+x-planets-gpu = { workspace = true }
+x-planets-math = { workspace = true }
+x-planets-tiles = { workspace = true }
+wgpu = { workspace = true }
+async-trait = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "HtmlCanvasElement",
+    "Response",
+    "Headers",
+] }
+js-sys = "0.3"
+console_log = "1"
+console_error_panic_hook = "0.1"

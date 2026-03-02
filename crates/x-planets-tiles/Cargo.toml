@@ -1,0 +1,17 @@
+[package]
+name = "x-planets-tiles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tile loading, decoding, and caching for x-planets"
+
+[dependencies]
+x-planets-math = { workspace = true }
+image = { workspace = true }
+async-trait = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

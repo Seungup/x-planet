@@ -1,0 +1,11 @@
+[package]
+name = "x-planets-math"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Math utilities for x-planets: geospatial types, tile coordinates, and projections"
+
+[dependencies]
+glam = { workspace = true }
+bytemuck = { workspace = true }
+serde = { workspace = true }

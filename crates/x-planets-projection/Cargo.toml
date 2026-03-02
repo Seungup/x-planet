@@ -1,0 +1,14 @@
+[package]
+name = "x-planets-projection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Extensible map projection system with GPU shader plugins"
+
+[dependencies]
+x-planets-math = { workspace = true }
+x-planets-gpu = { workspace = true }
+wgpu = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }

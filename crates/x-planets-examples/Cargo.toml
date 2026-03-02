@@ -1,0 +1,70 @@
+[package]
+name = "x-planets-examples"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Step-by-step examples for x-planets (Karpathy method)"
+publish = false
+
+[dependencies]
+x-planets-math = { workspace = true }
+x-planets-gpu = { workspace = true }
+x-planets-projection = { workspace = true }
+x-planets-tiles = { workspace = true }
+x-planets-core = { workspace = true }
+x-planets-native = { workspace = true }
+
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+image = { workspace = true }
+pollster = { workspace = true }
+winit = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+
+[[example]]
+name = "step00_triangle"
+path = "examples/step00_triangle.rs"
+
+[[example]]
+name = "step01_colored_quad"
+path = "examples/step01_colored_quad.rs"
+
+[[example]]
+name = "step02_textured_quad"
+path = "examples/step02_textured_quad.rs"
+
+[[example]]
+name = "step03_viewport"
+path = "examples/step03_viewport.rs"
+
+[[example]]
+name = "step04_osm_tile"
+path = "examples/step04_osm_tile.rs"
+
+[[example]]
+name = "step05_multi_tile"
+path = "examples/step05_multi_tile.rs"
+
+[[example]]
+name = "step06_cached_tiles"
+path = "examples/step06_cached_tiles.rs"
+
+[[example]]
+name = "step07_layer_stack"
+path = "examples/step07_layer_stack.rs"
+
+[[example]]
+name = "step08_projection"
+path = "examples/step08_projection.rs"
+
+[[example]]
+name = "verify"
+path = "examples/verify.rs"
+
+[[example]]
+name = "step09_map_engine"
+path = "examples/step09_map_engine.rs"

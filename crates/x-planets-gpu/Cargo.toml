@@ -1,0 +1,15 @@
+[package]
+name = "x-planets-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPU abstraction layer for x-planets using wgpu"
+
+[dependencies]
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+naga = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+x-planets-math = { workspace = true }
+image = { workspace = true }
