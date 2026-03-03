@@ -434,11 +434,7 @@ impl Viewport {
         let far = (unit_altitude + 2.0) * 3.0; // far enough to see whole sphere
         let proj = glam::DMat4::perspective_rh(fov_y, aspect, near.max(0.0001), far);
 
-        // Flip Y: in the globe coordinate system, the camera's view maps
-        // north to +clip_y, but the rendering convention requires the
-        // opposite sign to display north at the top of the screen.
-        let flip_y = glam::DMat4::from_diagonal(glam::DVec4::new(1.0, -1.0, 1.0, 1.0));
-        flip_y * proj * view
+        proj * view
     }
 
     /// Compute GPU uniforms for this viewport.
@@ -640,15 +636,14 @@ impl CameraController {
     /// Converts pixel deltas directly to geographic degree changes,
     /// bypassing Mercator to avoid polar amplification.
     pub fn pan_globe(&self, viewport: &mut Viewport, dx: f64, dy: f64) {
-        // Visible angular extent on sphere surface (approximate).
-        // At zoom z the camera sees roughly the same angular extent as
-        // 360 / 2^z degrees of longitude.  We use the FOV and altitude
-        // to derive a more accurate rate.
+        // Visible angular extent of the sphere surface from the camera.
+        // arccos(R/(R+h)) gives the angular radius of the visible cap
+        // on the unit sphere — this DECREASES when zooming in, correctly
+        // reducing the degrees-per-pixel rate at higher zoom.
         let unit_altitude =
             (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(viewport.zoom);
-        // Half-angle subtended from camera to sphere edge
-        let half_angle = (1.0 / (unit_altitude + 1.0)).asin();
-        let visible_deg = half_angle.to_degrees() * 2.0;
+        let visible_half = (1.0 / (unit_altitude + 1.0)).acos();
+        let visible_deg = visible_half.to_degrees() * 2.0;
 
         let deg_per_px_y = visible_deg / viewport.height as f64 * self.pan_speed;
         let deg_per_px_x = deg_per_px_y; // longitude scaled by cos(lat) below
@@ -660,8 +655,10 @@ impl CameraController {
         let dx_deg = dx * deg_per_px_x;
         let dy_deg = dy * deg_per_px_y;
 
-        // Rotate by bearing, then negate (drag opposite to center movement)
-        let dlat = cos_b * dy_deg - sin_b * dx_deg;
+        // Rotate by bearing.  Signs match the Mercator `pan()` convention:
+        // dy > 0 (screen up, already negated by caller) → center moves south,
+        // dx > 0 (screen right) → center moves west.
+        let dlat = sin_b * dx_deg - cos_b * dy_deg;
         let dlon = -(cos_b * dx_deg + sin_b * dy_deg)
             / viewport.center.lat.to_radians().cos().max(0.01); // scale by cos(lat)
 
@@ -670,6 +667,10 @@ impl CameraController {
     }
 
     /// Zoom toward a screen point in globe mode.
+    ///
+    /// Applies zoom-level-dependent damping: at low zoom levels the camera
+    /// altitude halves per level, making each step visually dramatic.
+    /// Damping smooths this out so pinch-zoom on mobile feels natural.
     pub fn zoom_at_globe(
         &self,
         viewport: &mut Viewport,
@@ -677,10 +678,21 @@ impl CameraController {
         screen_x: f64,
         screen_y: f64,
     ) {
-        // Compute angular offset of cursor from center before zoom
+        // Globe zoom damping: at low zoom, each level halves altitude,
+        // causing a huge visual change. Smoothly ramp from 30% to 100%
+        // sensitivity over zoom 0–4.
+        let damping = if viewport.zoom < 4.0 {
+            0.3 + 0.175 * viewport.zoom
+        } else {
+            1.0
+        };
+        let delta = delta * damping;
+
+        // Compute angular offset of cursor from center before zoom.
+        // arccos(R/(R+h)) = visible surface angular radius (decreases when zooming in).
         let unit_altitude =
             (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(viewport.zoom);
-        let half_angle_old = (1.0 / (unit_altitude + 1.0)).asin().to_degrees();
+        let half_angle_old = (1.0 / (unit_altitude + 1.0)).acos().to_degrees();
 
         let dx_norm = (screen_x - viewport.width as f64 * 0.5) / viewport.height as f64;
         let dy_norm = (screen_y - viewport.height as f64 * 0.5) / viewport.height as f64;
@@ -697,7 +709,7 @@ impl CameraController {
 
         let unit_altitude_new =
             (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(viewport.zoom);
-        let half_angle_new = (1.0 / (unit_altitude_new + 1.0)).asin().to_degrees();
+        let half_angle_new = (1.0 / (unit_altitude_new + 1.0)).acos().to_degrees();
 
         let new_cursor_lon_off = (dx_norm * cos_b - dy_norm * sin_b) * half_angle_new * 2.0
             / viewport.center.lat.to_radians().cos().max(0.01);
@@ -961,6 +973,341 @@ mod tests {
         assert!(
             frustum.polygon.is_some(),
             "Pitched view should have a convex polygon for precise culling"
+        );
+    }
+
+    // ── Mercator tile selection near poles ──────────────────
+
+    #[test]
+    fn test_tile_selection_near_north_pole() {
+        // At lat=80° zoom 3, tiles near the north pole should be selected.
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(80.0, 0.0);
+        viewport.zoom = 3.0;
+
+        let tiles = viewport.visible_tiles();
+        assert!(!tiles.is_empty(), "Should select tiles near the north pole");
+
+        // Should include y=0 tiles (northernmost in Mercator)
+        let has_y0 = tiles.iter().any(|t| t.coord.y == 0);
+        assert!(has_y0, "Should include northernmost tiles (y=0) at lat=80°");
+    }
+
+    #[test]
+    fn test_tile_selection_near_south_pole() {
+        // At lat=-80° zoom 3, tiles near the south pole should be selected.
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(-80.0, 0.0);
+        viewport.zoom = 3.0;
+
+        let tiles = viewport.visible_tiles();
+        assert!(!tiles.is_empty(), "Should select tiles near the south pole");
+
+        // Should include tiles at maximum y (southernmost in Mercator)
+        let n = 1u32 << 3;
+        let has_max_y = tiles.iter().any(|t| t.coord.y == n - 1);
+        assert!(
+            has_max_y,
+            "Should include southernmost tiles (y={}) at lat=-80°",
+            n - 1
+        );
+    }
+
+    #[test]
+    fn test_tile_selection_at_mercator_boundary() {
+        // At the exact Mercator boundary (~85.05°), tiles should still be selected.
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(85.0, 0.0);
+        viewport.zoom = 2.0;
+
+        let tiles = viewport.visible_tiles();
+        assert!(!tiles.is_empty(), "Should select tiles at Mercator boundary");
+    }
+
+    #[test]
+    fn test_tile_selection_high_lat_high_pitch() {
+        // High latitude + high pitch: frustum extends far toward the pole.
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(70.0, 0.0);
+        viewport.zoom = 5.0;
+        viewport.pitch = 55.0;
+
+        let tiles = viewport.visible_tiles();
+        assert!(!tiles.is_empty());
+
+        // Should include some tiles north of center
+        let center_tile = x_planets_math::TileCoord::from_geo(&viewport.center, viewport.tile_zoom());
+        let northernmost = tiles.iter().map(|t| t.coord.y).min().unwrap();
+        assert!(
+            northernmost <= center_tile.y,
+            "Pitched view should include tiles north of center"
+        );
+    }
+
+    // ── Globe view projection ──────────────────────────────
+
+    #[test]
+    fn test_globe_vp_north_at_top() {
+        // After fix: a point slightly north of center should project to
+        // positive clip Y (top of screen). Verifies flip_y is removed.
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        viewport.zoom = 2.0;
+
+        let vp = viewport.to_globe_view_proj_f64();
+
+        // Project a point on the sphere at lat=10°, lon=0° (slightly north)
+        let north_point = x_planets_math::geo_to_unit_sphere(
+            10.0_f64.to_radians(),
+            0.0_f64.to_radians(),
+        );
+        let clip = vp * glam::DVec4::new(north_point.x, north_point.y, north_point.z, 1.0);
+        let ndc_y = clip.y / clip.w;
+
+        // North should be at positive Y (top of screen)
+        assert!(
+            ndc_y > 0.0,
+            "North (lat=10°) should map to positive clip Y (top), got ndc_y={:.4}",
+            ndc_y
+        );
+
+        // Project a point at lat=-10° (south)
+        let south_point = x_planets_math::geo_to_unit_sphere(
+            (-10.0_f64).to_radians(),
+            0.0_f64.to_radians(),
+        );
+        let clip_s = vp * glam::DVec4::new(south_point.x, south_point.y, south_point.z, 1.0);
+        let ndc_y_s = clip_s.y / clip_s.w;
+
+        assert!(
+            ndc_y_s < 0.0,
+            "South (lat=-10°) should map to negative clip Y (bottom), got ndc_y={:.4}",
+            ndc_y_s
+        );
+    }
+
+    #[test]
+    fn test_globe_vp_east_at_right() {
+        // A point slightly east of center should project to positive clip X.
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        viewport.zoom = 2.0;
+
+        let vp = viewport.to_globe_view_proj_f64();
+
+        let east_point = x_planets_math::geo_to_unit_sphere(
+            0.0_f64.to_radians(),
+            10.0_f64.to_radians(),
+        );
+        let clip = vp * glam::DVec4::new(east_point.x, east_point.y, east_point.z, 1.0);
+        let ndc_x = clip.x / clip.w;
+
+        assert!(
+            ndc_x > 0.0,
+            "East (lon=10°) should map to positive clip X (right), got ndc_x={:.4}",
+            ndc_x
+        );
+    }
+
+    #[test]
+    fn test_globe_vp_with_bearing() {
+        // At bearing=90° (camera facing east), east is at the top and
+        // north is to the LEFT (-X) of the screen.
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        viewport.zoom = 2.0;
+        viewport.bearing = 90.0;
+
+        let vp = viewport.to_globe_view_proj_f64();
+
+        let north_point = x_planets_math::geo_to_unit_sphere(
+            10.0_f64.to_radians(),
+            0.0_f64.to_radians(),
+        );
+        let clip = vp * glam::DVec4::new(north_point.x, north_point.y, north_point.z, 1.0);
+        let ndc_x = clip.x / clip.w;
+
+        assert!(
+            ndc_x < 0.0,
+            "At bearing=90° (facing east), north should map to left (-X), got ndc_x={:.4}",
+            ndc_x
+        );
+
+        // East should be at the top (+Y)
+        let east_point = x_planets_math::geo_to_unit_sphere(
+            0.0_f64.to_radians(),
+            10.0_f64.to_radians(),
+        );
+        let clip_e = vp * glam::DVec4::new(east_point.x, east_point.y, east_point.z, 1.0);
+        let ndc_y_e = clip_e.y / clip_e.w;
+
+        assert!(
+            ndc_y_e > 0.0,
+            "At bearing=90°, east should map to top (+Y), got ndc_y={:.4}",
+            ndc_y_e
+        );
+    }
+
+    // ── Globe pan direction ──────────────────────────────
+
+    #[test]
+    fn test_globe_pan_up_moves_south() {
+        // Convention: callers pass dy with screen-up = positive (already negated).
+        // dy > 0 = "screen up drag" → center should move SOUTH (reveal content below).
+        let ctrl = CameraController::new();
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        viewport.zoom = 5.0;
+
+        let lat_before = viewport.center.lat;
+        // dy > 0 = screen up drag
+        ctrl.pan_globe(&mut viewport, 0.0, 50.0);
+        let lat_after = viewport.center.lat;
+
+        assert!(
+            lat_after < lat_before,
+            "Drag up (dy>0) should move center south: before={:.4}, after={:.4}",
+            lat_before, lat_after
+        );
+    }
+
+    #[test]
+    fn test_globe_pan_right_moves_west() {
+        // Dragging right (dx > 0) should move center west (longitude decreases).
+        let ctrl = CameraController::new();
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        viewport.zoom = 5.0;
+
+        let lon_before = viewport.center.lon;
+        ctrl.pan_globe(&mut viewport, 50.0, 0.0);
+        let lon_after = viewport.center.lon;
+
+        assert!(
+            lon_after < lon_before,
+            "Drag right should move center west: before={:.4}, after={:.4}",
+            lon_before, lon_after
+        );
+    }
+
+    #[test]
+    fn test_globe_pan_matches_mercator_direction() {
+        // Globe pan direction should match Mercator pan direction.
+        let ctrl = CameraController::new();
+
+        // Mercator: dy > 0 = screen up → center south
+        let mut vp_merc = Viewport::new(800, 600);
+        vp_merc.center = GeoCoord::new(30.0, 50.0);
+        vp_merc.zoom = 5.0;
+        let lat_before_merc = vp_merc.center.lat;
+        ctrl.pan(&mut vp_merc, 0.0, 50.0);
+        let merc_dlat = vp_merc.center.lat - lat_before_merc;
+
+        // Globe: same dy > 0 should also move south
+        let mut vp_globe = Viewport::new(800, 600);
+        vp_globe.center = GeoCoord::new(30.0, 50.0);
+        vp_globe.zoom = 5.0;
+        let lat_before_globe = vp_globe.center.lat;
+        ctrl.pan_globe(&mut vp_globe, 0.0, 50.0);
+        let globe_dlat = vp_globe.center.lat - lat_before_globe;
+
+        // Both should move south (negative dlat)
+        assert!(
+            merc_dlat.signum() == globe_dlat.signum(),
+            "Pan direction mismatch: mercator dlat={:.6}, globe dlat={:.6}",
+            merc_dlat, globe_dlat
+        );
+    }
+
+    #[test]
+    fn test_globe_pan_with_bearing() {
+        // At bearing=90°, dragging right should move center north
+        // (because screen-right at bearing=90° = geographic south,
+        //  and center moves opposite to drag = north).
+        let ctrl = CameraController::new();
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        viewport.zoom = 5.0;
+        viewport.bearing = 90.0;
+
+        let lat_before = viewport.center.lat;
+        ctrl.pan_globe(&mut viewport, 50.0, 0.0);
+        let lat_after = viewport.center.lat;
+
+        assert!(
+            lat_after > lat_before,
+            "At bearing=90°, drag right should move center north: before={:.4}, after={:.4}",
+            lat_before, lat_after
+        );
+    }
+
+    // ── Globe zoom sensitivity ──────────────────────────
+
+    #[test]
+    fn test_globe_zoom_damped_at_low_zoom() {
+        // At low zoom levels, globe zoom should be damped.
+        let ctrl = CameraController::new();
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        viewport.zoom = 1.0;
+
+        let zoom_before = viewport.zoom;
+        ctrl.zoom_at_globe(&mut viewport, 1.0, 400.0, 300.0);
+        let zoom_change_low = viewport.zoom - zoom_before;
+
+        // At high zoom, should be less damped
+        viewport.zoom = 10.0;
+        let zoom_before_high = viewport.zoom;
+        ctrl.zoom_at_globe(&mut viewport, 1.0, 400.0, 300.0);
+        let zoom_change_high = viewport.zoom - zoom_before_high;
+
+        assert!(
+            zoom_change_low < zoom_change_high,
+            "Zoom at low level should be damped more: low_change={:.4}, high_change={:.4}",
+            zoom_change_low, zoom_change_high
+        );
+    }
+
+    #[test]
+    fn test_globe_zoom_at_pointer_center_stable() {
+        // Zooming at screen center should not shift the viewport center.
+        let ctrl = CameraController::new();
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(37.5, 127.0);
+        viewport.zoom = 5.0;
+
+        let lat_before = viewport.center.lat;
+        let lon_before = viewport.center.lon;
+        ctrl.zoom_at_globe(&mut viewport, 1.0, 400.0, 300.0); // center of screen
+
+        assert!(
+            (viewport.center.lat - lat_before).abs() < 0.01,
+            "Zoom at center should not shift latitude: before={:.4}, after={:.4}",
+            lat_before, viewport.center.lat
+        );
+        assert!(
+            (viewport.center.lon - lon_before).abs() < 0.01,
+            "Zoom at center should not shift longitude: before={:.4}, after={:.4}",
+            lon_before, viewport.center.lon
+        );
+    }
+
+    #[test]
+    fn test_globe_zoom_at_pointer_offset_shifts_center() {
+        // Zooming at an off-center point should shift the center toward that point.
+        let ctrl = CameraController::new();
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        viewport.zoom = 3.0;
+
+        // Zoom in at the right side of the screen
+        ctrl.zoom_at_globe(&mut viewport, 2.0, 700.0, 300.0);
+
+        // Center should have shifted east (positive longitude)
+        assert!(
+            viewport.center.lon > 0.0,
+            "Zoom at right edge should shift center east, got lon={:.4}",
+            viewport.center.lon
         );
     }
 }
