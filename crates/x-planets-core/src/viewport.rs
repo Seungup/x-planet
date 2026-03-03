@@ -223,7 +223,7 @@ impl Viewport {
         match mode {
             x_planets_math::ProjectionMode::Globe => self.visible_tiles_globe(),
             x_planets_math::ProjectionMode::Mercator => self.visible_tiles_centered(),
-            _ => self.visible_tiles(),
+            x_planets_math::ProjectionMode::Equirectangular => self.visible_tiles(),
         }
     }
 
@@ -324,9 +324,11 @@ impl Viewport {
         // Compute effective zoom from angular extent:
         // At zoom z, each tile covers 360/2^z degrees of longitude.
         // The visible cap diameter in degrees ≈ 2 * half_angle_degrees.
-        // We want tiles where tile_angular_size ≈ viewport_angular_size / (viewport_pixels / 256).
+        // Using height/128 (instead of /256) doubles the tile density so
+        // the globe renders with higher resolution and tiles change at
+        // every viewport zoom level.
         let visible_deg = half_angle.to_degrees() * 2.0;
-        let tiles_needed = (self.height as f64 / 256.0).max(1.0);
+        let tiles_needed = (self.height as f64 / 128.0).max(1.0);
         let tile_size_deg = visible_deg / tiles_needed;
         // 360 / 2^z = tile_size_deg → z = log2(360 / tile_size_deg)
         let globe_zoom = (360.0 / tile_size_deg).log2()
