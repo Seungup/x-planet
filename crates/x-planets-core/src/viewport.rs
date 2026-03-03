@@ -334,7 +334,18 @@ impl Viewport {
     /// `MVP = VP_f64 * translate(tile_center_f64)` in f64, then casts to f32.
     /// This eliminates the ~14px jitter at zoom 18+ caused by f32 VP.
     pub fn to_view_proj_f64(&self) -> glam::DMat4 {
-        let center_merc = geo_to_mercator(&self.center);
+        self.to_view_proj_f64_projected(x_planets_math::ProjectionMode::Mercator)
+    }
+
+    /// Like [`to_view_proj_f64`] but positions the camera using the given projection.
+    pub fn to_view_proj_f64_projected(&self, mode: x_planets_math::ProjectionMode) -> glam::DMat4 {
+        let center = match mode {
+            x_planets_math::ProjectionMode::Mercator => geo_to_mercator(&self.center),
+            x_planets_math::ProjectionMode::Equirectangular => {
+                x_planets_math::geo_to_equirectangular(&self.center)
+            }
+        };
+        let center_merc = center;
         let scale = 2.0_f64.powf(self.zoom);
         let aspect = self.width as f64 / self.height as f64;
         let cx = center_merc.x;

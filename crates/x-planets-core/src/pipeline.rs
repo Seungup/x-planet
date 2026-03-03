@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use x_planets_math::{GeoCoord, TileCoord, TileUniforms, ViewportUniforms, VisibleTile};
 
-use crate::render::{tile_quad_vertices, TileVertex, TILE_QUAD_INDICES};
+use crate::render::{tile_quad_vertices_projected, TileVertex, TILE_QUAD_INDICES};
 use crate::viewport::Viewport;
 
 // ───────────────────────────────────────────────────────────────────
@@ -76,12 +76,20 @@ pub fn compute_load_requests(
 ///
 /// Pure function. Each tile becomes a textured quad (4 verts, 6 indices).
 pub fn build_tile_mesh(tiles: &[TileCoord]) -> (Vec<TileVertex>, Vec<u32>) {
+    build_tile_mesh_projected(tiles, x_planets_math::ProjectionMode::Mercator)
+}
+
+/// Build vertex and index buffers with projection-dependent tile geometry.
+pub fn build_tile_mesh_projected(
+    tiles: &[TileCoord],
+    mode: x_planets_math::ProjectionMode,
+) -> (Vec<TileVertex>, Vec<u32>) {
     let mut vertices = Vec::with_capacity(tiles.len() * 4);
     let mut indices = Vec::with_capacity(tiles.len() * 6);
 
     for (i, tile) in tiles.iter().enumerate() {
         let base = (i * 4) as u32;
-        let quad = tile_quad_vertices(tile);
+        let quad = tile_quad_vertices_projected(tile, mode);
         vertices.extend_from_slice(&quad);
         for idx in TILE_QUAD_INDICES {
             indices.push(base + idx);
@@ -161,6 +169,21 @@ pub fn tile_uniforms_for_visible(
     opacity: f32,
     vp_f64: &glam::DMat4,
 ) -> TileUniforms {
+    tile_uniforms_for_visible_projected(
+        rt,
+        opacity,
+        vp_f64,
+        x_planets_math::ProjectionMode::Mercator,
+    )
+}
+
+/// Like [`tile_uniforms_for_visible`] but positions the tile center using the given projection.
+pub fn tile_uniforms_for_visible_projected(
+    rt: &RenderableTile,
+    opacity: f32,
+    vp_f64: &glam::DMat4,
+    mode: x_planets_math::ProjectionMode,
+) -> TileUniforms {
     let n_f64 = rt.coord.extent() as f64;
     let n = n_f64 as f32;
     let min_x = rt.display_x as f32 / n;
@@ -168,9 +191,18 @@ pub fn tile_uniforms_for_visible(
     let max_x = (rt.display_x + 1) as f32 / n;
     let max_y = (rt.coord.y + 1) as f32 / n;
 
-    // Tile center in f64 using display_x — can be outside [0, 1] for wrapping.
+    // Tile center — x is the same for both projections, y depends on mode.
     let cx = (rt.display_x as f64 + 0.5) / n_f64;
-    let cy = (rt.coord.y as f64 + 0.5) / n_f64;
+    let cy = match mode {
+        x_planets_math::ProjectionMode::Mercator => (rt.coord.y as f64 + 0.5) / n_f64,
+        x_planets_math::ProjectionMode::Equirectangular => {
+            let y_top_m = rt.coord.y as f64 / n_f64;
+            let y_bot_m = (rt.coord.y + 1) as f64 / n_f64;
+            let y_top_eq = x_planets_math::mercator_y_to_equirectangular_y(y_top_m);
+            let y_bot_eq = x_planets_math::mercator_y_to_equirectangular_y(y_bot_m);
+            (y_top_eq + y_bot_eq) / 2.0
+        }
+    };
 
     let model = glam::DMat4::from_translation(glam::DVec3::new(cx, cy, 0.0));
     let mvp_f64 = *vp_f64 * model;

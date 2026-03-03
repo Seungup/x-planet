@@ -99,7 +99,7 @@ impl Default for LayerStack {
     }
 }
 
-/// Quad vertices for a single tile (Relative-To-Center).
+/// Quad vertices for a single tile (Relative-To-Center) in Mercator space.
 ///
 /// Positions are relative to the tile center, NOT absolute Mercator coordinates.
 /// This avoids f32 precision loss at high zoom levels.  The per-tile MVP matrix
@@ -108,9 +108,31 @@ impl Default for LayerStack {
 /// At zoom z, each tile spans `1 / 2^z` in Mercator space, so the half-size
 /// is `0.5 / 2^z`.  Vertices are at `(±hw, ±hh)` centered on the origin.
 pub fn tile_quad_vertices(coord: &TileCoord) -> [TileVertex; 4] {
+    tile_quad_vertices_projected(coord, x_planets_math::ProjectionMode::Mercator)
+}
+
+/// Quad vertices with projection-dependent half-heights.
+///
+/// For Mercator, all tiles at the same zoom have equal height.
+/// For Equirectangular, height varies by latitude (compressed near poles).
+pub fn tile_quad_vertices_projected(
+    coord: &TileCoord,
+    mode: x_planets_math::ProjectionMode,
+) -> [TileVertex; 4] {
     let n = coord.extent() as f32;
-    let hw = 0.5 / n; // half-width
-    let hh = 0.5 / n; // half-height
+    let hw = 0.5 / n; // half-width (same for all projections — linear in longitude)
+
+    let hh = match mode {
+        x_planets_math::ProjectionMode::Mercator => 0.5 / n,
+        x_planets_math::ProjectionMode::Equirectangular => {
+            let n_f64 = coord.extent() as f64;
+            let y_top_m = coord.y as f64 / n_f64;
+            let y_bot_m = (coord.y + 1) as f64 / n_f64;
+            let y_top_eq = x_planets_math::mercator_y_to_equirectangular_y(y_top_m);
+            let y_bot_eq = x_planets_math::mercator_y_to_equirectangular_y(y_bot_m);
+            ((y_bot_eq - y_top_eq).abs() / 2.0) as f32
+        }
+    };
 
     [
         TileVertex { position: [-hw, -hh], tex_coord: [0.0, 0.0] },
