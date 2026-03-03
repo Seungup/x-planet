@@ -47,6 +47,20 @@ impl NativeApp {
                     PhysicalKey::Code(KeyCode::KeyE) => {
                         engine.rotate(KEYBOARD_ROTATE);
                     }
+                    PhysicalKey::Code(KeyCode::KeyP) => {
+                        let mut names: Vec<String> = engine
+                            .projection_registry
+                            .list()
+                            .into_iter()
+                            .map(|s| s.to_string())
+                            .collect();
+                        names.sort();
+                        let current = &engine.active_projection;
+                        let idx = names.iter().position(|n| n == current).unwrap_or(0);
+                        let next_idx = (idx + 1) % names.len();
+                        engine.set_projection(&names[next_idx]);
+                        log::info!("Projection: {}", engine.active_projection);
+                    }
                     PhysicalKey::Code(KeyCode::Home) => {
                         engine.viewport.center =
                             x_planets_math::GeoCoord::new(0.0, 0.0);

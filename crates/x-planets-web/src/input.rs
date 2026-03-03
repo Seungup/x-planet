@@ -9,10 +9,11 @@
 //! - Middle-drag: rotate
 //! - Scroll wheel: smooth animated zoom toward cursor
 //! - Double-click: smooth zoom in +1 level
-//! - Keyboard: Arrow keys (pan), +/- (zoom), Q/E (rotate), Home (reset)
+//! - Keyboard: Arrow keys (pan), +/- (zoom), Q/E (rotate), P (projection), Home (reset)
 //!
 //! Mobile touch (via shared TouchGestureState with grace period):
-//! - Single finger: pan
+//! - Single finger: pan with inertia
+//! - Double-tap: smooth zoom in +1 level
 //! - Two fingers: pinch zoom, rotate, pitch (vertical drag)
 
 use std::cell::RefCell;
@@ -22,8 +23,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use x_planets_core::interaction::{
-    GestureAction, TouchGestureState,
-    PAN_AMOUNT, ZOOM_STEP, KEYBOARD_ROTATE, PITCH_SENSITIVITY, ROTATE_SENSITIVITY,
+    GestureAction, TouchGestureState, KEYBOARD_ROTATE, PAN_AMOUNT, PITCH_SENSITIVITY,
+    ROTATE_SENSITIVITY, ZOOM_STEP,
 };
 
 use crate::app::WebApp;
@@ -83,17 +84,43 @@ impl MouseDragState {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Touch tap state (for double-tap zoom detection)
+// ═══════════════════════════════════════════════════════════════════
+
+struct TouchTapState {
+    /// Position when single finger first touched down (CSS pixels).
+    start_pos: Option<(f64, f64)>,
+    /// Timestamp when single finger first touched down.
+    start_time: Option<f64>,
+}
+
+impl TouchTapState {
+    fn new() -> Self {
+        Self {
+            start_pos: None,
+            start_time: None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Event registration
 // ═══════════════════════════════════════════════════════════════════
 
 pub fn register_events(canvas: &web_sys::HtmlCanvasElement, app: Rc<RefCell<WebApp>>) {
     let touch_state = Rc::new(RefCell::new(TouchGestureState::new()));
     let mouse_state = Rc::new(RefCell::new(MouseDragState::new()));
+    let tap_state = Rc::new(RefCell::new(TouchTapState::new()));
 
     register_mouse_events(canvas, Rc::clone(&app), Rc::clone(&mouse_state));
     register_wheel_event(canvas, Rc::clone(&app));
     register_keyboard_events(Rc::clone(&app));
-    register_touch_events(canvas, Rc::clone(&app), Rc::clone(&touch_state));
+    register_touch_events(
+        canvas,
+        Rc::clone(&app),
+        Rc::clone(&touch_state),
+        Rc::clone(&tap_state),
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -278,6 +305,10 @@ fn register_keyboard_events(app: Rc<RefCell<WebApp>>) {
             }
             "KeyQ" => app.engine.rotate(-KEYBOARD_ROTATE),
             "KeyE" => app.engine.rotate(KEYBOARD_ROTATE),
+            "KeyP" => {
+                let name = app.cycle_projection();
+                update_projection_button(&name);
+            }
             "Home" => {
                 app.engine.viewport.center = x_planets_math::GeoCoord::new(0.0, 0.0);
                 app.engine.viewport.zoom = 2.0;
@@ -298,19 +329,27 @@ fn register_keyboard_events(app: Rc<RefCell<WebApp>>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Touch events (using shared TouchGestureState with grace period)
+// Touch events (with inertia + double-tap zoom)
 // ═══════════════════════════════════════════════════════════════════
+
+/// Maximum duration (seconds) and distance (CSS px) for a touch to
+/// count as a "tap" for double-tap detection.
+const TAP_MAX_DURATION: f64 = 0.3;
+const TAP_MAX_DISTANCE: f64 = 20.0;
 
 fn register_touch_events(
     canvas: &web_sys::HtmlCanvasElement,
     app: Rc<RefCell<WebApp>>,
     touch_state: Rc<RefCell<TouchGestureState>>,
+    tap_state: Rc<RefCell<TouchTapState>>,
 ) {
     let dpr = web_sys::window().unwrap().device_pixel_ratio();
 
     // touchstart (must be non-passive so preventDefault() works on mobile)
     {
         let ts = Rc::clone(&touch_state);
+        let app = Rc::clone(&app);
+        let tap = Rc::clone(&tap_state);
         let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::TouchEvent| {
             e.prevent_default();
             let now = now_secs();
@@ -326,6 +365,22 @@ fn register_touch_events(
                     );
                 }
             }
+
+            if ts.touch_count() == 1 {
+                // Single finger: stop any running inertia and begin new drag.
+                app.borrow_mut().anim.begin_drag();
+                // Record tap start for double-tap detection.
+                if let Some(t) = e.changed_touches().get(0) {
+                    let mut tap = tap.borrow_mut();
+                    tap.start_pos = Some((t.client_x() as f64, t.client_y() as f64));
+                    tap.start_time = Some(now);
+                }
+            } else {
+                // Multi-touch → not a tap.
+                let mut tap = tap.borrow_mut();
+                tap.start_pos = None;
+                tap.start_time = None;
+            }
         });
         add_non_passive_listener(canvas, "touchstart", cb.as_ref().unchecked_ref());
         cb.forget();
@@ -335,6 +390,7 @@ fn register_touch_events(
     {
         let ts = Rc::clone(&touch_state);
         let app = Rc::clone(&app);
+        let tap = Rc::clone(&tap_state);
         let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::TouchEvent| {
             e.prevent_default();
             let now = now_secs();
@@ -354,6 +410,10 @@ fn register_touch_events(
                 match action {
                     GestureAction::Pan { dx, dy } => {
                         app.engine.pan(dx, -dy);
+                        // Record drag position for inertia velocity estimation.
+                        if let Some(&(_, x, y)) = changes.first() {
+                            app.anim.record_drag((x * dpr, y * dpr), now);
+                        }
                     }
                     GestureAction::MultiTouch(mt) => {
                         if let Some((delta, cx, cy)) = mt.zoom {
@@ -369,6 +429,10 @@ fn register_touch_events(
                         if let Some(deg) = mt.pitch {
                             app.engine.pitch(deg);
                         }
+                        // Multi-touch gesture invalidates tap.
+                        let mut tap = tap.borrow_mut();
+                        tap.start_pos = None;
+                        tap.start_time = None;
                     }
                 }
             }
@@ -380,14 +444,48 @@ fn register_touch_events(
     // touchend / touchcancel (must be non-passive so preventDefault() works on mobile)
     {
         let ts = Rc::clone(&touch_state);
+        let app = Rc::clone(&app);
+        let tap = Rc::clone(&tap_state);
         let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::TouchEvent| {
             e.prevent_default();
             let now = now_secs();
             let mut ts = ts.borrow_mut();
+            let was_single = ts.touch_count() == 1;
+
             let touches = e.changed_touches();
             for i in 0..touches.length() {
                 if let Some(t) = touches.get(i) {
+                    let end_pos = (t.client_x() as f64, t.client_y() as f64);
                     ts.touch_end(t.identifier(), now);
+
+                    // 1→0 transition: finalize single-finger gesture.
+                    if was_single && ts.touch_count() == 0 {
+                        let mut app = app.borrow_mut();
+                        let mut tap = tap.borrow_mut();
+
+                        // Check for double-tap zoom.
+                        if let (Some(start_pos), Some(start_time)) =
+                            (tap.start_pos, tap.start_time)
+                        {
+                            let duration = now - start_time;
+                            let dist = ((end_pos.0 - start_pos.0).powi(2)
+                                + (end_pos.1 - start_pos.1).powi(2))
+                            .sqrt();
+                            if duration < TAP_MAX_DURATION && dist < TAP_MAX_DISTANCE {
+                                let phys = (start_pos.0 * dpr, start_pos.1 * dpr);
+                                if app.anim.check_double_click(phys, now) {
+                                    app.anim.zoom_target += 1.0;
+                                    app.anim.zoom_anchor = Some(phys);
+                                }
+                            }
+                        }
+
+                        // Compute inertia velocity from drag samples.
+                        app.anim.compute_release_velocity(now);
+
+                        tap.start_pos = None;
+                        tap.start_time = None;
+                    }
                 }
             }
         });
@@ -395,4 +493,37 @@ fn register_touch_events(
         add_non_passive_listener(canvas, "touchcancel", cb.as_ref().unchecked_ref());
         cb.forget();
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Projection button (created from lib.rs, updated here)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Update the projection button text to match the current projection.
+fn update_projection_button(name: &str) {
+    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+        if let Some(btn) = doc.get_element_by_id("proj-btn") {
+            btn.set_text_content(Some(name));
+        }
+    }
+}
+
+/// Set up the click listener on the projection button (called from lib.rs).
+pub fn setup_projection_button(app: Rc<RefCell<WebApp>>) {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Some(btn) = doc.get_element_by_id("proj-btn") else {
+        return;
+    };
+
+    let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::Event| {
+        e.stop_propagation();
+        let mut app = app.borrow_mut();
+        let name = app.cycle_projection();
+        update_projection_button(&name);
+    });
+    btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
+        .unwrap();
+    cb.forget();
 }

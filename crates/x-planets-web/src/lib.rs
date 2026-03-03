@@ -76,6 +76,9 @@ mod web_impl {
         // ── Input events ──
         crate::input::register_events(&canvas, std::rc::Rc::clone(&app));
 
+        // ── Projection switcher button ──
+        crate::input::setup_projection_button(std::rc::Rc::clone(&app));
+
         // ── Start render loop ──
         WebApp::start_render_loop(std::rc::Rc::clone(&app));
 
