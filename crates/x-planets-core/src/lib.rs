@@ -7,6 +7,7 @@
 //! - `render`: GPU vertex layouts and layer management
 
 pub mod engine;
+pub mod interaction;
 pub mod model3d_renderer;
 pub mod pipeline;
 pub mod render;

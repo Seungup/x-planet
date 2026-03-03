@@ -8,14 +8,16 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use x_planets_core::engine::MapEngine;
-use wasm_bindgen_futures::JsFuture;
-
+use x_planets_core::interaction::{
+    AnimationController, build_crossfade_overlay, compute_crossfade, compute_fade_overrides,
+};
 use x_planets_core::pipeline::resolve_fallbacks;
 use x_planets_core::render::RenderLayerData;
 use x_planets_core::TileRenderer;
 use x_planets_gpu::{GpuContext, GpuTexture, TextureManager};
 use x_planets_math::TileCoord;
 use x_planets_tiles::{RasterTileDecoder, TileCache, TileDecoder};
+use wasm_bindgen_futures::JsFuture;
 
 // ═══════════════════════════════════════════════════════════════════
 // Completed tile result (produced by async fetch, consumed each frame)
@@ -47,27 +49,12 @@ pub struct WebApp {
     tile_textures: TileCache<GpuTexture>,
     pending_coords: HashSet<TileCoord>,
     completed_queue: Rc<RefCell<Vec<CompletedTile>>>,
-
-    // Max concurrent tile loads
     max_concurrent: usize,
 
-    // ── Animation state ──
-    /// Target zoom level (accumulated from scroll/keyboard, animated toward).
-    pub zoom_target: f64,
-    /// Screen-space anchor for zoom-toward-cursor. `None` = zoom at center.
-    pub zoom_anchor: Option<(f64, f64)>,
-    /// Current pan velocity in screen pixels/sec (for inertia).
-    pub pan_velocity: (f64, f64),
-    /// Recent drag samples: (position, timestamp_ms) for velocity estimation.
-    pub drag_samples: Vec<((f64, f64), f64)>,
-    /// Timestamp (ms) of last left-click for double-click detection.
-    pub last_click_time_ms: Option<f64>,
-    /// Position of last left-click for double-click detection.
-    pub last_click_pos: Option<(f64, f64)>,
+    // ── Shared animation controller (from x-planets-core) ──
+    pub anim: AnimationController,
     /// Previous frame timestamp (ms) for dt calculation.
-    pub last_frame_ms: Option<f64>,
-    /// Last known mouse position (for zoom anchor fallback).
-    pub last_mouse_pos: Option<(f64, f64)>,
+    last_frame_ms: Option<f64>,
 }
 
 impl WebApp {
@@ -103,14 +90,8 @@ impl WebApp {
             pending_coords: HashSet::new(),
             completed_queue: Rc::new(RefCell::new(Vec::new())),
             max_concurrent: 6,
-            zoom_target: initial_zoom,
-            zoom_anchor: None,
-            pan_velocity: (0.0, 0.0),
-            drag_samples: Vec::new(),
-            last_click_time_ms: None,
-            last_click_pos: None,
+            anim: AnimationController::new(initial_zoom),
             last_frame_ms: None,
-            last_mouse_pos: None,
         }
     }
 
@@ -128,22 +109,30 @@ impl WebApp {
     }
 
     fn render_frame(&mut self, timestamp_ms: f64) {
+        let now_secs = timestamp_ms / 1000.0;
+
         // ── 0. Tick animations (smooth zoom, inertia pan) ──
-        self.tick_animations(timestamp_ms);
+        if let Some(prev_ms) = self.last_frame_ms {
+            let dt = ((timestamp_ms - prev_ms) / 1000.0).min(0.1);
+            self.anim.tick(&mut self.engine, dt);
+        }
+        self.last_frame_ms = Some(timestamp_ms);
+
+        // GC finished tile fades
+        self.anim.gc_fades(now_secs);
 
         // ── 1. Handle resize ──
         self.check_resize();
 
         // ── 2. Process completed tile fetches → GPU upload ──
-        self.upload_completed_tiles();
+        self.upload_completed_tiles(now_secs);
 
         // ── 3. Request missing tiles ──
         let visible = self.engine.viewport.visible_tiles();
         self.request_missing_tiles(&visible);
 
-        // ── 4. Build render data ──
+        // ── 4. Build render data with crossfade ──
         let available: HashSet<TileCoord> = self.tile_textures.keys().copied().collect();
-        let renderable = resolve_fallbacks(&visible, &available);
 
         let texture_views: HashMap<TileCoord, &wgpu::TextureView> = self
             .tile_textures
@@ -151,13 +140,41 @@ impl WebApp {
             .map(|(k, v)| (*k, &v.view))
             .collect();
 
-        let layer = RenderLayerData {
+        // Crossfade: exclude fading children from base, render them as overlay
+        let (available_for_base, crossfade_tiles) =
+            compute_crossfade(&visible, &available, |coord| {
+                self.anim.tile_fade_elapsed(coord, now_secs)
+            });
+
+        let renderable = resolve_fallbacks(&visible, &available_for_base);
+
+        // Opacity overrides for tiles with no parent (fade from zero)
+        let tile_opacity_overrides =
+            compute_fade_overrides(&renderable, 1.0, |coord| {
+                self.anim.tile_fade_elapsed(coord, now_secs)
+            });
+
+        let base_layer = RenderLayerData {
             name: "base",
             opacity: 1.0,
             tiles: renderable,
-            texture_views,
-            tile_opacity_overrides: HashMap::new(),
+            texture_views: texture_views.clone(),
+            tile_opacity_overrides,
         };
+
+        // Build crossfade overlay layer (if any tiles are transitioning)
+        let mut layers: Vec<RenderLayerData> = vec![base_layer];
+        if !crossfade_tiles.is_empty() {
+            let (overlay_tiles, overlay_opacity) =
+                build_crossfade_overlay(&crossfade_tiles, 1.0);
+            layers.push(RenderLayerData {
+                name: "crossfade-overlay",
+                opacity: 1.0,
+                tiles: overlay_tiles,
+                texture_views,
+                tile_opacity_overrides: overlay_opacity,
+            });
+        }
 
         // ── 5. Render ──
         let surface = match self.gpu.surface.as_ref() {
@@ -177,7 +194,7 @@ impl WebApp {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         self.renderer
-            .render_frame_layered(&self.gpu, &view, &self.engine.viewport, &[layer]);
+            .render_frame_layered(&self.gpu, &view, &self.engine.viewport, &layers);
 
         frame.present();
 
@@ -204,7 +221,7 @@ impl WebApp {
         }
     }
 
-    fn upload_completed_tiles(&mut self) {
+    fn upload_completed_tiles(&mut self, now_secs: f64) {
         let completed: Vec<CompletedTile> = self.completed_queue.borrow_mut().drain(..).collect();
         for tile in completed {
             self.pending_coords.remove(&tile.coord);
@@ -218,6 +235,8 @@ impl WebApp {
                 &tile.pixels,
             );
             self.tile_textures.insert(tile.coord, gpu_tex);
+            // Register for fade-in animation
+            self.anim.register_tile_loaded(tile.coord, now_secs);
         }
     }
 
@@ -265,76 +284,6 @@ impl WebApp {
                 }
             });
         }
-    }
-    // ── Animation methods ──
-
-    fn tick_animations(&mut self, timestamp_ms: f64) {
-        let dt = match self.last_frame_ms {
-            Some(prev) => ((timestamp_ms - prev) / 1000.0).min(0.1), // cap at 100ms
-            None => {
-                self.last_frame_ms = Some(timestamp_ms);
-                return;
-            }
-        };
-        self.last_frame_ms = Some(timestamp_ms);
-
-        // Smooth zoom: exponential decay toward target
-        let current = self.engine.viewport.zoom;
-        let target = self
-            .zoom_target
-            .clamp(self.engine.camera.min_zoom, self.engine.camera.max_zoom);
-        let diff = target - current;
-        if diff.abs() > 0.001 {
-            let new_zoom = current + diff * (1.0 - (-12.0 * dt).exp());
-            let delta = new_zoom - current;
-            match self.zoom_anchor {
-                Some((mx, my)) => self.engine.zoom_at(delta, mx, my),
-                None => self.engine.zoom(delta),
-            }
-        } else if (current - target).abs() > 1e-9 {
-            self.engine.viewport.zoom = target;
-            self.engine.request_redraw();
-        }
-
-        // Inertia pan: friction-based velocity decay
-        let (vx, vy) = self.pan_velocity;
-        let speed = (vx * vx + vy * vy).sqrt();
-        if speed > 1.0 {
-            self.engine.pan(vx * dt, -(vy * dt));
-            let friction = (-6.0 * dt).exp();
-            self.pan_velocity = (vx * friction, vy * friction);
-        } else {
-            self.pan_velocity = (0.0, 0.0);
-        }
-    }
-
-    /// Record a drag position sample for velocity estimation.
-    pub fn record_drag(&mut self, pos: (f64, f64), timestamp_ms: f64) {
-        // Keep only the last 100ms of samples.
-        self.drag_samples
-            .retain(|(_, t)| timestamp_ms - t < 100.0);
-        self.drag_samples.push((pos, timestamp_ms));
-    }
-
-    /// Compute pan velocity from recent drag samples (called on mouse-up).
-    pub fn compute_release_velocity(&mut self, timestamp_ms: f64) {
-        self.drag_samples
-            .retain(|(_, t)| timestamp_ms - t < 100.0);
-        if self.drag_samples.len() < 2 {
-            self.pan_velocity = (0.0, 0.0);
-            return;
-        }
-        let first = &self.drag_samples[0];
-        let last = &self.drag_samples[self.drag_samples.len() - 1];
-        let dt = (last.1 - first.1) / 1000.0; // seconds
-        if dt < 0.001 {
-            self.pan_velocity = (0.0, 0.0);
-            return;
-        }
-        let vx = (last.0 .0 - first.0 .0) / dt;
-        let vy = (last.0 .1 - first.0 .1) / dt;
-        self.pan_velocity = (vx, vy);
-        self.drag_samples.clear();
     }
 }
 
