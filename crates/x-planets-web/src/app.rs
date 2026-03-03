@@ -111,7 +111,7 @@ impl WebApp {
     /// Resolve the active projection name to a `ProjectionMode` enum.
     fn resolve_projection_mode(&self) -> x_planets_math::ProjectionMode {
         match self.engine.active_projection.as_str() {
-            "Equirectangular" => x_planets_math::ProjectionMode::Equirectangular,
+            "Equirectangular" => x_planets_math::ProjectionMode::Globe,
             _ => x_planets_math::ProjectionMode::Mercator,
         }
     }

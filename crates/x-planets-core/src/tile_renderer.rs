@@ -16,12 +16,16 @@
 use x_planets_gpu::GpuContext;
 use x_planets_math::{TileCoord, ViewportUniforms};
 
-use crate::pipeline::{build_tile_mesh_projected, tile_uniforms_for_visible_projected, RenderableTile};
-use crate::render::{RenderLayerData, TileVertex};
+use crate::pipeline::{
+    build_tile_mesh_projected, tile_uniforms_for_visible_projected,
+    build_globe_tile_mesh, tile_uniforms_for_globe, RenderableTile,
+};
+use crate::render::{GlobeTileVertex, RenderLayerData, TileVertex};
 use crate::viewport::Viewport;
 use std::collections::HashMap;
 
 const RASTER_TILE_SHADER: &str = include_str!("../../../shaders/rendering/raster_tile.wgsl");
+const RASTER_TILE_GLOBE_SHADER: &str = include_str!("../../../shaders/rendering/raster_tile_globe.wgsl");
 
 /// A tile prepared for rendering (owns its GPU resources).
 pub struct PreparedTile {
@@ -32,6 +36,7 @@ pub struct PreparedTile {
 /// Renders raster tiles to the screen.
 pub struct TileRenderer {
     pipeline: wgpu::RenderPipeline,
+    globe_pipeline: wgpu::RenderPipeline,
     _viewport_bgl: wgpu::BindGroupLayout,
     tile_bgl: wgpu::BindGroupLayout,
     viewport_buffer: wgpu::Buffer,
@@ -159,6 +164,59 @@ impl TileRenderer {
                     cache: None,
                 });
 
+        // ── Globe Shader + Pipeline ──
+        let globe_shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("raster-tile-globe-shader"),
+                source: wgpu::ShaderSource::Wgsl(RASTER_TILE_GLOBE_SHADER.into()),
+            });
+
+        let globe_pipeline_layout =
+            gpu.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("raster-tile-globe-layout"),
+                    bind_group_layouts: &[&_viewport_bgl, &tile_bgl],
+                    push_constant_ranges: &[],
+                });
+
+        let globe_pipeline =
+            gpu.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("raster-tile-globe-pipeline"),
+                    layout: Some(&globe_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &globe_shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[GlobeTileVertex::layout()],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &globe_shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        cull_mode: Some(wgpu::Face::Back),
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: Self::depth_format(),
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::LessEqual,
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                });
+
         // ── Viewport uniform buffer (updated per frame) ──
         let viewport_uniforms = ViewportUniforms {
             view_proj: [0.0; 16],
@@ -200,6 +258,7 @@ impl TileRenderer {
 
         Self {
             pipeline,
+            globe_pipeline,
             _viewport_bgl,
             tile_bgl,
             viewport_buffer,
@@ -271,6 +330,43 @@ impl TileRenderer {
 
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tile-bg"),
+            layout: &self.tile_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+
+        PreparedTile {
+            _buffer: buffer,
+            bind_group,
+        }
+    }
+
+    /// Prepare a tile for globe rendering: uses 3D sphere uniforms.
+    fn prepare_tile_globe(
+        &self,
+        gpu: &GpuContext,
+        rt: &RenderableTile,
+        texture_view: &wgpu::TextureView,
+        opacity: f32,
+        vp_f64: &glam::DMat4,
+    ) -> PreparedTile {
+        let uniforms = tile_uniforms_for_globe(rt, opacity, vp_f64);
+        let buffer = gpu.create_uniform_buffer("globe-tile-uniforms", &uniforms);
+
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("globe-tile-bg"),
             layout: &self.tile_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -427,40 +523,7 @@ impl TileRenderer {
                 continue;
             }
 
-            // 2. Build batched vertex/index mesh for this layer (RTE positions)
-            let coords: Vec<TileCoord> = layer.tiles.iter().map(|t| t.coord).collect();
-            let (vertices, indices) = build_tile_mesh_projected(&coords, mode);
-
-            if vertices.is_empty() {
-                continue;
-            }
-
-            let vertex_buffer = gpu.create_vertex_buffer(
-                &format!("tile-vertices-{}", layer.name),
-                &vertices,
-            );
-            let index_buffer = gpu.create_index_buffer(
-                &format!("tile-indices-{}", layer.name),
-                &indices,
-            );
-
-            // 3. Prepare per-tile bind groups (per-tile MVP + opacity)
-            let prepared: Vec<PreparedTile> = layer
-                .tiles
-                .iter()
-                .filter_map(|rt| {
-                    layer.texture_views.get(&rt.texture_coord).map(|tex_view| {
-                        let tile_opacity = layer
-                            .tile_opacity_overrides
-                            .get(&rt.coord)
-                            .copied()
-                            .unwrap_or(layer.opacity);
-                        self.prepare_tile(gpu, rt, tex_view, tile_opacity, &vp_f64, mode)
-                    })
-                })
-                .collect();
-
-            // 4. Encode render pass for this layer
+            // 2. Encode render pass for this layer
             let is_first = layer_idx == 0;
             let color_load = if is_first {
                 wgpu::LoadOp::Clear(wgpu::Color {
@@ -469,40 +532,143 @@ impl TileRenderer {
             } else {
                 wgpu::LoadOp::Load
             };
-            // Always clear depth per layer to avoid cross-layer z-fighting
             let depth_load = wgpu::LoadOp::Clear(1.0);
 
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("tile-render-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: target,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: color_load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.depth_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: depth_load,
-                            store: wgpu::StoreOp::Discard,
+            let is_globe = mode == x_planets_math::ProjectionMode::Globe;
+
+            if is_globe {
+                // ── Globe path: tessellated sphere mesh ──
+                let (globe_verts, globe_idxs, tile_idx_counts) =
+                    build_globe_tile_mesh(&layer.tiles);
+
+                if globe_verts.is_empty() {
+                    continue;
+                }
+
+                let vertex_buffer = gpu.create_vertex_buffer(
+                    &format!("globe-vertices-{}", layer.name),
+                    &globe_verts,
+                );
+                let index_buffer = gpu.create_index_buffer(
+                    &format!("globe-indices-{}", layer.name),
+                    &globe_idxs,
+                );
+
+                let prepared: Vec<PreparedTile> = layer
+                    .tiles
+                    .iter()
+                    .filter_map(|rt| {
+                        layer.texture_views.get(&rt.texture_coord).map(|tex_view| {
+                            let tile_opacity = layer
+                                .tile_opacity_overrides
+                                .get(&rt.coord)
+                                .copied()
+                                .unwrap_or(layer.opacity);
+                            self.prepare_tile_globe(gpu, rt, tex_view, tile_opacity, &vp_f64)
+                        })
+                    })
+                    .collect();
+
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("globe-render-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: color_load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: depth_load,
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
                         }),
-                        stencil_ops: None,
-                    }),
-                    ..Default::default()
-                });
+                        ..Default::default()
+                    });
 
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.viewport_bg, &[]);
-                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_pipeline(&self.globe_pipeline);
+                    pass.set_bind_group(0, &self.viewport_bg, &[]);
+                    pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-                for (i, tile) in prepared.iter().enumerate() {
-                    pass.set_bind_group(1, &tile.bind_group, &[]);
-                    let start = (i * 6) as u32;
-                    pass.draw_indexed(start..start + 6, 0, 0..1);
+                    let mut idx_offset = 0u32;
+                    for (i, tile) in prepared.iter().enumerate() {
+                        pass.set_bind_group(1, &tile.bind_group, &[]);
+                        let count = tile_idx_counts[i];
+                        pass.draw_indexed(idx_offset..idx_offset + count, 0, 0..1);
+                        idx_offset += count;
+                    }
+                }
+            } else {
+                // ── Flat path: 2D quad mesh ──
+                let coords: Vec<TileCoord> = layer.tiles.iter().map(|t| t.coord).collect();
+                let (vertices, indices) = build_tile_mesh_projected(&coords, mode);
+
+                if vertices.is_empty() {
+                    continue;
+                }
+
+                let vertex_buffer = gpu.create_vertex_buffer(
+                    &format!("tile-vertices-{}", layer.name),
+                    &vertices,
+                );
+                let index_buffer = gpu.create_index_buffer(
+                    &format!("tile-indices-{}", layer.name),
+                    &indices,
+                );
+
+                let prepared: Vec<PreparedTile> = layer
+                    .tiles
+                    .iter()
+                    .filter_map(|rt| {
+                        layer.texture_views.get(&rt.texture_coord).map(|tex_view| {
+                            let tile_opacity = layer
+                                .tile_opacity_overrides
+                                .get(&rt.coord)
+                                .copied()
+                                .unwrap_or(layer.opacity);
+                            self.prepare_tile(gpu, rt, tex_view, tile_opacity, &vp_f64, mode)
+                        })
+                    })
+                    .collect();
+
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("tile-render-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: color_load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: depth_load,
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &self.viewport_bg, &[]);
+                    pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
+                    for (i, tile) in prepared.iter().enumerate() {
+                        pass.set_bind_group(1, &tile.bind_group, &[]);
+                        let start = (i * 6) as u32;
+                        pass.draw_indexed(start..start + 6, 0, 0..1);
+                    }
                 }
             }
         }

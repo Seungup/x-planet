@@ -339,8 +339,12 @@ impl Viewport {
 
     /// Like [`to_view_proj_f64`] but positions the camera using the given projection.
     pub fn to_view_proj_f64_projected(&self, mode: x_planets_math::ProjectionMode) -> glam::DMat4 {
+        if mode == x_planets_math::ProjectionMode::Globe {
+            return self.to_globe_view_proj_f64();
+        }
         let center = match mode {
-            x_planets_math::ProjectionMode::Mercator => geo_to_mercator(&self.center),
+            x_planets_math::ProjectionMode::Mercator
+            | x_planets_math::ProjectionMode::Globe => geo_to_mercator(&self.center),
             x_planets_math::ProjectionMode::Equirectangular => {
                 x_planets_math::geo_to_equirectangular(&self.center)
             }
@@ -375,6 +379,59 @@ impl Viewport {
 
         let flip_x = glam::DMat4::from_diagonal(glam::DVec4::new(-1.0, 1.0, 1.0, 1.0));
         flip_x * proj * view
+    }
+
+    /// Compute the globe view-projection matrix in f64.
+    ///
+    /// Orbital camera around a unit sphere.  The camera looks at the surface
+    /// point corresponding to `self.center`, positioned at a distance
+    /// determined by `self.zoom`.  Pitch and bearing rotate the camera.
+    pub fn to_globe_view_proj_f64(&self) -> glam::DMat4 {
+        let lat_rad = self.center.lat.to_radians();
+        let lon_rad = self.center.lon.to_radians();
+
+        // Surface point (look-at target) on unit sphere
+        let surface_point = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
+
+        // Camera altitude above sphere surface (unit-sphere radius = 1.0).
+        // At zoom 0, ~3.14 radii above surface → sees whole globe.
+        // Each zoom level halves the altitude.
+        let unit_altitude =
+            (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(self.zoom);
+
+        // Local ENU (East-North-Up) basis at surface point
+        let up_surface = surface_point.normalize();
+        let east = glam::DVec3::new(-lon_rad.sin(), lon_rad.cos(), 0.0).normalize();
+        let north = up_surface.cross(east).normalize();
+
+        // Apply bearing: rotate horizontal component
+        let bearing_rad = self.bearing.to_radians();
+        let cos_b = bearing_rad.cos();
+        let sin_b = bearing_rad.sin();
+        let forward_h = north * cos_b + east * sin_b;
+
+        // Apply pitch: at pitch=0, camera directly above, looking down.
+        let pitch_rad = self.pitch.to_radians();
+        let backward = -forward_h * pitch_rad.sin() + up_surface * pitch_rad.cos();
+        let camera_pos = surface_point + backward.normalize() * unit_altitude;
+
+        let camera_up = if pitch_rad.abs() < 0.01 {
+            forward_h.normalize()
+        } else {
+            let forward = (surface_point - camera_pos).normalize();
+            let right = forward.cross(up_surface).normalize();
+            right.cross(forward).normalize()
+        };
+
+        let view = glam::DMat4::look_at_rh(camera_pos, surface_point, camera_up);
+
+        let aspect = self.width as f64 / self.height.max(1) as f64;
+        let fov_y: f64 = std::f64::consts::FRAC_PI_3; // 60°
+        let near = unit_altitude * 0.01;
+        let far = (unit_altitude + 2.0) * 3.0; // far enough to see whole sphere
+        let proj = glam::DMat4::perspective_rh(fov_y, aspect, near.max(0.0001), far);
+
+        proj * view
     }
 
     /// Compute GPU uniforms for this viewport.
