@@ -326,11 +326,8 @@ impl Viewport {
         // Compute effective zoom from angular extent:
         // At zoom z, each tile covers 360/2^z degrees of longitude.
         // The visible cap diameter in degrees ≈ 2 * half_angle_degrees.
-        // Using height/128 (instead of /256) doubles the tile density so
-        // the globe renders with higher resolution and tiles change at
-        // every viewport zoom level.
         let visible_deg = half_angle.to_degrees() * 2.0;
-        let tiles_needed = (self.height as f64 / 128.0).max(1.0);
+        let tiles_needed = (self.height as f64 / 256.0).max(1.0);
         let tile_size_deg = visible_deg / tiles_needed;
         // 360 / 2^z = tile_size_deg → z = log2(360 / tile_size_deg)
         let globe_zoom = (360.0 / tile_size_deg).log2()
