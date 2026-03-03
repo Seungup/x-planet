@@ -2959,4 +2959,244 @@ mod tests {
         }
         points
     }
+
+    // ── Globe/centered mesh alignment regression tests ─────────
+
+    /// Regression: build_globe_tile_mesh must produce exactly one
+    /// index-count entry per input tile.  A mismatch between the mesh
+    /// index-count vector and the prepared bind-group vector caused
+    /// tiles to render with the wrong mesh.
+    #[test]
+    fn test_build_globe_tile_mesh_count_matches_tiles() {
+        let tiles = vec![
+            RenderableTile {
+                coord: TileCoord::new(2, 0, 0),
+                texture_coord: TileCoord::new(2, 0, 0),
+                uv_rect: [0.0, 0.0, 1.0, 1.0],
+                display_x: 0,
+            },
+            RenderableTile {
+                coord: TileCoord::new(2, 1, 1),
+                texture_coord: TileCoord::new(2, 1, 1),
+                uv_rect: [0.0, 0.0, 1.0, 1.0],
+                display_x: 1,
+            },
+            RenderableTile {
+                coord: TileCoord::new(2, 3, 2),
+                texture_coord: TileCoord::new(2, 3, 2),
+                uv_rect: [0.0, 0.0, 1.0, 1.0],
+                display_x: 3,
+            },
+        ];
+
+        let (_verts, _idxs, tile_idx_counts) = build_globe_tile_mesh(&tiles);
+
+        assert_eq!(
+            tile_idx_counts.len(),
+            tiles.len(),
+            "tile_idx_counts length must equal input tile count"
+        );
+        // Every tile must produce at least some indices
+        for (i, &count) in tile_idx_counts.iter().enumerate() {
+            assert!(
+                count > 0,
+                "tile {} must produce non-zero index count, got 0",
+                i
+            );
+        }
+    }
+
+    /// Regression: build_centered_tile_mesh must produce exactly one
+    /// index-count entry per input tile.
+    #[test]
+    fn test_build_centered_tile_mesh_count_matches_tiles() {
+        let center_lat = 37.5_f64.to_radians();
+        let center_lon = 127.0_f64.to_radians();
+        // Use tiles near the center so they pass the angular-distance filter
+        let tiles = vec![
+            RenderableTile {
+                coord: TileCoord::new(3, 7, 3),
+                texture_coord: TileCoord::new(3, 7, 3),
+                uv_rect: [0.0, 0.0, 1.0, 1.0],
+                display_x: 7,
+            },
+            RenderableTile {
+                coord: TileCoord::new(3, 7, 4),
+                texture_coord: TileCoord::new(3, 7, 4),
+                uv_rect: [0.0, 0.0, 1.0, 1.0],
+                display_x: 7,
+            },
+        ];
+
+        let (_verts, _idxs, tile_idx_counts) =
+            build_centered_tile_mesh(&tiles, center_lat, center_lon);
+
+        assert_eq!(
+            tile_idx_counts.len(),
+            tiles.len(),
+            "tile_idx_counts length must equal input tile count"
+        );
+        for (i, &count) in tile_idx_counts.iter().enumerate() {
+            assert!(
+                count > 0,
+                "tile {} must produce non-zero index count, got 0",
+                i
+            );
+        }
+    }
+
+    /// Regression: index offsets must be cumulative and non-overlapping.
+    /// The draw loop uses `idx_offset..idx_offset+count` ranges, so
+    /// the sum of all counts must equal total indices.
+    #[test]
+    fn test_globe_mesh_index_offsets_are_contiguous() {
+        let tiles: Vec<RenderableTile> = (0..4)
+            .map(|i| RenderableTile {
+                coord: TileCoord::new(2, i, 0),
+                texture_coord: TileCoord::new(2, i, 0),
+                uv_rect: [0.0, 0.0, 1.0, 1.0],
+                display_x: i as i64,
+            })
+            .collect();
+
+        let (_verts, all_idxs, tile_idx_counts) = build_globe_tile_mesh(&tiles);
+
+        let total: u32 = tile_idx_counts.iter().sum();
+        assert_eq!(
+            total,
+            all_idxs.len() as u32,
+            "sum of per-tile index counts must equal total index count"
+        );
+    }
+
+    /// Regression: same contiguity invariant for centered Mercator.
+    #[test]
+    fn test_centered_mesh_index_offsets_are_contiguous() {
+        let center_lat = 0.0_f64.to_radians();
+        let center_lon = 0.0_f64.to_radians();
+        let tiles: Vec<RenderableTile> = (0..4)
+            .map(|i| RenderableTile {
+                coord: TileCoord::new(2, i, 1),
+                texture_coord: TileCoord::new(2, i, 1),
+                uv_rect: [0.0, 0.0, 1.0, 1.0],
+                display_x: i as i64,
+            })
+            .collect();
+
+        let (_verts, all_idxs, tile_idx_counts) =
+            build_centered_tile_mesh(&tiles, center_lat, center_lon);
+
+        let total: u32 = tile_idx_counts.iter().sum();
+        assert_eq!(
+            total,
+            all_idxs.len() as u32,
+            "sum of per-tile index counts must equal total index count"
+        );
+    }
+
+    // ── Oblique Mercator angular-distance filtering tests ──────
+
+    /// Tiles near the oblique Mercator singularity (~90° from center)
+    /// must produce valid (non-degenerate) meshes. Tiles at the center
+    /// should always produce indices.
+    #[test]
+    fn test_centered_mesh_center_tile_always_has_indices() {
+        // Center at Seoul (37.5°N, 127°E)
+        let center_lat = 37.5_f64.to_radians();
+        let center_lon = 127.0_f64.to_radians();
+
+        // Tile covering Seoul at zoom 5
+        let tile = RenderableTile {
+            coord: TileCoord::new(5, 27, 12),
+            texture_coord: TileCoord::new(5, 27, 12),
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x: 27,
+        };
+
+        let (_verts, _idxs, counts) =
+            build_centered_tile_mesh(&[tile], center_lat, center_lon);
+
+        assert_eq!(counts.len(), 1);
+        assert!(
+            counts[0] > 0,
+            "tile near center must produce non-zero index count"
+        );
+    }
+
+    /// The centered mesh builder should produce no degenerate triangles
+    /// (zero-area) for tiles within the valid projection range.
+    #[test]
+    fn test_centered_mesh_no_degenerate_triangles_near_center() {
+        let center_lat = 0.0_f64;
+        let center_lon = 0.0_f64;
+        // Tile at center
+        let tile = RenderableTile {
+            coord: TileCoord::new(2, 2, 2),
+            texture_coord: TileCoord::new(2, 2, 2),
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x: 2,
+        };
+
+        let (verts, idxs, _counts) =
+            build_centered_tile_mesh(&[tile], center_lat, center_lon);
+
+        // Check every triangle has non-zero area
+        for tri in idxs.chunks(3) {
+            if tri.len() < 3 {
+                continue;
+            }
+            let p0 = verts[tri[0] as usize].position;
+            let p1 = verts[tri[1] as usize].position;
+            let p2 = verts[tri[2] as usize].position;
+            let cross = (p1[0] - p0[0]) * (p2[1] - p0[1])
+                - (p1[1] - p0[1]) * (p2[0] - p0[0]);
+            assert!(
+                cross.abs() > 1e-12,
+                "degenerate triangle found: area ≈ {:.2e}",
+                cross.abs()
+            );
+        }
+    }
+
+    /// Tiles whose angular distance from the center exceeds ~80° should
+    /// produce fewer or zero triangles (winding check skips distorted ones).
+    #[test]
+    fn test_centered_mesh_far_tile_has_fewer_indices() {
+        let center_lat = 37.5_f64.to_radians();
+        let center_lon = 127.0_f64.to_radians();
+
+        // Tile near center (Seoul)
+        let near = RenderableTile {
+            coord: TileCoord::new(2, 3, 1),
+            texture_coord: TileCoord::new(2, 3, 1),
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x: 3,
+        };
+
+        // Tile far from center (opposite side of globe at zoom 2)
+        let far = RenderableTile {
+            coord: TileCoord::new(2, 1, 1),
+            texture_coord: TileCoord::new(2, 1, 1),
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x: 1,
+        };
+
+        let (_v1, _i1, counts_near) =
+            build_centered_tile_mesh(&[near], center_lat, center_lon);
+        let (_v2, _i2, counts_far) =
+            build_centered_tile_mesh(&[far], center_lat, center_lon);
+
+        assert!(
+            counts_near[0] > 0,
+            "near tile must produce indices"
+        );
+        // Far tile should have fewer or no valid triangles due to
+        // the oblique Mercator distortion near the singularity
+        assert!(
+            counts_far[0] <= counts_near[0],
+            "far tile should have <= indices than near tile: {} vs {}",
+            counts_far[0],
+            counts_near[0]
+        );
+    }
 }

@@ -604,4 +604,128 @@ mod tests {
             }
         }
     }
+
+    // ── Globe mesh geometry tests ──────────────────────────────
+
+    /// Globe mesh vertices must lie on (or very near) the unit sphere.
+    #[test]
+    fn test_globe_mesh_vertices_on_unit_sphere() {
+        let coord = TileCoord::new(2, 1, 1);
+        let center = x_planets_math::geo_to_unit_sphere(
+            x_planets_math::mercator_y_to_lat_rad(0.375),
+            (0.375 * 2.0 - 1.0) * std::f64::consts::PI,
+        );
+        let (verts, _idxs) = tile_globe_mesh(&coord, center);
+
+        for (i, v) in verts.iter().enumerate() {
+            let p = glam::DVec3::new(
+                v.position[0] as f64 + center.x,
+                v.position[1] as f64 + center.y,
+                v.position[2] as f64 + center.z,
+            );
+            let r = p.length();
+            assert!(
+                (r - 1.0).abs() < 1e-4,
+                "vertex {} at distance {:.6} from origin, expected 1.0",
+                i, r
+            );
+        }
+    }
+
+    /// Globe mesh triangles must all face outward (normal · centroid > 0).
+    #[test]
+    fn test_globe_mesh_all_triangles_face_outward() {
+        for z in 0..=3u8 {
+            let n = 1u32 << z;
+            for x in 0..n {
+                for y in 0..n {
+                    let coord = TileCoord::new(z, x, y);
+                    let n_f = coord.extent() as f64;
+                    let mx = (x as f64 + 0.5) / n_f;
+                    let my = (y as f64 + 0.5) / n_f;
+                    let center = x_planets_math::geo_to_unit_sphere(
+                        x_planets_math::mercator_y_to_lat_rad(my),
+                        (mx * 2.0 - 1.0) * std::f64::consts::PI,
+                    );
+                    let (verts, idxs) = tile_globe_mesh(&coord, center);
+
+                    for tri in idxs.chunks(3) {
+                        let v0 = glam::Vec3::from(verts[tri[0] as usize].position);
+                        let v1 = glam::Vec3::from(verts[tri[1] as usize].position);
+                        let v2 = glam::Vec3::from(verts[tri[2] as usize].position);
+                        // Add center back to get absolute positions
+                        let c = glam::Vec3::new(center.x as f32, center.y as f32, center.z as f32);
+                        let abs0 = v0 + c;
+                        let abs1 = v1 + c;
+                        let abs2 = v2 + c;
+                        let normal = (abs1 - abs0).cross(abs2 - abs0);
+                        let centroid = (abs0 + abs1 + abs2) / 3.0;
+                        let dot = normal.dot(centroid);
+                        assert!(
+                            dot > 0.0,
+                            "z={} x={} y={}: triangle has inward normal (dot={:.6})",
+                            z, x, y, dot
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Centered mesh winding tests ────────────────────────────
+
+    /// Centered mesh triangles near the center must have correct
+    /// (positive) 2D cross product, confirming CCW winding.
+    #[test]
+    fn test_centered_mesh_winding_near_center() {
+        let center_lat = 0.0_f64;
+        let center_lon = 0.0_f64;
+        let coord = TileCoord::new(2, 2, 2);
+        let tile_center = x_planets_math::oblique_mercator(
+            x_planets_math::mercator_y_to_lat_rad(0.625),
+            (0.625 * 2.0 - 1.0) * std::f64::consts::PI,
+            center_lat,
+            center_lon,
+        );
+        let (verts, idxs) = tile_centered_mesh(&coord, center_lat, center_lon, tile_center);
+
+        // All triangles should have positive cross product (CCW winding)
+        for tri in idxs.chunks(3) {
+            if tri.len() < 3 {
+                continue;
+            }
+            let p0 = verts[tri[0] as usize].position;
+            let p1 = verts[tri[1] as usize].position;
+            let p2 = verts[tri[2] as usize].position;
+            let cross = (p1[0] - p0[0]) * (p2[1] - p0[1])
+                - (p1[1] - p0[1]) * (p2[0] - p0[0]);
+            // Some triangles may be degenerate (zero-area) due to
+            // clamping; we just require non-negative for near-center tiles
+            assert!(
+                cross >= -1e-10,
+                "near-center triangle has inverted winding (cross={:.6})",
+                cross
+            );
+        }
+    }
+
+    /// Centered mesh for tiles near the center should produce indices.
+    #[test]
+    fn test_centered_mesh_produces_indices() {
+        let center_lat = 37.5_f64.to_radians();
+        let center_lon = 127.0_f64.to_radians();
+        let coord = TileCoord::new(5, 27, 12); // near Seoul
+        let tile_center = x_planets_math::oblique_mercator(
+            x_planets_math::mercator_y_to_lat_rad(12.5 / 32.0),
+            (27.5 / 32.0 * 2.0 - 1.0) * std::f64::consts::PI,
+            center_lat,
+            center_lon,
+        );
+        let (_verts, idxs) = tile_centered_mesh(&coord, center_lat, center_lon, tile_center);
+
+        assert!(
+            !idxs.is_empty(),
+            "tile near center must produce indices"
+        );
+    }
 }
