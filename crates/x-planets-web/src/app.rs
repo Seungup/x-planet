@@ -9,9 +9,10 @@ use wasm_bindgen::JsCast;
 
 use x_planets_core::engine::MapEngine;
 use x_planets_core::interaction::{
-    AnimationController, build_crossfade_overlay, compute_crossfade, compute_fade_overrides,
+    AnimationController, FADE_DURATION, build_crossfade_overlay, compute_crossfade,
+    compute_fade_overrides,
 };
-use x_planets_core::pipeline::resolve_fallbacks;
+use x_planets_core::pipeline::{resolve_fallbacks, RenderableTile};
 use x_planets_core::render::RenderLayerData;
 use x_planets_core::TileRenderer;
 use x_planets_gpu::{GpuContext, GpuTexture, TextureManager};
@@ -49,12 +50,21 @@ pub struct WebApp {
     tile_textures: TileCache<GpuTexture>,
     pending_coords: HashSet<TileCoord>,
     completed_queue: Rc<RefCell<Vec<CompletedTile>>>,
+    /// Failed fetch notifications (coord pushed from async task, drained each frame).
+    failed_queue: Rc<RefCell<Vec<TileCoord>>>,
     max_concurrent: usize,
 
     // ── Shared animation controller (from x-planets-core) ──
     pub anim: AnimationController,
     /// Previous frame timestamp (ms) for dt calculation.
     last_frame_ms: Option<f64>,
+
+    // ── Crossfade tracking ──
+    /// Tiles that were visible+available last frame (for detecting transitions).
+    prev_visible_available: HashSet<TileCoord>,
+    /// Tiles that recently left the visible set, rendered as a fading-out overlay.
+    /// Maps coord → departure time (seconds).
+    departing_tiles: HashMap<TileCoord, f64>,
 }
 
 impl WebApp {
@@ -89,9 +99,12 @@ impl WebApp {
             tile_textures: TileCache::new(256),
             pending_coords: HashSet::new(),
             completed_queue: Rc::new(RefCell::new(Vec::new())),
+            failed_queue: Rc::new(RefCell::new(Vec::new())),
             max_concurrent: 6,
             anim: AnimationController::new(initial_zoom),
             last_frame_ms: None,
+            prev_visible_available: HashSet::new(),
+            departing_tiles: HashMap::new(),
         }
     }
 
@@ -133,6 +146,31 @@ impl WebApp {
 
         // ── 4. Build render data with crossfade ──
         let available: HashSet<TileCoord> = self.tile_textures.keys().copied().collect();
+        let visible_set: HashSet<TileCoord> = visible.iter().copied().collect();
+
+        // 4a. Register fade for tiles that just became visible+available
+        //     (handles cached tiles re-entering view and zoom-out transitions).
+        let visible_available: HashSet<TileCoord> = visible.iter()
+            .filter(|c| available.contains(c))
+            .copied()
+            .collect();
+        for &coord in &visible_available {
+            if !self.prev_visible_available.contains(&coord) {
+                if self.anim.tile_fade_elapsed(&coord, now_secs).is_none() {
+                    self.anim.register_tile_loaded(coord, now_secs);
+                }
+            }
+        }
+
+        // 4b. Track departing tiles (were visible+available, now gone) for
+        //     zoom-out fade-out overlay.
+        for &coord in &self.prev_visible_available {
+            if !visible_set.contains(&coord) {
+                self.departing_tiles.entry(coord).or_insert(now_secs);
+            }
+        }
+        self.departing_tiles.retain(|_, start| now_secs - *start < FADE_DURATION);
+        self.prev_visible_available = visible_available;
 
         let texture_views: HashMap<TileCoord, &wgpu::TextureView> = self
             .tile_textures
@@ -162,7 +200,7 @@ impl WebApp {
             tile_opacity_overrides,
         };
 
-        // Build crossfade overlay layer (if any tiles are transitioning)
+        // Build crossfade overlay layer (zoom-in: child fading in over parent)
         let mut layers: Vec<RenderLayerData> = vec![base_layer];
         if !crossfade_tiles.is_empty() {
             let (overlay_tiles, overlay_opacity) =
@@ -171,9 +209,38 @@ impl WebApp {
                 name: "crossfade-overlay",
                 opacity: 1.0,
                 tiles: overlay_tiles,
-                texture_views,
+                texture_views: texture_views.clone(),
                 tile_opacity_overrides: overlay_opacity,
             });
+        }
+
+        // Build departing tiles overlay (zoom-out: old tiles fading out)
+        if !self.departing_tiles.is_empty() {
+            let mut overlay_tiles = Vec::new();
+            let mut overlay_opacity = HashMap::new();
+            for (&coord, &start) in &self.departing_tiles {
+                if texture_views.contains_key(&coord) {
+                    let elapsed = now_secs - start;
+                    let fade_out = (1.0 - elapsed / FADE_DURATION).max(0.0) as f32;
+                    if fade_out > 0.01 {
+                        overlay_tiles.push(RenderableTile {
+                            coord,
+                            texture_coord: coord,
+                            uv_rect: [0.0, 0.0, 1.0, 1.0],
+                        });
+                        overlay_opacity.insert(coord, fade_out);
+                    }
+                }
+            }
+            if !overlay_tiles.is_empty() {
+                layers.push(RenderLayerData {
+                    name: "zoom-out-overlay",
+                    opacity: 1.0,
+                    tiles: overlay_tiles,
+                    texture_views: texture_views.clone(),
+                    tile_opacity_overrides: overlay_opacity,
+                });
+            }
         }
 
         // ── 5. Render ──
@@ -222,6 +289,11 @@ impl WebApp {
     }
 
     fn upload_completed_tiles(&mut self, now_secs: f64) {
+        // Drain failed fetch notifications so their pending slots are freed.
+        for coord in self.failed_queue.borrow_mut().drain(..) {
+            self.pending_coords.remove(&coord);
+        }
+
         let completed: Vec<CompletedTile> = self.completed_queue.borrow_mut().drain(..).collect();
         for tile in completed {
             self.pending_coords.remove(&tile.coord);
@@ -241,6 +313,13 @@ impl WebApp {
     }
 
     fn request_missing_tiles(&mut self, visible: &[TileCoord]) {
+        let visible_set: HashSet<TileCoord> = visible.iter().copied().collect();
+
+        // Free pending slots for tiles no longer visible.  The in-flight
+        // fetches can't be cancelled, but freeing the slot lets new
+        // (now-visible) tiles start loading immediately.
+        self.pending_coords.retain(|c| visible_set.contains(c));
+
         let camera_center = x_planets_math::geo_to_mercator(&self.engine.viewport.center);
 
         // Sort by distance from camera (closest first)
@@ -262,6 +341,7 @@ impl WebApp {
         for (coord, _) in missing.into_iter().take(slots) {
             self.pending_coords.insert(coord);
             let queue = Rc::clone(&self.completed_queue);
+            let failed = Rc::clone(&self.failed_queue);
             let url = tile_url(&self.url_template, &coord);
 
             wasm_bindgen_futures::spawn_local(async move {
@@ -277,10 +357,16 @@ impl WebApp {
                                     pixels: decoded.pixels,
                                 });
                             }
-                            Err(e) => log::warn!("Decode {}: {}", coord, e),
+                            Err(e) => {
+                                log::warn!("Decode {}: {}", coord, e);
+                                failed.borrow_mut().push(coord);
+                            }
                         }
                     }
-                    Err(e) => log::warn!("Fetch {}: {}", coord, e),
+                    Err(e) => {
+                        log::warn!("Fetch {}: {}", coord, e);
+                        failed.borrow_mut().push(coord);
+                    }
                 }
             });
         }
