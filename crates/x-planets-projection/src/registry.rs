@@ -190,7 +190,7 @@ mod tests {
         );
         assert_eq!(
             registry.rendering_mode_for("Equirectangular"),
-            x_planets_math::ProjectionMode::Globe,
+            x_planets_math::ProjectionMode::Equirectangular,
         );
     }
 

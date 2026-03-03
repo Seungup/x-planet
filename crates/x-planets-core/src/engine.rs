@@ -406,11 +406,11 @@ mod tests {
             x_planets_math::ProjectionMode::Mercator,
         );
 
-        // Switch to Equirectangular → Globe rendering mode (renders on sphere).
+        // Switch to Equirectangular → Equirectangular rendering mode (flat map).
         engine.set_projection("Equirectangular");
         assert_eq!(
             engine.rendering_mode(),
-            x_planets_math::ProjectionMode::Globe,
+            x_planets_math::ProjectionMode::Equirectangular,
         );
 
         // Switch back → Mercator.
