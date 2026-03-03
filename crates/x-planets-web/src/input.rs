@@ -1,4 +1,16 @@
 //! Touch and mouse input handling for the web map.
+//!
+//! Desktop mouse features (matching native):
+//! - Left-drag: pan with inertia
+//! - Right-drag: pitch (vertical) + rotate (horizontal)
+//! - Middle-drag: rotate
+//! - Scroll wheel: smooth animated zoom toward cursor
+//! - Double-click: smooth zoom in +1 level
+//! - Keyboard: Arrow keys (pan), +/- (zoom), Q/E (rotate), Home (reset)
+//!
+//! Mobile touch:
+//! - Single finger: pan
+//! - Two fingers: pinch zoom, rotate, pitch (vertical drag)
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -8,6 +20,18 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::app::WebApp;
+
+// ═══════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════
+
+fn now_ms() -> f64 {
+    web_sys::window()
+        .unwrap()
+        .performance()
+        .unwrap()
+        .now()
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // Touch state for gesture detection
@@ -67,12 +91,38 @@ impl TouchState {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Mouse drag state
+// ═══════════════════════════════════════════════════════════════════
+
+struct MouseDragState {
+    /// Left-button drag: last position
+    left: Option<(f64, f64)>,
+    /// Left button currently pressed
+    left_pressed: bool,
+    /// Right-button drag: last position
+    right: Option<(f64, f64)>,
+    /// Middle-button drag: last X position (rotate only)
+    middle_x: Option<f64>,
+}
+
+impl MouseDragState {
+    fn new() -> Self {
+        Self {
+            left: None,
+            left_pressed: false,
+            right: None,
+            middle_x: None,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Event registration
 // ═══════════════════════════════════════════════════════════════════
 
 pub fn register_events(canvas: &web_sys::HtmlCanvasElement, app: Rc<RefCell<WebApp>>) {
     let touch_state = Rc::new(RefCell::new(TouchState::new()));
-    let mouse_state: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
+    let mouse_state = Rc::new(RefCell::new(MouseDragState::new()));
 
     // ── Mouse events ──
     register_mouse_events(canvas, Rc::clone(&app), Rc::clone(&mouse_state));
@@ -80,19 +130,24 @@ pub fn register_events(canvas: &web_sys::HtmlCanvasElement, app: Rc<RefCell<WebA
     // ── Wheel event ──
     register_wheel_event(canvas, Rc::clone(&app));
 
+    // ── Keyboard events ──
+    register_keyboard_events(Rc::clone(&app));
+
     // ── Touch events ──
     register_touch_events(canvas, Rc::clone(&app), Rc::clone(&touch_state));
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Mouse events: left-drag (pan+inertia), right-drag (pitch+rotate),
+//               middle-drag (rotate), double-click (zoom)
+// ═══════════════════════════════════════════════════════════════════
+
 fn register_mouse_events(
     canvas: &web_sys::HtmlCanvasElement,
     app: Rc<RefCell<WebApp>>,
-    mouse_state: Rc<RefCell<Option<(f64, f64)>>>,
+    mouse: Rc<RefCell<MouseDragState>>,
 ) {
-    // Right-click drag state: last position for pitch/rotate
-    let right_mouse_state: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
-
-    // Disable context menu on canvas so right-click drag works
+    // Disable context menu so right-click drag works
     {
         let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
             e.prevent_default();
@@ -105,13 +160,50 @@ fn register_mouse_events(
 
     // mousedown
     {
-        let ms = Rc::clone(&mouse_state);
-        let rms = Rc::clone(&right_mouse_state);
+        let ms = Rc::clone(&mouse);
+        let app = Rc::clone(&app);
         let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
             let pos = (e.offset_x() as f64, e.offset_y() as f64);
+            let mut ms = ms.borrow_mut();
             match e.button() {
-                0 => *ms.borrow_mut() = Some(pos),  // Left button
-                2 => *rms.borrow_mut() = Some(pos),  // Right button
+                0 => {
+                    // ── Double-click detection ──
+                    let now = now_ms();
+                    let mut app = app.borrow_mut();
+                    let is_double_click = app
+                        .last_click_time_ms
+                        .map(|t| now - t < 300.0)
+                        .unwrap_or(false)
+                        && app
+                            .last_click_pos
+                            .map(|(lx, ly)| {
+                                ((pos.0 - lx).powi(2) + (pos.1 - ly).powi(2)).sqrt() < 10.0
+                            })
+                            .unwrap_or(false);
+
+                    if is_double_click {
+                        // Double-click: smooth zoom in +1 level at cursor
+                        app.zoom_target += 1.0;
+                        app.zoom_anchor = Some(pos);
+                        app.last_click_time_ms = None; // prevent triple-click
+                    } else {
+                        app.last_click_time_ms = Some(now);
+                        app.last_click_pos = Some(pos);
+                    }
+
+                    // Stop inertia when starting a new drag
+                    app.pan_velocity = (0.0, 0.0);
+                    app.drag_samples.clear();
+
+                    ms.left = Some(pos);
+                    ms.left_pressed = true;
+                }
+                1 => {
+                    ms.middle_x = Some(pos.0);
+                }
+                2 => {
+                    ms.right = Some(pos);
+                }
                 _ => {}
             }
         });
@@ -123,35 +215,44 @@ fn register_mouse_events(
 
     // mousemove
     {
-        let ms = Rc::clone(&mouse_state);
-        let rms = Rc::clone(&right_mouse_state);
+        let ms = Rc::clone(&mouse);
         let app = Rc::clone(&app);
         let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
             let x = e.offset_x() as f64;
             let y = e.offset_y() as f64;
+            let mut ms = ms.borrow_mut();
+            let mut app = app.borrow_mut();
+
+            // Track mouse position for zoom anchor fallback
+            app.last_mouse_pos = Some((x, y));
 
             // Left-drag: pan
-            {
-                let mut ms = ms.borrow_mut();
-                if let Some((lx, ly)) = *ms {
+            if ms.left_pressed {
+                if let Some((lx, ly)) = ms.left {
                     let dx = x - lx;
                     let dy = y - ly;
-                    app.borrow_mut().engine.pan(dx, -dy);
-                    *ms = Some((x, y));
+                    app.engine.pan(dx, -dy);
                 }
+                // Record sample for inertia velocity estimation
+                let now = now_ms();
+                app.record_drag((x, y), now);
+                ms.left = Some((x, y));
             }
 
             // Right-drag: pitch (vertical) + rotate (horizontal)
-            {
-                let mut rms = rms.borrow_mut();
-                if let Some((lx, ly)) = *rms {
-                    let dx = x - lx;
-                    let dy = y - ly;
-                    let mut app = app.borrow_mut();
-                    app.engine.pitch(-dy * 0.3);   // drag up = more tilt
-                    app.engine.rotate(dx * 0.3);   // drag right = clockwise
-                    *rms = Some((x, y));
-                }
+            if let Some((lx, ly)) = ms.right {
+                let dx = x - lx;
+                let dy = y - ly;
+                app.engine.pitch(-dy * 0.3); // drag up = more tilt
+                app.engine.rotate(dx * 0.3); // drag right = clockwise
+                ms.right = Some((x, y));
+            }
+
+            // Middle-drag: rotate
+            if let Some(last_x) = ms.middle_x {
+                let dx = x - last_x;
+                app.engine.rotate(dx * 0.3);
+                ms.middle_x = Some(x);
             }
         });
         canvas
@@ -162,12 +263,24 @@ fn register_mouse_events(
 
     // mouseup
     {
-        let ms = Rc::clone(&mouse_state);
-        let rms = Rc::clone(&right_mouse_state);
+        let ms = Rc::clone(&mouse);
+        let app = Rc::clone(&app);
         let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
+            let mut ms = ms.borrow_mut();
             match e.button() {
-                0 => *ms.borrow_mut() = None,
-                2 => *rms.borrow_mut() = None,
+                0 => {
+                    ms.left = None;
+                    ms.left_pressed = false;
+                    // Compute release velocity for inertia
+                    let now = now_ms();
+                    app.borrow_mut().compute_release_velocity(now);
+                }
+                1 => {
+                    ms.middle_x = None;
+                }
+                2 => {
+                    ms.right = None;
+                }
                 _ => {}
             }
         });
@@ -178,19 +291,88 @@ fn register_mouse_events(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Wheel: smooth animated zoom toward cursor
+// ═══════════════════════════════════════════════════════════════════
+
 fn register_wheel_event(canvas: &web_sys::HtmlCanvasElement, app: Rc<RefCell<WebApp>>) {
     let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::WheelEvent| {
         e.prevent_default();
         let delta = -e.delta_y() / 300.0;
         let x = e.offset_x() as f64;
         let y = e.offset_y() as f64;
-        app.borrow_mut().engine.zoom_at(delta, x, y);
+        let mut app = app.borrow_mut();
+        // Accumulate into zoom target for smooth animation
+        app.zoom_target += delta;
+        // Set anchor to cursor position for zoom-toward-pointer
+        app.zoom_anchor = Some((x, y));
     });
     canvas
         .add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref())
         .unwrap();
     cb.forget();
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Keyboard: Arrow keys (pan), +/- (zoom), Q/E (rotate), Home (reset)
+// ═══════════════════════════════════════════════════════════════════
+
+fn register_keyboard_events(app: Rc<RefCell<WebApp>>) {
+    let window = web_sys::window().unwrap();
+    let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::KeyboardEvent| {
+        let key = e.code();
+        let mut app = app.borrow_mut();
+        let pan_amount = 50.0;
+
+        match key.as_str() {
+            "ArrowLeft" => {
+                app.engine.pan(-pan_amount, 0.0);
+            }
+            "ArrowRight" => {
+                app.engine.pan(pan_amount, 0.0);
+            }
+            "ArrowUp" => {
+                app.engine.pan(0.0, -pan_amount);
+            }
+            "ArrowDown" => {
+                app.engine.pan(0.0, pan_amount);
+            }
+            "Equal" | "NumpadAdd" => {
+                app.zoom_target += 0.5;
+                app.zoom_anchor = None;
+            }
+            "Minus" | "NumpadSubtract" => {
+                app.zoom_target -= 0.5;
+                app.zoom_anchor = None;
+            }
+            "KeyQ" => {
+                app.engine.rotate(-10.0);
+            }
+            "KeyE" => {
+                app.engine.rotate(10.0);
+            }
+            "Home" => {
+                app.engine.viewport.center = x_planets_math::GeoCoord::new(0.0, 0.0);
+                app.engine.viewport.zoom = 2.0;
+                app.engine.viewport.pitch = 0.0;
+                app.engine.viewport.bearing = 0.0;
+                app.zoom_target = 2.0;
+                app.pan_velocity = (0.0, 0.0);
+                app.engine.request_redraw();
+            }
+            _ => return, // Don't prevent default for unhandled keys
+        }
+        e.prevent_default();
+    });
+    window
+        .add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref())
+        .unwrap();
+    cb.forget();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Touch events
+// ═══════════════════════════════════════════════════════════════════
 
 fn register_touch_events(
     canvas: &web_sys::HtmlCanvasElement,
@@ -279,8 +461,6 @@ fn register_touch_events(
                 }
 
                 // Rotate from angle change
-                // Negate: screen-clockwise finger rotation → positive atan2 delta,
-                // but we want map to rotate clockwise (bearing decrease visually).
                 if let (Some(prev_a), Some(new_a)) = (ts.prev_pinch_angle, new_angle) {
                     let mut delta_angle = new_a - prev_a;
                     // Normalize to [-180, 180]
@@ -296,7 +476,6 @@ fn register_touch_events(
                 }
 
                 // Pitch from two-finger vertical drag
-                // Drag up (negative dy in screen coords) → increase pitch (tilt more)
                 if let (Some((_, prev_my)), Some((_, new_my))) =
                     (ts.prev_midpoint, midpoint)
                 {
