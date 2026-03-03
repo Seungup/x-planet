@@ -559,8 +559,18 @@ impl TileRenderer {
 
             if is_globe {
                 // ── Globe path: tessellated sphere mesh ──
+                // Filter to tiles with available textures BEFORE building
+                // the mesh so that mesh indices and bind groups stay aligned.
+                let renderable_tiles: Vec<&RenderableTile> = layer
+                    .tiles
+                    .iter()
+                    .filter(|rt| layer.texture_views.contains_key(&rt.texture_coord))
+                    .collect();
+
+                let renderable_refs: Vec<RenderableTile> =
+                    renderable_tiles.iter().map(|rt| (*rt).clone()).collect();
                 let (globe_verts, globe_idxs, tile_idx_counts) =
-                    build_globe_tile_mesh(&layer.tiles);
+                    build_globe_tile_mesh(&renderable_refs);
 
                 if globe_verts.is_empty() {
                     continue;
@@ -575,18 +585,16 @@ impl TileRenderer {
                     &globe_idxs,
                 );
 
-                let prepared: Vec<PreparedTile> = layer
-                    .tiles
+                let prepared: Vec<PreparedTile> = renderable_tiles
                     .iter()
-                    .filter_map(|rt| {
-                        layer.texture_views.get(&rt.texture_coord).map(|tex_view| {
-                            let tile_opacity = layer
-                                .tile_opacity_overrides
-                                .get(&rt.coord)
-                                .copied()
-                                .unwrap_or(layer.opacity);
-                            self.prepare_tile_globe(gpu, rt, tex_view, tile_opacity, &vp_f64)
-                        })
+                    .map(|rt| {
+                        let tex_view = layer.texture_views.get(&rt.texture_coord).unwrap();
+                        let tile_opacity = layer
+                            .tile_opacity_overrides
+                            .get(&rt.coord)
+                            .copied()
+                            .unwrap_or(layer.opacity);
+                        self.prepare_tile_globe(gpu, rt, tex_view, tile_opacity, &vp_f64)
                     })
                     .collect();
 
@@ -673,8 +681,38 @@ impl TileRenderer {
                 let center_lat_rad = viewport.center.lat.to_radians();
                 let center_lon_rad = viewport.center.lon.to_radians();
 
+                // Filter to tiles with available textures AND within the
+                // valid oblique Mercator range BEFORE building the mesh so
+                // that mesh indices and bind groups stay aligned.
+                // The oblique Mercator has a singularity at ~90° from the
+                // center; skip tiles whose angular distance exceeds 80° to
+                // prevent extreme distortion (the V-shape artifact).
+                let center_sphere = x_planets_math::geo_to_unit_sphere(center_lat_rad, center_lon_rad);
+                let cos_threshold = 80.0_f64.to_radians().cos(); // ~0.17
+
+                let renderable_tiles: Vec<&RenderableTile> = layer
+                    .tiles
+                    .iter()
+                    .filter(|rt| {
+                        if !layer.texture_views.contains_key(&rt.texture_coord) {
+                            return false;
+                        }
+                        // Angular distance check: compute tile center on unit sphere
+                        let n = rt.coord.extent() as f64;
+                        let mx = (rt.display_x as f64 + 0.5) / n;
+                        let my = (rt.coord.y as f64 + 0.5) / n;
+                        let lon_rad = (mx * 2.0 - 1.0) * std::f64::consts::PI;
+                        let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+                        let tile_sphere = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
+                        let cos_angle = center_sphere.dot(tile_sphere);
+                        cos_angle > cos_threshold
+                    })
+                    .collect();
+
+                let renderable_refs: Vec<RenderableTile> =
+                    renderable_tiles.iter().map(|rt| (*rt).clone()).collect();
                 let (centered_verts, centered_idxs, tile_idx_counts) =
-                    build_centered_tile_mesh(&layer.tiles, center_lat_rad, center_lon_rad);
+                    build_centered_tile_mesh(&renderable_refs, center_lat_rad, center_lon_rad);
 
                 if centered_verts.is_empty() {
                     continue;
@@ -689,26 +727,24 @@ impl TileRenderer {
                     &centered_idxs,
                 );
 
-                let prepared: Vec<PreparedTile> = layer
-                    .tiles
+                let prepared: Vec<PreparedTile> = renderable_tiles
                     .iter()
-                    .filter_map(|rt| {
-                        layer.texture_views.get(&rt.texture_coord).map(|tex_view| {
-                            let tile_opacity = layer
-                                .tile_opacity_overrides
-                                .get(&rt.coord)
-                                .copied()
-                                .unwrap_or(layer.opacity);
-                            self.prepare_tile_centered(
-                                gpu,
-                                rt,
-                                tex_view,
-                                tile_opacity,
-                                &vp_f64,
-                                center_lat_rad,
-                                center_lon_rad,
-                            )
-                        })
+                    .map(|rt| {
+                        let tex_view = layer.texture_views.get(&rt.texture_coord).unwrap();
+                        let tile_opacity = layer
+                            .tile_opacity_overrides
+                            .get(&rt.coord)
+                            .copied()
+                            .unwrap_or(layer.opacity);
+                        self.prepare_tile_centered(
+                            gpu,
+                            rt,
+                            tex_view,
+                            tile_opacity,
+                            &vp_f64,
+                            center_lat_rad,
+                            center_lon_rad,
+                        )
                     })
                     .collect();
 
