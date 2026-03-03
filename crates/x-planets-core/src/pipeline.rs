@@ -7,7 +7,7 @@
 //! knows nothing about the engine or GPU.
 
 use std::collections::HashSet;
-use x_planets_math::{GeoCoord, TileCoord, TileUniforms, ViewportUniforms};
+use x_planets_math::{GeoCoord, TileCoord, TileUniforms, ViewportUniforms, VisibleTile};
 
 use crate::render::{tile_quad_vertices, TileVertex, TILE_QUAD_INDICES};
 use crate::viewport::Viewport;
@@ -22,7 +22,7 @@ use crate::viewport::Viewport;
 /// For LOD-based multi-level tile selection, use [`Viewport::visible_tiles()`] instead.
 ///
 /// Pure function. No state, no side effects.
-pub fn visible_tiles(viewport: &Viewport) -> Vec<TileCoord> {
+pub fn visible_tiles(viewport: &Viewport) -> Vec<VisibleTile> {
     viewport.frustum().visible_tiles(viewport.tile_zoom())
 }
 
@@ -150,6 +150,40 @@ pub fn tile_uniforms_with_uv(
     }
 }
 
+/// Compute per-tile uniforms using `display_x` for antimeridian wrapping.
+///
+/// Like `tile_uniforms_with_uv`, but uses the unwrapped `display_x` for tile
+/// center positioning so tiles crossing the antimeridian render correctly.
+///
+/// Pure function.
+pub fn tile_uniforms_for_visible(
+    rt: &RenderableTile,
+    opacity: f32,
+    vp_f64: &glam::DMat4,
+) -> TileUniforms {
+    let n_f64 = rt.coord.extent() as f64;
+    let n = n_f64 as f32;
+    let min_x = rt.display_x as f32 / n;
+    let min_y = rt.coord.y as f32 / n;
+    let max_x = (rt.display_x + 1) as f32 / n;
+    let max_y = (rt.coord.y + 1) as f32 / n;
+
+    // Tile center in f64 using display_x — can be outside [0, 1] for wrapping.
+    let cx = (rt.display_x as f64 + 0.5) / n_f64;
+    let cy = (rt.coord.y as f64 + 0.5) / n_f64;
+
+    let model = glam::DMat4::from_translation(glam::DVec3::new(cx, cy, 0.0));
+    let mvp_f64 = *vp_f64 * model;
+    let mvp_f32 = mvp_f64.as_mat4();
+
+    TileUniforms {
+        mvp: mvp_f32.to_cols_array(),
+        bounds: [min_x, min_y, max_x, max_y],
+        meta: [rt.coord.z as f32, opacity, 0.0, 0.0],
+        uv_rect: rt.uv_rect,
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────
 // Fallback texture resolution
 // ───────────────────────────────────────────────────────────────────
@@ -157,13 +191,16 @@ pub fn tile_uniforms_with_uv(
 /// A tile ready for rendering, with resolved texture source.
 #[derive(Debug, Clone)]
 pub struct RenderableTile {
-    /// The tile position to render (geometry).
+    /// The tile position to render (geometry) — canonical coord.
     pub coord: TileCoord,
     /// The tile whose texture to use (may be an ancestor).
     pub texture_coord: TileCoord,
     /// UV sub-rectangle within texture_coord's texture.
     /// `[0, 0, 1, 1]` = full texture (own texture available).
     pub uv_rect: [f32; 4],
+    /// Unwrapped X for rendering position (antimeridian support).
+    /// Can be negative or >= 2^z.
+    pub display_x: i64,
 }
 
 /// Compute the UV sub-rectangle of `ancestor`'s texture that corresponds
@@ -205,23 +242,25 @@ pub fn fallback_uv_rect(tile: &TileCoord, ancestor: &TileCoord) -> [f32; 4] {
 ///
 /// For each visible tile, finds the best available texture (own or
 /// nearest ancestor).  Returns `None` for tiles with no texture at all.
+/// Preserves `display_x` from the input `VisibleTile` for antimeridian wrapping.
 ///
 /// Pure function.
 pub fn resolve_fallbacks(
-    visible: &[TileCoord],
+    visible: &[VisibleTile],
     available_textures: &HashSet<TileCoord>,
 ) -> Vec<RenderableTile> {
     visible
         .iter()
-        .filter_map(|tile| {
-            let mut cur = *tile;
+        .filter_map(|vt| {
+            let mut cur = vt.coord;
             loop {
                 if available_textures.contains(&cur) {
-                    let uv = fallback_uv_rect(tile, &cur);
+                    let uv = fallback_uv_rect(&vt.coord, &cur);
                     return Some(RenderableTile {
-                        coord: *tile,
+                        coord: vt.coord,
                         texture_coord: cur,
                         uv_rect: uv,
+                        display_x: vt.display_x,
                     });
                 }
                 match cur.parent() {
@@ -1238,7 +1277,7 @@ mod tests {
         let tiles = visible_tiles(&vp);
         // zoom 0 → 1x1 grid → should include tile (0,0,0)
         assert!(
-            tiles.contains(&TileCoord::new(0, 0, 0)),
+            tiles.iter().any(|vt| vt.coord == TileCoord::new(0, 0, 0)),
             "zoom 0 must include the single world tile, got: {:?}",
             tiles
         );
@@ -1586,12 +1625,12 @@ mod tests {
     #[test]
     fn test_resolve_fallbacks_complete_coverage() {
         // All visible tiles with their own texture should get uv_rect = [0,0,1,1].
-        let visible = vec![
-            TileCoord::new(2, 0, 0),
-            TileCoord::new(2, 1, 0),
-            TileCoord::new(2, 0, 1),
+        let visible: Vec<VisibleTile> = vec![
+            VisibleTile::canonical(TileCoord::new(2, 0, 0)),
+            VisibleTile::canonical(TileCoord::new(2, 1, 0)),
+            VisibleTile::canonical(TileCoord::new(2, 0, 1)),
         ];
-        let available: HashSet<TileCoord> = visible.iter().copied().collect();
+        let available: HashSet<TileCoord> = visible.iter().map(|vt| vt.coord).collect();
         let result = resolve_fallbacks(&visible, &available);
 
         assert_eq!(result.len(), 3);
@@ -1608,7 +1647,7 @@ mod tests {
         let child = TileCoord::new(3, 2, 3);
         let parent = child.parent().unwrap();
 
-        let visible = vec![child];
+        let visible = vec![VisibleTile::canonical(child)];
         let mut available = HashSet::new();
         available.insert(parent);
 
@@ -1627,7 +1666,7 @@ mod tests {
     #[test]
     fn test_resolve_fallbacks_missing_all_returns_empty() {
         // If no textures are available at all, result should be empty.
-        let visible = vec![TileCoord::new(5, 10, 10)];
+        let visible = vec![VisibleTile::canonical(TileCoord::new(5, 10, 10))];
         let available = HashSet::new();
         let result = resolve_fallbacks(&visible, &available);
         assert!(result.is_empty());

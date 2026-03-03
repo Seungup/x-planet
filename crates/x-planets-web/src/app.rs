@@ -16,7 +16,7 @@ use x_planets_core::pipeline::{resolve_fallbacks, RenderableTile};
 use x_planets_core::render::RenderLayerData;
 use x_planets_core::TileRenderer;
 use x_planets_gpu::{GpuContext, GpuTexture, TextureManager};
-use x_planets_math::TileCoord;
+use x_planets_math::{TileCoord, VisibleTile};
 use x_planets_tiles::{RasterTileDecoder, TileCache, TileDecoder};
 use wasm_bindgen_futures::JsFuture;
 
@@ -146,13 +146,14 @@ impl WebApp {
 
         // ── 4. Build render data with crossfade ──
         let available: HashSet<TileCoord> = self.tile_textures.keys().copied().collect();
-        let visible_set: HashSet<TileCoord> = visible.iter().copied().collect();
+        // Use canonical coords for set operations
+        let visible_set: HashSet<TileCoord> = visible.iter().map(|vt| vt.coord).collect();
 
         // 4a. Register fade for tiles that just became visible+available
         //     (handles cached tiles re-entering view and zoom-out transitions).
         let visible_available: HashSet<TileCoord> = visible.iter()
-            .filter(|c| available.contains(c))
-            .copied()
+            .filter(|vt| available.contains(&vt.coord))
+            .map(|vt| vt.coord)
             .collect();
         for &coord in &visible_available {
             if !self.prev_visible_available.contains(&coord) {
@@ -227,6 +228,7 @@ impl WebApp {
                             coord,
                             texture_coord: coord,
                             uv_rect: [0.0, 0.0, 1.0, 1.0],
+                            display_x: coord.x as i64,
                         });
                         overlay_opacity.insert(coord, fade_out);
                     }
@@ -265,9 +267,9 @@ impl WebApp {
 
         frame.present();
 
-        // ── 6. LRU bump visible tiles ──
-        for coord in &visible {
-            let _ = self.tile_textures.get(coord);
+        // ── 6. LRU bump visible tiles (use canonical coords) ──
+        for vt in &visible {
+            let _ = self.tile_textures.get(&vt.coord);
         }
     }
 
@@ -312,8 +314,9 @@ impl WebApp {
         }
     }
 
-    fn request_missing_tiles(&mut self, visible: &[TileCoord]) {
-        let visible_set: HashSet<TileCoord> = visible.iter().copied().collect();
+    fn request_missing_tiles(&mut self, visible: &[VisibleTile]) {
+        // Use canonical coords for cache/pending lookups
+        let visible_set: HashSet<TileCoord> = visible.iter().map(|vt| vt.coord).collect();
 
         // Free pending slots for tiles no longer visible.  The in-flight
         // fetches can't be cancelled, but freeing the slot lets new
@@ -322,16 +325,20 @@ impl WebApp {
 
         let camera_center = x_planets_math::geo_to_mercator(&self.engine.viewport.center);
 
-        // Sort by distance from camera (closest first)
+        // Deduplicate by canonical coord (same tile may appear in multiple
+        // wrapped positions) and sort by display distance (closest first).
+        let mut seen = HashSet::new();
         let mut missing: Vec<(TileCoord, f64)> = visible
             .iter()
-            .filter(|c| {
-                !self.tile_textures.contains(c) && !self.pending_coords.contains(c)
+            .filter(|vt| {
+                !self.tile_textures.contains(&vt.coord)
+                    && !self.pending_coords.contains(&vt.coord)
+                    && seen.insert(vt.coord)
             })
-            .map(|c| {
-                let center = c.mercator_center();
+            .map(|vt| {
+                let center = vt.display_mercator_center();
                 let dist = (center - camera_center).length();
-                (*c, dist)
+                (vt.coord, dist)
             })
             .collect();
         missing.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));

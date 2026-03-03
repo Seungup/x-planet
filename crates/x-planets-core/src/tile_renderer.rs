@@ -16,7 +16,7 @@
 use x_planets_gpu::GpuContext;
 use x_planets_math::{TileCoord, ViewportUniforms};
 
-use crate::pipeline::{build_tile_mesh, tile_uniforms_with_uv, RenderableTile};
+use crate::pipeline::{build_tile_mesh, tile_uniforms_for_visible, RenderableTile};
 use crate::render::{RenderLayerData, TileVertex};
 use crate::viewport::Viewport;
 use std::collections::HashMap;
@@ -255,16 +255,17 @@ impl TileRenderer {
     }
 
     /// Prepare a tile for rendering: create uniform buffer + bind group.
+    ///
+    /// Uses display_x from the `RenderableTile` for antimeridian wrapping.
     fn prepare_tile(
         &self,
         gpu: &GpuContext,
-        coord: &TileCoord,
+        rt: &RenderableTile,
         texture_view: &wgpu::TextureView,
         opacity: f32,
-        uv_rect: [f32; 4],
         vp_f64: &glam::DMat4,
     ) -> PreparedTile {
-        let uniforms = tile_uniforms_with_uv(coord, opacity, uv_rect, vp_f64);
+        let uniforms = tile_uniforms_for_visible(rt, opacity, vp_f64);
         let buffer = gpu.create_uniform_buffer("tile-uniforms", &uniforms);
 
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -435,7 +436,7 @@ impl TileRenderer {
                             .get(&rt.coord)
                             .copied()
                             .unwrap_or(layer.opacity);
-                        self.prepare_tile(gpu, &rt.coord, tex_view, tile_opacity, rt.uv_rect, &vp_f64)
+                        self.prepare_tile(gpu, rt, tex_view, tile_opacity, &vp_f64)
                     })
                 })
                 .collect();

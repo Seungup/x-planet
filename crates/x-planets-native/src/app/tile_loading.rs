@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use glam::DVec2;
 use x_planets_core::engine::LayerKind;
-use x_planets_math::TileCoord;
+use x_planets_math::{TileCoord, VisibleTile};
 use x_planets_tiles::{
     RasterTileDecoder, TerrainEncoding, TerrainRgbDecoder, TerrariumDecoder, TileDecoder,
     TileRequest, TileSource,
@@ -20,7 +20,7 @@ use super::NativeApp;
 impl NativeApp {
     pub(super) fn run_tile_loading(
         &mut self,
-        visible: &[TileCoord],
+        visible: &[VisibleTile],
         visible_set: &HashSet<TileCoord>,
         camera_center: DVec2,
         now: Instant,
@@ -42,7 +42,8 @@ impl NativeApp {
             // For over-zoomed tiles (z > max_zoom), the max_zoom ancestor
             // is the deepest tile we can fetch, so include it in the needed set.
             let mut needed_coords: HashSet<TileCoord> = visible_set.clone();
-            for &coord in visible {
+            for vt in visible {
+                let coord = vt.coord;
                 // If tile exceeds max_zoom, start the ancestor chain
                 // from the corresponding tile AT max_zoom.
                 let start = if coord.z > ls.max_zoom {
@@ -91,7 +92,8 @@ impl NativeApp {
             {
                 let mut budget = ls.tile_loader.max_concurrent();
                 let mut ancestor_enqueued: HashSet<TileCoord> = HashSet::new();
-                for &coord in visible {
+                for vt in visible {
+                    let coord = vt.coord;
                     if budget == 0 { break; }
                     // Already have a cached texture? No ancestor needed.
                     if ls.tile_textures.contains(&coord) { continue; }
@@ -147,7 +149,8 @@ impl NativeApp {
             // it.  Multiple over-zoomed children may map to the SAME max_zoom
             // tile, so we deduplicate.
             let mut overzoom_enqueued: HashSet<TileCoord> = HashSet::new();
-            for &coord in visible {
+            for vt in visible {
+                let coord = vt.coord;
                 if coord.z < ls.min_zoom {
                     continue;
                 }

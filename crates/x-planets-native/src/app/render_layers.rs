@@ -13,7 +13,7 @@ use x_planets_core::interaction::{
 };
 use x_planets_core::render::RenderLayerData;
 use x_planets_core::{MapEngine, TerrainLayerData, TerrainTileData};
-use x_planets_math::TileCoord;
+use x_planets_math::{TileCoord, VisibleTile};
 
 use crate::animation::AnimationState;
 use crate::tile_source::NativeLayerState;
@@ -25,7 +25,7 @@ pub(super) fn build_all_layers<'a>(
     engine: &'a MapEngine,
     layer_states: &'a [NativeLayerState],
     anim: &AnimationState,
-    visible: &[TileCoord],
+    visible: &[VisibleTile],
     now: Instant,
 ) -> (
     Vec<RenderLayerData<'a>>,
@@ -94,7 +94,7 @@ fn build_raster_layer<'a>(
     layer: &'a x_planets_core::engine::TileLayer,
     ls: &'a NativeLayerState,
     anim: &AnimationState,
-    visible: &[TileCoord],
+    visible: &[VisibleTile],
     now: Instant,
 ) -> (RenderLayerData<'a>, Option<RenderLayerData<'a>>) {
     let available: HashSet<TileCoord> = ls.tile_textures.keys().copied().collect();
@@ -153,7 +153,7 @@ fn build_terrain_layer<'a>(
     terrain_ls: &'a NativeLayerState,
     imagery_ls: &'a NativeLayerState,
     anim: &AnimationState,
-    visible: &[TileCoord],
+    visible: &[VisibleTile],
     now: Instant,
 ) -> (TerrainLayerData<'a>, Option<TerrainLayerData<'a>>) {
     let available: HashSet<TileCoord> = imagery_ls.tile_textures.keys().copied().collect();
@@ -179,7 +179,7 @@ fn build_terrain_layer<'a>(
     let all_needed: HashSet<TileCoord> = renderable
         .iter()
         .map(|rt| rt.coord)
-        .chain(crossfade_tiles.iter().map(|&(c, _)| c))
+        .chain(crossfade_tiles.iter().map(|&(c, _, _)| c))
         .collect();
     for &coord in &all_needed {
         let mut c = Some(coord);
@@ -207,7 +207,7 @@ fn build_terrain_layer<'a>(
         let overlay_elev: HashMap<TileCoord, (&TerrainTileData, TileCoord)> =
             crossfade_tiles
                 .iter()
-                .filter_map(|&(coord, _)| {
+                .filter_map(|&(coord, _, _)| {
                     elevation_data.get(&coord).map(|&v| (coord, v))
                 })
                 .collect();

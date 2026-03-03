@@ -298,7 +298,7 @@ impl NativeApp {
         let visible = self.engine.as_ref().unwrap().viewport.visible_tiles();
         let camera_center =
             x_planets_math::geo_to_mercator(&self.engine.as_ref().unwrap().viewport.center);
-        let visible_set: HashSet<TileCoord> = visible.iter().copied().collect();
+        let visible_set: HashSet<TileCoord> = visible.iter().map(|vt| vt.coord).collect();
 
         self.run_tile_loading(&visible, &visible_set, camera_center, now);
         self.poll_tile_results(now);
@@ -308,7 +308,8 @@ impl NativeApp {
         // parent tiles from being evicted while still needed as fallback
         // coverage for unloaded children.
         for ls in &mut self.layer_states {
-            for &coord in &visible {
+            for vt in &visible {
+                let coord = vt.coord;
                 let _ = ls.tile_textures.get(&coord);
                 let _ = ls.terrain_data.get(&coord);
                 // Also bump ancestor tiles that might serve as fallbacks
@@ -403,7 +404,7 @@ impl NativeApp {
         // ── 9. Continue rendering if animations or loading are in progress ──
         let any_pending = self.layer_states.iter().any(|ls| {
             !ls.pending_coords.is_empty()
-                || visible.iter().any(|c| !ls.tile_textures.contains(c))
+                || visible.iter().any(|vt| !ls.tile_textures.contains(&vt.coord))
         });
         let any_tiles3d_pending = self.tiles3d_states.iter().any(|ts| {
             !ts.pending_uris.is_empty() || !ts.is_initialized()
