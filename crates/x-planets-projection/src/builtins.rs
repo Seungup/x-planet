@@ -92,7 +92,7 @@ impl ProjectionPlugin for Equirectangular {
     }
 
     fn rendering_mode(&self) -> x_planets_math::ProjectionMode {
-        x_planets_math::ProjectionMode::Equirectangular
+        x_planets_math::ProjectionMode::Globe
     }
 
     fn shader_source(&self) -> &str {
@@ -189,7 +189,7 @@ mod tests {
         let proj = Equirectangular;
         assert_eq!(
             proj.rendering_mode(),
-            x_planets_math::ProjectionMode::Equirectangular,
+            x_planets_math::ProjectionMode::Globe,
         );
     }
 
