@@ -265,6 +265,16 @@ impl MapEngine {
         self.projection_registry.get(&self.active_projection)
     }
 
+    /// Get the rendering mode for the currently active projection.
+    ///
+    /// Delegates to the `ProjectionPlugin::rendering_mode()` declared by
+    /// the active projection.  Falls back to `Mercator` if the projection
+    /// is not found in the registry.
+    pub fn rendering_mode(&self) -> x_planets_math::ProjectionMode {
+        self.projection_registry
+            .rendering_mode_for(&self.active_projection)
+    }
+
     /// Whether a redraw is needed.
     pub fn needs_redraw(&self) -> bool {
         self.needs_redraw
@@ -384,6 +394,31 @@ mod tests {
         let mut engine = MapEngine::new(MapConfig::default(), 800, 600);
         assert!(engine.set_projection("Equirectangular"));
         assert!(!engine.set_projection("NonExistent"));
+    }
+
+    #[test]
+    fn test_engine_rendering_mode() {
+        let mut engine = MapEngine::new(MapConfig::default(), 800, 600);
+
+        // Default is "Web Mercator" → Mercator rendering mode.
+        assert_eq!(
+            engine.rendering_mode(),
+            x_planets_math::ProjectionMode::Mercator,
+        );
+
+        // Switch to Equirectangular → Globe rendering mode.
+        engine.set_projection("Equirectangular");
+        assert_eq!(
+            engine.rendering_mode(),
+            x_planets_math::ProjectionMode::Globe,
+        );
+
+        // Switch back → Mercator.
+        engine.set_projection("Web Mercator");
+        assert_eq!(
+            engine.rendering_mode(),
+            x_planets_math::ProjectionMode::Mercator,
+        );
     }
 
     #[test]

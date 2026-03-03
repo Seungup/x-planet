@@ -14,6 +14,7 @@ use glam::DVec3;
 /// - A WGSL shader function that transforms world coordinates to projected coordinates
 /// - A CPU fallback for testing and tile coordinate calculations
 /// - Uniform data that gets passed to the shader
+/// - A rendering mode that determines tile mesh construction, camera, and interaction
 pub trait ProjectionPlugin: Send + Sync {
     /// Human-readable name of the projection.
     fn name(&self) -> &str;
@@ -21,6 +22,19 @@ pub trait ProjectionPlugin: Send + Sync {
     /// EPSG code if applicable (e.g., "EPSG:3857" for Web Mercator).
     fn epsg_code(&self) -> Option<&str> {
         None
+    }
+
+    /// Rendering mode for tile positioning, camera control, and visible tile selection.
+    ///
+    /// This determines:
+    /// - How tiles are positioned and rendered (flat quad vs sphere tessellation)
+    /// - How the camera VP matrix is constructed (perspective in projection space vs orbital)
+    /// - How visible tiles are selected (Mercator frustum vs spherical cap)
+    /// - How user interaction (pan, zoom) is interpreted
+    ///
+    /// Defaults to `Mercator` (flat tile rendering with centered Mercator VP).
+    fn rendering_mode(&self) -> x_planets_math::ProjectionMode {
+        x_planets_math::ProjectionMode::Mercator
     }
 
     /// WGSL shader source snippet.
