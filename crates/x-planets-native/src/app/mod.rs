@@ -308,7 +308,8 @@ impl NativeApp {
         };
 
         // ── 4. Per-layer async tile loading pipeline ──
-        let visible = self.engine.as_ref().unwrap().viewport.visible_tiles();
+        let proj_mode_for_tiles = self.resolve_projection_mode();
+        let visible = self.engine.as_ref().unwrap().viewport.visible_tiles_for_mode(proj_mode_for_tiles);
         let camera_center =
             x_planets_math::geo_to_mercator(&self.engine.as_ref().unwrap().viewport.center);
         let visible_set: HashSet<TileCoord> = visible.iter().map(|vt| vt.coord).collect();

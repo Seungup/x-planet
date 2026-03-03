@@ -270,15 +270,24 @@ where
         }
         if let Some(elapsed) = tile_fade_elapsed_fn(&coord) {
             if elapsed < FADE_DURATION {
+                // Search for an available parent at most 4 levels up.
+                // Unbounded search can cause issues at high zoom with many
+                // cached ancestor tiles, and at polar regions where tiles
+                // change rapidly.
                 let has_parent = {
                     let mut c = coord.parent();
                     let mut found = false;
+                    let mut depth = 0u8;
                     while let Some(p) = c {
+                        if depth >= 4 {
+                            break;
+                        }
                         if available.contains(&p) {
                             found = true;
                             break;
                         }
                         c = p.parent();
+                        depth += 1;
                     }
                     found
                 };
