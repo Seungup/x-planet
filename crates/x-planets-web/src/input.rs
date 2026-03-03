@@ -20,6 +20,8 @@ struct TouchState {
     prev_pinch_dist: Option<f64>,
     /// Previous pinch angle (for rotation)
     prev_pinch_angle: Option<f64>,
+    /// Previous midpoint (for two-finger pitch)
+    prev_midpoint: Option<(f64, f64)>,
 }
 
 impl TouchState {
@@ -28,6 +30,7 @@ impl TouchState {
             touches: HashMap::new(),
             prev_pinch_dist: None,
             prev_pinch_angle: None,
+            prev_midpoint: None,
         }
     }
 
@@ -86,12 +89,30 @@ fn register_mouse_events(
     app: Rc<RefCell<WebApp>>,
     mouse_state: Rc<RefCell<Option<(f64, f64)>>>,
 ) {
+    // Right-click drag state: last position for pitch/rotate
+    let right_mouse_state: Rc<RefCell<Option<(f64, f64)>>> = Rc::new(RefCell::new(None));
+
+    // Disable context menu on canvas so right-click drag works
+    {
+        let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
+            e.prevent_default();
+        });
+        canvas
+            .add_event_listener_with_callback("contextmenu", cb.as_ref().unchecked_ref())
+            .unwrap();
+        cb.forget();
+    }
+
     // mousedown
     {
         let ms = Rc::clone(&mouse_state);
+        let rms = Rc::clone(&right_mouse_state);
         let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
-            if e.button() == 0 {
-                *ms.borrow_mut() = Some((e.offset_x() as f64, e.offset_y() as f64));
+            let pos = (e.offset_x() as f64, e.offset_y() as f64);
+            match e.button() {
+                0 => *ms.borrow_mut() = Some(pos),  // Left button
+                2 => *rms.borrow_mut() = Some(pos),  // Right button
+                _ => {}
             }
         });
         canvas
@@ -103,16 +124,34 @@ fn register_mouse_events(
     // mousemove
     {
         let ms = Rc::clone(&mouse_state);
+        let rms = Rc::clone(&right_mouse_state);
         let app = Rc::clone(&app);
         let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
-            let mut ms = ms.borrow_mut();
-            if let Some((lx, ly)) = *ms {
-                let x = e.offset_x() as f64;
-                let y = e.offset_y() as f64;
-                let dx = x - lx;
-                let dy = y - ly;
-                app.borrow_mut().engine.pan(dx, -dy);
-                *ms = Some((x, y));
+            let x = e.offset_x() as f64;
+            let y = e.offset_y() as f64;
+
+            // Left-drag: pan
+            {
+                let mut ms = ms.borrow_mut();
+                if let Some((lx, ly)) = *ms {
+                    let dx = x - lx;
+                    let dy = y - ly;
+                    app.borrow_mut().engine.pan(dx, -dy);
+                    *ms = Some((x, y));
+                }
+            }
+
+            // Right-drag: pitch (vertical) + rotate (horizontal)
+            {
+                let mut rms = rms.borrow_mut();
+                if let Some((lx, ly)) = *rms {
+                    let dx = x - lx;
+                    let dy = y - ly;
+                    let mut app = app.borrow_mut();
+                    app.engine.pitch(-dy * 0.3);   // drag up = more tilt
+                    app.engine.rotate(dx * 0.3);   // drag right = clockwise
+                    *rms = Some((x, y));
+                }
             }
         });
         canvas
@@ -124,8 +163,13 @@ fn register_mouse_events(
     // mouseup
     {
         let ms = Rc::clone(&mouse_state);
-        let cb = Closure::<dyn FnMut(_)>::new(move |_: web_sys::MouseEvent| {
-            *ms.borrow_mut() = None;
+        let rms = Rc::clone(&right_mouse_state);
+        let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
+            match e.button() {
+                0 => *ms.borrow_mut() = None,
+                2 => *rms.borrow_mut() = None,
+                _ => {}
+            }
         });
         canvas
             .add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref())
@@ -173,6 +217,7 @@ fn register_touch_events(
             // Reset pinch state when touch count changes
             ts.prev_pinch_dist = ts.pinch_distance();
             ts.prev_pinch_angle = ts.pinch_angle();
+            ts.prev_midpoint = ts.midpoint();
         });
         canvas
             .add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref())
@@ -234,6 +279,8 @@ fn register_touch_events(
                 }
 
                 // Rotate from angle change
+                // Negate: screen-clockwise finger rotation → positive atan2 delta,
+                // but we want map to rotate clockwise (bearing decrease visually).
                 if let (Some(prev_a), Some(new_a)) = (ts.prev_pinch_angle, new_angle) {
                     let mut delta_angle = new_a - prev_a;
                     // Normalize to [-180, 180]
@@ -244,12 +291,24 @@ fn register_touch_events(
                         delta_angle += 360.0;
                     }
                     if delta_angle.abs() < 30.0 {
-                        app.engine.rotate(delta_angle);
+                        app.engine.rotate(-delta_angle);
+                    }
+                }
+
+                // Pitch from two-finger vertical drag
+                // Drag up (negative dy in screen coords) → increase pitch (tilt more)
+                if let (Some((_, prev_my)), Some((_, new_my))) =
+                    (ts.prev_midpoint, midpoint)
+                {
+                    let dy = new_my - prev_my;
+                    if dy.abs() > 0.5 {
+                        app.engine.pitch(-dy * 0.3);
                     }
                 }
 
                 ts.prev_pinch_dist = new_dist;
                 ts.prev_pinch_angle = new_angle;
+                ts.prev_midpoint = midpoint;
             }
         });
         canvas
@@ -273,6 +332,7 @@ fn register_touch_events(
             // Reset pinch state
             ts.prev_pinch_dist = ts.pinch_distance();
             ts.prev_pinch_angle = ts.pinch_angle();
+            ts.prev_midpoint = ts.midpoint();
         });
         canvas
             .add_event_listener_with_callback("touchend", cb.as_ref().unchecked_ref())
