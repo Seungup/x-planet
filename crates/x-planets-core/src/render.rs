@@ -415,11 +415,11 @@ pub fn polar_cap_mesh(north: bool) -> (Vec<GlobeTileVertex>, Vec<u32>) {
     // Triangle fan indices (CCW from outside for back-face culling)
     for i in 0..seg {
         if north {
-            // North: pole at top, ring going counter-clockwise from outside
-            indices.extend_from_slice(&[0, i + 2, i + 1]);
-        } else {
-            // South: opposite winding
+            // North: pole → ring[i] → ring[i+1], CCW from outside (+z)
             indices.extend_from_slice(&[0, i + 1, i + 2]);
+        } else {
+            // South: pole → ring[i+1] → ring[i], CCW from outside (-z)
+            indices.extend_from_slice(&[0, i + 2, i + 1]);
         }
     }
 
@@ -547,5 +547,61 @@ mod tests {
 
         stack.remove_layer("base");
         assert_eq!(stack.layer_count(), 1);
+    }
+
+    // ── Polar cap winding tests ──────────────────────────
+
+    #[test]
+    fn test_polar_cap_north_normal_points_outward() {
+        let (verts, idxs) = polar_cap_mesh(true);
+        assert!(idxs.len() >= 3);
+        let v0 = glam::Vec3::from(verts[idxs[0] as usize].position);
+        let v1 = glam::Vec3::from(verts[idxs[1] as usize].position);
+        let v2 = glam::Vec3::from(verts[idxs[2] as usize].position);
+        let normal = (v1 - v0).cross(v2 - v0);
+        // At the north pole, outward normal should have positive z
+        assert!(
+            normal.z > 0.0,
+            "North cap triangle normal.z={:.6} should be positive (outward)",
+            normal.z
+        );
+    }
+
+    #[test]
+    fn test_polar_cap_south_normal_points_outward() {
+        let (verts, idxs) = polar_cap_mesh(false);
+        assert!(idxs.len() >= 3);
+        let v0 = glam::Vec3::from(verts[idxs[0] as usize].position);
+        let v1 = glam::Vec3::from(verts[idxs[1] as usize].position);
+        let v2 = glam::Vec3::from(verts[idxs[2] as usize].position);
+        let normal = (v1 - v0).cross(v2 - v0);
+        // At the south pole, outward normal should have negative z
+        assert!(
+            normal.z < 0.0,
+            "South cap triangle normal.z={:.6} should be negative (outward)",
+            normal.z
+        );
+    }
+
+    #[test]
+    fn test_polar_cap_all_triangles_face_outward() {
+        for north in [true, false] {
+            let (verts, idxs) = polar_cap_mesh(north);
+            for tri in idxs.chunks(3) {
+                let v0 = glam::Vec3::from(verts[tri[0] as usize].position);
+                let v1 = glam::Vec3::from(verts[tri[1] as usize].position);
+                let v2 = glam::Vec3::from(verts[tri[2] as usize].position);
+                let normal = (v1 - v0).cross(v2 - v0);
+                let centroid = (v0 + v1 + v2) / 3.0;
+                // Normal should point same direction as centroid (outward from origin)
+                let dot = normal.dot(centroid);
+                assert!(
+                    dot > 0.0,
+                    "{} cap triangle has inward-facing normal (dot={:.6})",
+                    if north { "North" } else { "South" },
+                    dot
+                );
+            }
+        }
     }
 }
