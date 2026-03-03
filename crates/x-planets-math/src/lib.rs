@@ -392,6 +392,19 @@ pub enum ProjectionMode {
     Mercator,
     /// Equirectangular / Plate Carée (linear lat/lon mapping).
     Equirectangular,
+    /// 3D Globe — tiles rendered on a unit sphere surface.
+    Globe,
+}
+
+/// Convert geographic coordinates (radians) to a point on the unit sphere.
+///
+/// Returns `(cos(lat)*cos(lon), cos(lat)*sin(lon), sin(lat))`.
+pub fn geo_to_unit_sphere(lat_rad: f64, lon_rad: f64) -> DVec3 {
+    DVec3::new(
+        lat_rad.cos() * lon_rad.cos(),
+        lat_rad.cos() * lon_rad.sin(),
+        lat_rad.sin(),
+    )
 }
 
 // ---------------------------------------------------------------------------

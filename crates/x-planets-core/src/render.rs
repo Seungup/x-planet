@@ -123,7 +123,8 @@ pub fn tile_quad_vertices_projected(
     let hw = 0.5 / n; // half-width (same for all projections — linear in longitude)
 
     let hh = match mode {
-        x_planets_math::ProjectionMode::Mercator => 0.5 / n,
+        x_planets_math::ProjectionMode::Mercator
+        | x_planets_math::ProjectionMode::Globe => 0.5 / n,
         x_planets_math::ProjectionMode::Equirectangular => {
             let n_f64 = coord.extent() as f64;
             let y_top_m = coord.y as f64 / n_f64;
@@ -172,6 +173,105 @@ impl TileVertex {
             ],
         }
     }
+}
+
+/// Vertex layout for globe tile rendering (3D position on sphere surface + UV).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GlobeTileVertex {
+    /// Position (x, y, z) relative to tile center on the unit sphere (RTE).
+    pub position: [f32; 3],
+    /// Texture coordinate (0..1) within the tile.
+    pub tex_coord: [f32; 2],
+}
+
+impl GlobeTileVertex {
+    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress, // 20 bytes
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3, // position xyz
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2, // tex_coord
+                },
+            ],
+        }
+    }
+}
+
+/// Tessellation subdivisions for a globe tile based on zoom level.
+///
+/// Lower zoom → larger tiles → more curvature → more subdivisions needed.
+pub fn globe_subdivisions(zoom: u8) -> u32 {
+    match zoom {
+        0..=2 => 32,
+        3..=5 => 16,
+        6..=9 => 8,
+        10..=13 => 4,
+        _ => 2,
+    }
+}
+
+/// Build a tessellated globe mesh for a single tile on the unit sphere (RTE).
+///
+/// Each vertex is computed on the unit sphere surface, then offset relative
+/// to `tile_center_3d` (computed in f64 for precision).
+pub fn tile_globe_mesh(
+    coord: &x_planets_math::TileCoord,
+    tile_center_3d: glam::DVec3,
+) -> (Vec<GlobeTileVertex>, Vec<u32>) {
+    use std::f64::consts::PI;
+
+    let subdiv = globe_subdivisions(coord.z);
+    let seg = subdiv + 1; // vertices per axis
+    let n = coord.extent() as f64;
+    let mut vertices = Vec::with_capacity((seg * seg) as usize);
+    let mut indices = Vec::with_capacity((subdiv * subdiv * 6) as usize);
+
+    for j in 0..=subdiv {
+        for i in 0..=subdiv {
+            let u = i as f64 / subdiv as f64;
+            let v = j as f64 / subdiv as f64;
+
+            // Global Mercator position [0,1]
+            let mx = (coord.x as f64 + u) / n;
+            let my = (coord.y as f64 + v) / n;
+
+            // Mercator → lat/lon (radians)
+            let lon_rad = (mx * 2.0 - 1.0) * PI;
+            let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+
+            // 3D position on unit sphere
+            let pos_3d = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
+            // RTE: subtract tile center in f64, then cast to f32
+            let rte = pos_3d - tile_center_3d;
+
+            vertices.push(GlobeTileVertex {
+                position: [rte.x as f32, rte.y as f32, rte.z as f32],
+                tex_coord: [u as f32, v as f32],
+            });
+        }
+    }
+
+    // Triangle indices (CCW winding from outside the sphere → back-face culling works)
+    for j in 0..subdiv {
+        for i in 0..subdiv {
+            let tl = j * seg + i;
+            let tr = j * seg + i + 1;
+            let bl = (j + 1) * seg + i;
+            let br = (j + 1) * seg + i + 1;
+            indices.extend_from_slice(&[tl, bl, tr, tr, bl, br]);
+        }
+    }
+
+    (vertices, indices)
 }
 
 /// Vertex layout for terrain tile rendering (3D displaced positions + normals).

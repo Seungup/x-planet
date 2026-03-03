@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use x_planets_math::{GeoCoord, TileCoord, TileUniforms, ViewportUniforms, VisibleTile};
 
-use crate::render::{tile_quad_vertices_projected, TileVertex, TILE_QUAD_INDICES};
+use crate::render::{tile_quad_vertices_projected, GlobeTileVertex, TileVertex, TILE_QUAD_INDICES, tile_globe_mesh};
 use crate::viewport::Viewport;
 
 // ───────────────────────────────────────────────────────────────────
@@ -194,7 +194,8 @@ pub fn tile_uniforms_for_visible_projected(
     // Tile center — x is the same for both projections, y depends on mode.
     let cx = (rt.display_x as f64 + 0.5) / n_f64;
     let cy = match mode {
-        x_planets_math::ProjectionMode::Mercator => (rt.coord.y as f64 + 0.5) / n_f64,
+        x_planets_math::ProjectionMode::Mercator
+        | x_planets_math::ProjectionMode::Globe => (rt.coord.y as f64 + 0.5) / n_f64,
         x_planets_math::ProjectionMode::Equirectangular => {
             let y_top_m = rt.coord.y as f64 / n_f64;
             let y_bot_m = (rt.coord.y + 1) as f64 / n_f64;
@@ -205,6 +206,76 @@ pub fn tile_uniforms_for_visible_projected(
     };
 
     let model = glam::DMat4::from_translation(glam::DVec3::new(cx, cy, 0.0));
+    let mvp_f64 = *vp_f64 * model;
+    let mvp_f32 = mvp_f64.as_mat4();
+
+    TileUniforms {
+        mvp: mvp_f32.to_cols_array(),
+        bounds: [min_x, min_y, max_x, max_y],
+        meta: [rt.coord.z as f32, opacity, 0.0, 0.0],
+        uv_rect: rt.uv_rect,
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Globe (3D sphere) mesh + uniforms
+// ───────────────────────────────────────────────────────────────────
+
+/// Compute the center of a tile on the unit sphere (f64 precision).
+///
+/// Uses `display_x` for correct antimeridian handling.
+/// Pure function.
+pub fn globe_tile_center(coord: &TileCoord, display_x: i64) -> glam::DVec3 {
+    let n = coord.extent() as f64;
+    let mx = (display_x as f64 + 0.5) / n;
+    let my = (coord.y as f64 + 0.5) / n;
+    let lon_rad = (mx * 2.0 - 1.0) * std::f64::consts::PI;
+    let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+    x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad)
+}
+
+/// Build tessellated sphere meshes for all tiles in a layer.
+///
+/// Returns `(vertices, indices, per_tile_index_counts)`.
+/// Each tile gets zoom-dependent subdivisions; index counts may vary.
+/// Pure function.
+pub fn build_globe_tile_mesh(
+    tiles: &[RenderableTile],
+) -> (Vec<GlobeTileVertex>, Vec<u32>, Vec<u32>) {
+    let mut all_verts = Vec::new();
+    let mut all_idxs = Vec::new();
+    let mut tile_idx_counts = Vec::new();
+
+    for rt in tiles {
+        let tile_center_3d = globe_tile_center(&rt.coord, rt.display_x);
+        let base_vertex = all_verts.len() as u32;
+        let (verts, idxs) = tile_globe_mesh(&rt.coord, tile_center_3d);
+        all_verts.extend(verts);
+        all_idxs.extend(idxs.iter().map(|i| i + base_vertex));
+        tile_idx_counts.push(idxs.len() as u32);
+    }
+
+    (all_verts, all_idxs, tile_idx_counts)
+}
+
+/// Compute per-tile uniforms for globe rendering.
+///
+/// The model translation is the tile's 3D center on the unit sphere
+/// (instead of a 2D Mercator point).
+/// Pure function.
+pub fn tile_uniforms_for_globe(
+    rt: &RenderableTile,
+    opacity: f32,
+    vp_f64: &glam::DMat4,
+) -> TileUniforms {
+    let n = rt.coord.extent() as f32;
+    let min_x = rt.display_x as f32 / n;
+    let min_y = rt.coord.y as f32 / n;
+    let max_x = (rt.display_x + 1) as f32 / n;
+    let max_y = (rt.coord.y + 1) as f32 / n;
+
+    let tile_center_3d = globe_tile_center(&rt.coord, rt.display_x);
+    let model = glam::DMat4::from_translation(tile_center_3d);
     let mvp_f64 = *vp_f64 * model;
     let mvp_f32 = mvp_f64.as_mat4();
 

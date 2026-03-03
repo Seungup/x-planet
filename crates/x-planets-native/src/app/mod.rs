@@ -342,7 +342,7 @@ impl NativeApp {
             let engine = self.engine.as_ref().unwrap();
 
             let proj_mode = match engine.active_projection.as_str() {
-                "Equirectangular" => x_planets_math::ProjectionMode::Equirectangular,
+                "Equirectangular" => x_planets_math::ProjectionMode::Globe,
                 _ => x_planets_math::ProjectionMode::Mercator,
             };
             renderer.render_frame_layered_projected(gpu, &view, &engine.viewport, &render_layers, proj_mode);
