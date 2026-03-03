@@ -218,7 +218,7 @@ impl Viewport {
     ///
     /// For Globe mode, computes tile zoom from the orbital camera altitude
     /// and selects tiles visible from the sphere surface.  For Mercator and
-    /// other modes, delegates to the standard Mercator-based frustum.
+    /// other flat modes, delegates to the standard Mercator-based frustum.
     pub fn visible_tiles_for_mode(&self, mode: x_planets_math::ProjectionMode) -> Vec<VisibleTile> {
         match mode {
             x_planets_math::ProjectionMode::Globe => self.visible_tiles_globe(),
@@ -266,8 +266,8 @@ impl Viewport {
         let lon_max = lon + lon_span;
 
         // Convert to Mercator and build a Frustum2D.
-        let sw = x_planets_math::geo_to_mercator(&GeoCoord::new(lat_min, lon_min));
-        let ne = x_planets_math::geo_to_mercator(&GeoCoord::new(lat_max, lon_max));
+        let sw = geo_to_mercator(&GeoCoord::new(lat_min, lon_min));
+        let ne = geo_to_mercator(&GeoCoord::new(lat_max, lon_max));
 
         let bbox = BoundingBox::new(
             GeoCoord::new(lat_min, lon_min.clamp(-180.0, 180.0)),
@@ -389,115 +389,8 @@ impl Viewport {
 
     /// Quadtree-based LOD tile selection (gap-free, priority-ordered, budgeted).
     fn quadtree_lod(&self, base_z: u8) -> Vec<VisibleTile> {
-        use std::cmp::Ordering;
-        use std::collections::BinaryHeap;
-
-        const TILE_BUDGET: usize = 150;
-
-        let center_merc = geo_to_mercator(&self.center);
-        let pitch_rad = self.pitch.to_radians();
-        let sin_p = pitch_rad.sin();
-        let scale = 2.0_f64.powf(-self.zoom);
-        let fov_half_tan = (std::f64::consts::FRAC_PI_3 * 0.5).tan();
-        let cam_h = scale / fov_half_tan;
-
-        let bearing_rad = self.bearing.to_radians();
-        let sin_b = bearing_rad.sin();
-        let cos_b = bearing_rad.cos();
-
-        let max_drop = ((self.pitch / 15.0).ceil() as u8).min(4);
-        let min_z = base_z.saturating_sub(max_drop);
-
-        // ── Ideal zoom for a point in Mercator space ──
-        let ideal_zoom_at = |mx: f64, my: f64| -> u8 {
-            if self.pitch < 5.0 {
-                return base_z;
-            }
-            let dx = mx - center_merc.x;
-            let dy = my - center_merc.y;
-            let d_fwd = dx * sin_b - dy * cos_b;
-
-            if d_fwd > 0.0 && sin_p > 0.01 {
-                let perspective = cam_h / (cam_h + d_fwd * sin_p);
-                (self.zoom + perspective.log2())
-                    .round()
-                    .clamp(min_z as f64, base_z as f64) as u8
-            } else {
-                base_z
-            }
-        };
-
-        // ── Priority: closer tiles are more important (max-heap) ──
-        #[derive(Debug)]
-        struct Candidate {
-            tile: VisibleTile,
-            priority: f64, // higher = more important
-        }
-        impl PartialEq for Candidate {
-            fn eq(&self, other: &Self) -> bool {
-                self.priority == other.priority
-            }
-        }
-        impl Eq for Candidate {}
-        impl PartialOrd for Candidate {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for Candidate {
-            fn cmp(&self, other: &Self) -> Ordering {
-                self.priority
-                    .partial_cmp(&other.priority)
-                    .unwrap_or(Ordering::Equal)
-            }
-        }
-
         let frustum = self.frustum();
-        let mut heap = BinaryHeap::<Candidate>::new();
-        let mut result = Vec::<VisibleTile>::new();
-
-        // Seed: visible tiles at min_z (coarse, guaranteed small set).
-        for vt in frustum.visible_tiles(min_z) {
-            let tc = vt.display_mercator_center();
-            let dist = (tc - center_merc).length();
-            heap.push(Candidate {
-                tile: vt,
-                priority: 1.0 / (dist + 1e-10),
-            });
-        }
-
-        // ── Quadtree traversal ──
-        while let Some(candidate) = heap.pop() {
-            let vt = candidate.tile;
-            let tc = vt.display_mercator_center();
-            let ideal_z = ideal_zoom_at(tc.x, tc.y);
-
-            // Should we subdivide this tile?
-            let should_subdivide = vt.coord.z < ideal_z
-                && vt.coord.z < base_z
-                && (result.len() + heap.len() + 4) <= TILE_BUDGET;
-
-            if should_subdivide {
-                // Push 4 children — visible ones only.
-                for child in vt.children() {
-                    if frustum.is_visible_tile(&child) {
-                        let cc = child.display_mercator_center();
-                        let dist = (cc - center_merc).length();
-                        heap.push(Candidate {
-                            tile: child,
-                            priority: 1.0 / (dist + 1e-10),
-                        });
-                    }
-                }
-            } else {
-                // Keep at current zoom level.
-                result.push(vt);
-            }
-        }
-
-        // Sort: coarser first (background), finer last (foreground).
-        result.sort_by_key(|vt| vt.coord.z);
-        result
+        self.quadtree_lod_with_frustum(base_z, &frustum)
     }
 
     /// Compute the view-projection matrix in f64 for high-precision per-tile MVP.
@@ -1576,6 +1469,137 @@ mod tests {
             (viewport.center.lon - lon_orig).abs() < 0.1,
             "Round-trip lon: orig={:.4}, after={:.4}",
             lon_orig, viewport.center.lon
+        );
+    }
+
+    // ── Projection-aware visible tile selection ──────────
+
+    #[test]
+    fn test_visible_tiles_for_mode_mercator_equals_default() {
+        // Mercator mode should produce the same tiles as the default visible_tiles().
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(37.5665, 126.978);
+        viewport.zoom = 5.0;
+
+        let default_tiles = viewport.visible_tiles();
+        let mode_tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+
+        assert_eq!(default_tiles.len(), mode_tiles.len());
+        for (d, m) in default_tiles.iter().zip(mode_tiles.iter()) {
+            assert_eq!(d.coord, m.coord);
+            assert_eq!(d.display_x, m.display_x);
+        }
+    }
+
+    #[test]
+    fn test_visible_tiles_globe_returns_tiles() {
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(37.5665, 126.978);
+        viewport.zoom = 3.0;
+
+        let tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+        assert!(
+            !tiles.is_empty(),
+            "Globe mode should return visible tiles"
+        );
+    }
+
+    #[test]
+    fn test_visible_tiles_globe_center_tile_included() {
+        // The tile containing the viewport center must always be in the result.
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(37.5665, 126.978);
+        viewport.zoom = 5.0;
+
+        let tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+        let center_tile = TileCoord::from_geo(&viewport.center, viewport.tile_zoom());
+
+        // The center tile (or one of its ancestors) must be in the result.
+        let has_center = tiles.iter().any(|vt| {
+            let mut cur = center_tile;
+            loop {
+                if cur == vt.coord {
+                    return true;
+                }
+                match cur.parent() {
+                    Some(p) => cur = p,
+                    None => return false,
+                }
+            }
+        });
+        assert!(
+            has_center,
+            "Center tile {:?} (or ancestor) not found in globe visible tiles",
+            center_tile
+        );
+    }
+
+    #[test]
+    fn test_visible_tiles_globe_sorted_coarse_first() {
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        viewport.zoom = 4.0;
+
+        let tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+        for pair in tiles.windows(2) {
+            assert!(
+                pair[0].coord.z <= pair[1].coord.z,
+                "Globe tiles not sorted coarse-first"
+            );
+        }
+    }
+
+    #[test]
+    fn test_visible_tiles_globe_low_zoom_coverage() {
+        // At zoom 0-1, globe mode should select some tiles.
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        viewport.zoom = 1.0;
+
+        let tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+        assert!(
+            !tiles.is_empty(),
+            "Globe mode at zoom 1 should produce tiles"
+        );
+    }
+
+    #[test]
+    fn test_visible_tiles_globe_polar_center() {
+        // Viewport centered near the north pole.
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(80.0, 0.0);
+        viewport.zoom = 4.0;
+
+        let tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+        assert!(
+            !tiles.is_empty(),
+            "Globe mode near pole should produce tiles"
+        );
+        // All tiles should have valid y coordinates.
+        for vt in &tiles {
+            let max_y = vt.coord.extent();
+            assert!(vt.coord.y < max_y, "Tile y out of range: {:?}", vt.coord);
+        }
+    }
+
+    #[test]
+    fn test_visible_tiles_globe_budget_respected() {
+        let mut viewport = Viewport::new(1920, 1080);
+        viewport.center = GeoCoord::new(37.5, 127.0);
+        viewport.zoom = 8.0;
+
+        let tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+        assert!(
+            tiles.len() <= 200,
+            "Globe mode: too many tiles {} (budget should cap)",
+            tiles.len()
         );
     }
 }

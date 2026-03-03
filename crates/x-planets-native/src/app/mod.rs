@@ -131,10 +131,7 @@ struct NativeApp {
 impl NativeApp {
     fn resolve_projection_mode(&self) -> x_planets_math::ProjectionMode {
         match self.engine.as_ref() {
-            Some(engine) => match engine.active_projection.as_str() {
-                "Equirectangular" => x_planets_math::ProjectionMode::Globe,
-                _ => x_planets_math::ProjectionMode::Mercator,
-            },
+            Some(engine) => engine.rendering_mode(),
             None => x_planets_math::ProjectionMode::Mercator,
         }
     }

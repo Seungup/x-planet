@@ -23,6 +23,10 @@ impl ProjectionPlugin for Mercator {
         Some("EPSG:3857")
     }
 
+    fn rendering_mode(&self) -> x_planets_math::ProjectionMode {
+        x_planets_math::ProjectionMode::Mercator
+    }
+
     fn shader_source(&self) -> &str {
         MERCATOR_WGSL
     }
@@ -85,6 +89,10 @@ impl ProjectionPlugin for Equirectangular {
 
     fn epsg_code(&self) -> Option<&str> {
         Some("EPSG:4326")
+    }
+
+    fn rendering_mode(&self) -> x_planets_math::ProjectionMode {
+        x_planets_math::ProjectionMode::Globe
     }
 
     fn shader_source(&self) -> &str {
@@ -165,6 +173,24 @@ mod tests {
         let recovered = proj.unproject_cpu(projected);
         assert!((original.x - recovered.x).abs() < 1e-8);
         assert!((original.y - recovered.y).abs() < 1e-8);
+    }
+
+    #[test]
+    fn test_mercator_rendering_mode() {
+        let proj = Mercator;
+        assert_eq!(
+            proj.rendering_mode(),
+            x_planets_math::ProjectionMode::Mercator,
+        );
+    }
+
+    #[test]
+    fn test_equirectangular_rendering_mode() {
+        let proj = Equirectangular;
+        assert_eq!(
+            proj.rendering_mode(),
+            x_planets_math::ProjectionMode::Globe,
+        );
     }
 
     #[test]

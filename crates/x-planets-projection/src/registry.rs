@@ -58,6 +58,17 @@ impl ProjectionRegistry {
         self.plugins.keys().map(|s| s.as_str()).collect()
     }
 
+    /// Look up the rendering mode for a projection by name.
+    ///
+    /// Returns the `ProjectionMode` declared by the plugin, or
+    /// the default `Mercator` if the name is not registered.
+    pub fn rendering_mode_for(&self, name: &str) -> x_planets_math::ProjectionMode {
+        self.plugins
+            .get(name)
+            .map(|p| p.rendering_mode())
+            .unwrap_or_default()
+    }
+
     /// Number of registered projections.
     pub fn len(&self) -> usize {
         self.plugins.len()
@@ -167,5 +178,44 @@ mod tests {
         registry.register(Arc::new(custom));
         assert!(registry.get("My Projection").is_some());
         assert_eq!(registry.len(), 3);
+    }
+
+    #[test]
+    fn test_rendering_mode_for_builtins() {
+        let registry = ProjectionRegistry::new();
+
+        assert_eq!(
+            registry.rendering_mode_for("Web Mercator"),
+            x_planets_math::ProjectionMode::Mercator,
+        );
+        assert_eq!(
+            registry.rendering_mode_for("Equirectangular"),
+            x_planets_math::ProjectionMode::Globe,
+        );
+    }
+
+    #[test]
+    fn test_rendering_mode_for_unknown_defaults_to_mercator() {
+        let registry = ProjectionRegistry::new();
+        assert_eq!(
+            registry.rendering_mode_for("NonExistent"),
+            x_planets_math::ProjectionMode::Mercator,
+        );
+    }
+
+    #[test]
+    fn test_custom_projection_default_rendering_mode() {
+        let mut registry = ProjectionRegistry::new();
+        let custom = CustomProjection::new(
+            "Stereographic",
+            "fn project(p: vec3<f32>) -> vec3<f32> { return p; }",
+        );
+        registry.register(Arc::new(custom));
+
+        // CustomProjection uses the default rendering_mode() = Mercator
+        assert_eq!(
+            registry.rendering_mode_for("Stereographic"),
+            x_planets_math::ProjectionMode::Mercator,
+        );
     }
 }
