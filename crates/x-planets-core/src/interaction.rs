@@ -39,11 +39,11 @@ pub const ROTATE_SENSITIVITY: f64 = 0.3;
 /// Suppresses gesture actions during finger transitions to prevent jitter.
 pub const TOUCH_GRACE_PERIOD: f64 = 0.08;
 /// Exponential friction speed for inertia decay.
-pub const INERTIA_FRICTION: f64 = 6.0;
+pub const INERTIA_FRICTION: f64 = 4.5;
 /// Minimum speed (px/sec) below which inertia stops.
 pub const INERTIA_MIN_SPEED: f64 = 1.0;
 /// Exponential decay speed for smooth zoom animation.
-pub const ZOOM_ANIM_SPEED: f64 = 12.0;
+pub const ZOOM_ANIM_SPEED: f64 = 16.0;
 /// Time window (seconds) for drag velocity sampling.
 pub const DRAG_SAMPLE_WINDOW: f64 = 0.1;
 
@@ -429,8 +429,10 @@ impl TouchGestureState {
             }
         }
 
-        // Suppress during grace period
-        if self.in_grace_period(now_secs) {
+        // Suppress during grace period — but NOT for 0→1 transitions.
+        // When a single finger first touches down there is no prior gesture to
+        // conflict with, so skipping the delay makes pan start feel instant.
+        if self.in_grace_period(now_secs) && self.prev_count > 0 {
             // Still update pinch state so we don't get a jump after grace ends
             self.prev_pinch_dist = self.pinch_distance();
             self.prev_pinch_angle = self.pinch_angle();
@@ -699,17 +701,31 @@ mod tests {
     }
 
     #[test]
-    fn test_touch_grace_suppresses_actions() {
+    fn test_touch_grace_skipped_for_first_finger() {
+        // 0→1 transition: grace period is skipped so pan starts instantly.
         let mut ts = TouchGestureState::new();
         ts.touch_start(0, 100.0, 100.0, 1.0);
 
-        // Move during grace period → None
+        // Move during grace period for first finger → Pan (no suppression)
         let action = ts.process_moves(&[(0, 150.0, 100.0)], 1.0, 1.02);
-        assert!(action.is_none());
+        assert!(matches!(action, Some(GestureAction::Pan { .. })));
 
-        // Move after grace period → Pan
+        // Move after grace period → still Pan
         let action = ts.process_moves(&[(0, 200.0, 100.0)], 1.0, 1.1);
         assert!(matches!(action, Some(GestureAction::Pan { .. })));
+    }
+
+    #[test]
+    fn test_touch_grace_suppresses_multi_finger_transition() {
+        // 1→2 transition: grace period IS active to prevent jitter.
+        let mut ts = TouchGestureState::new();
+        ts.touch_start(0, 100.0, 100.0, 0.0);
+        // Wait past initial grace
+        let _ = ts.process_moves(&[(0, 110.0, 100.0)], 1.0, 0.2);
+        // Second finger arrives → new grace period (prev_count=1 > 0)
+        ts.touch_start(1, 200.0, 100.0, 0.3);
+        let action = ts.process_moves(&[(0, 115.0, 100.0), (1, 205.0, 100.0)], 1.0, 0.32);
+        assert!(action.is_none(), "Should suppress during 1→2 grace period");
     }
 
     #[test]

@@ -108,6 +108,24 @@ impl WebApp {
         }
     }
 
+    /// Cycle to the next projection and return its name.
+    pub fn cycle_projection(&mut self) -> String {
+        let mut names: Vec<String> = self
+            .engine
+            .projection_registry
+            .list()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        names.sort();
+        let current = &self.engine.active_projection;
+        let idx = names.iter().position(|n| n == current).unwrap_or(0);
+        let next_idx = (idx + 1) % names.len();
+        self.engine.set_projection(&names[next_idx]);
+        log::info!("Projection: {}", self.engine.active_projection);
+        self.engine.active_projection.clone()
+    }
+
     /// Start the requestAnimationFrame render loop.
     pub fn start_render_loop(app: Rc<RefCell<Self>>) {
         let f: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
