@@ -109,7 +109,7 @@ impl WebApp {
     }
 
     /// Resolve the active projection name to a `ProjectionMode` enum.
-    fn resolve_projection_mode(&self) -> x_planets_math::ProjectionMode {
+    pub(crate) fn resolve_projection_mode(&self) -> x_planets_math::ProjectionMode {
         match self.engine.active_projection.as_str() {
             "Equirectangular" => x_planets_math::ProjectionMode::Globe,
             _ => x_planets_math::ProjectionMode::Mercator,
@@ -153,7 +153,8 @@ impl WebApp {
         // ── 0. Tick animations (smooth zoom, inertia pan) ──
         if let Some(prev_ms) = self.last_frame_ms {
             let dt = ((timestamp_ms - prev_ms) / 1000.0).min(0.1);
-            self.anim.tick(&mut self.engine, dt);
+            let mode = self.resolve_projection_mode();
+            self.anim.tick_with_mode(&mut self.engine, dt, mode);
         }
         self.last_frame_ms = Some(timestamp_ms);
 

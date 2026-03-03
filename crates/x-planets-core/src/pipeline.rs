@@ -9,7 +9,10 @@
 use std::collections::HashSet;
 use x_planets_math::{GeoCoord, TileCoord, TileUniforms, ViewportUniforms, VisibleTile};
 
-use crate::render::{tile_quad_vertices_projected, GlobeTileVertex, TileVertex, TILE_QUAD_INDICES, tile_globe_mesh};
+use crate::render::{
+    tile_quad_vertices_projected, GlobeTileVertex, TileVertex, TILE_QUAD_INDICES,
+    tile_globe_mesh, tile_centered_mesh, polar_cap_mesh,
+};
 use crate::viewport::Viewport;
 
 // ───────────────────────────────────────────────────────────────────
@@ -258,6 +261,20 @@ pub fn build_globe_tile_mesh(
     (all_verts, all_idxs, tile_idx_counts)
 }
 
+/// Build polar cap geometry for the globe (fills the holes at ±90°).
+///
+/// Returns `(vertices, indices)` for both north and south polar caps.
+/// These use absolute unit-sphere positions (no RTE offset).
+/// Render with an identity model matrix in the VP.
+pub fn build_polar_caps() -> (Vec<GlobeTileVertex>, Vec<u32>) {
+    let (mut verts, mut idxs) = polar_cap_mesh(true);
+    let (south_v, south_i) = polar_cap_mesh(false);
+    let base = verts.len() as u32;
+    verts.extend(south_v);
+    idxs.extend(south_i.iter().map(|i| i + base));
+    (verts, idxs)
+}
+
 /// Compute per-tile uniforms for globe rendering.
 ///
 /// The model translation is the tile's 3D center on the unit sphere
@@ -276,6 +293,84 @@ pub fn tile_uniforms_for_globe(
 
     let tile_center_3d = globe_tile_center(&rt.coord, rt.display_x);
     let model = glam::DMat4::from_translation(tile_center_3d);
+    let mvp_f64 = *vp_f64 * model;
+    let mvp_f32 = mvp_f64.as_mat4();
+
+    TileUniforms {
+        mvp: mvp_f32.to_cols_array(),
+        bounds: [min_x, min_y, max_x, max_y],
+        meta: [rt.coord.z as f32, opacity, 0.0, 0.0],
+        uv_rect: rt.uv_rect,
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Viewport-centered (oblique) Mercator mesh + uniforms
+// ───────────────────────────────────────────────────────────────────
+
+/// Compute tile center in oblique (viewport-centered) Mercator space.
+fn centered_tile_center(
+    coord: &TileCoord,
+    display_x: i64,
+    center_lat_rad: f64,
+    center_lon_rad: f64,
+) -> glam::DVec2 {
+    let n = coord.extent() as f64;
+    let mx = (display_x as f64 + 0.5) / n;
+    let my = (coord.y as f64 + 0.5) / n;
+    let lon_rad = (mx * 2.0 - 1.0) * std::f64::consts::PI;
+    let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+    x_planets_math::oblique_mercator(lat_rad, lon_rad, center_lat_rad, center_lon_rad)
+}
+
+/// Build tessellated centered-Mercator meshes for all tiles.
+///
+/// Tiles are projected through oblique Mercator centered on
+/// `(center_lat_rad, center_lon_rad)`, producing 2D positions (z=0)
+/// in `GlobeTileVertex` format (reuses the globe pipeline).
+///
+/// Returns `(vertices, indices, per_tile_index_counts)`.
+pub fn build_centered_tile_mesh(
+    tiles: &[RenderableTile],
+    center_lat_rad: f64,
+    center_lon_rad: f64,
+) -> (Vec<GlobeTileVertex>, Vec<u32>, Vec<u32>) {
+    let mut all_verts = Vec::new();
+    let mut all_idxs = Vec::new();
+    let mut tile_idx_counts = Vec::new();
+
+    for rt in tiles {
+        let tile_center_2d =
+            centered_tile_center(&rt.coord, rt.display_x, center_lat_rad, center_lon_rad);
+        let base_vertex = all_verts.len() as u32;
+        let (verts, idxs) =
+            tile_centered_mesh(&rt.coord, center_lat_rad, center_lon_rad, tile_center_2d);
+        all_verts.extend(verts);
+        all_idxs.extend(idxs.iter().map(|i| i + base_vertex));
+        tile_idx_counts.push(idxs.len() as u32);
+    }
+
+    (all_verts, all_idxs, tile_idx_counts)
+}
+
+/// Compute per-tile uniforms for centered Mercator rendering.
+pub fn tile_uniforms_for_centered(
+    rt: &RenderableTile,
+    opacity: f32,
+    vp_f64: &glam::DMat4,
+    center_lat_rad: f64,
+    center_lon_rad: f64,
+) -> TileUniforms {
+    let n = rt.coord.extent() as f32;
+    let min_x = rt.display_x as f32 / n;
+    let min_y = rt.coord.y as f32 / n;
+    let max_x = (rt.display_x + 1) as f32 / n;
+    let max_y = (rt.coord.y + 1) as f32 / n;
+
+    let tile_center_2d =
+        centered_tile_center(&rt.coord, rt.display_x, center_lat_rad, center_lon_rad);
+    let model =
+        glam::DMat4::from_translation(glam::DVec3::new(tile_center_2d.x, tile_center_2d.y, 0.0));
     let mvp_f64 = *vp_f64 * model;
     let mvp_f32 = mvp_f64.as_mat4();
 

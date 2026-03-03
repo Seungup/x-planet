@@ -204,7 +204,8 @@ fn register_mouse_events(
                 if let Some((lx, ly)) = ms.left {
                     let dx = (x - lx) * dpr;
                     let dy = (y - ly) * dpr;
-                    app.engine.pan(dx, -dy);
+                    let mode = app.resolve_projection_mode();
+                    app.engine.pan_for_mode(dx, -dy, mode);
                 }
                 app.anim.record_drag((x * dpr, y * dpr), now_secs());
                 ms.left = Some((x, y));
@@ -290,11 +291,12 @@ fn register_keyboard_events(app: Rc<RefCell<WebApp>>) {
         let key = e.code();
         let mut app = app.borrow_mut();
 
+        let mode = app.resolve_projection_mode();
         match key.as_str() {
-            "ArrowLeft" => app.engine.pan(-PAN_AMOUNT, 0.0),
-            "ArrowRight" => app.engine.pan(PAN_AMOUNT, 0.0),
-            "ArrowUp" => app.engine.pan(0.0, -PAN_AMOUNT),
-            "ArrowDown" => app.engine.pan(0.0, PAN_AMOUNT),
+            "ArrowLeft" => app.engine.pan_for_mode(-PAN_AMOUNT, 0.0, mode),
+            "ArrowRight" => app.engine.pan_for_mode(PAN_AMOUNT, 0.0, mode),
+            "ArrowUp" => app.engine.pan_for_mode(0.0, -PAN_AMOUNT, mode),
+            "ArrowDown" => app.engine.pan_for_mode(0.0, PAN_AMOUNT, mode),
             "Equal" | "NumpadAdd" => {
                 app.anim.zoom_target += ZOOM_STEP;
                 app.anim.zoom_anchor = None;
@@ -407,9 +409,10 @@ fn register_touch_events(
             let mut ts = ts.borrow_mut();
             if let Some(action) = ts.process_moves(&changes, dpr, now) {
                 let mut app = app.borrow_mut();
+                let mode = app.resolve_projection_mode();
                 match action {
                     GestureAction::Pan { dx, dy } => {
-                        app.engine.pan(dx, -dy);
+                        app.engine.pan_for_mode(dx, -dy, mode);
                         // Record drag position for inertia velocity estimation.
                         if let Some(&(_, x, y)) = changes.first() {
                             app.anim.record_drag((x * dpr, y * dpr), now);
@@ -417,7 +420,7 @@ fn register_touch_events(
                     }
                     GestureAction::MultiTouch(mt) => {
                         if let Some((delta, cx, cy)) = mt.zoom {
-                            app.engine.zoom_at(delta, cx, cy);
+                            app.engine.zoom_at_for_mode(delta, cx, cy, mode);
                             // Sync animation target so tick() doesn't fight
                             // the pinch zoom by reverting to the old target.
                             app.anim.zoom_target = app.engine.viewport.zoom;

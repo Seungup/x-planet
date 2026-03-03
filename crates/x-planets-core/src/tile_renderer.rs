@@ -17,14 +17,14 @@ use x_planets_gpu::GpuContext;
 use x_planets_math::{TileCoord, ViewportUniforms};
 
 use crate::pipeline::{
-    build_tile_mesh_projected, tile_uniforms_for_visible_projected,
-    build_globe_tile_mesh, tile_uniforms_for_globe, RenderableTile,
+    build_globe_tile_mesh, build_polar_caps, tile_uniforms_for_globe,
+    build_centered_tile_mesh, tile_uniforms_for_centered,
+    RenderableTile,
 };
-use crate::render::{GlobeTileVertex, RenderLayerData, TileVertex};
+use crate::render::{GlobeTileVertex, RenderLayerData};
 use crate::viewport::Viewport;
 use std::collections::HashMap;
 
-const RASTER_TILE_SHADER: &str = include_str!("../../../shaders/rendering/raster_tile.wgsl");
 const RASTER_TILE_GLOBE_SHADER: &str = include_str!("../../../shaders/rendering/raster_tile_globe.wgsl");
 
 /// A tile prepared for rendering (owns its GPU resources).
@@ -35,13 +35,15 @@ pub struct PreparedTile {
 
 /// Renders raster tiles to the screen.
 pub struct TileRenderer {
-    pipeline: wgpu::RenderPipeline,
     globe_pipeline: wgpu::RenderPipeline,
+    centered_pipeline: wgpu::RenderPipeline,
     _viewport_bgl: wgpu::BindGroupLayout,
     tile_bgl: wgpu::BindGroupLayout,
     viewport_buffer: wgpu::Buffer,
     viewport_bg: wgpu::BindGroup,
     sampler: wgpu::Sampler,
+    /// 1×1 white texture for polar caps and fallback rendering.
+    polar_cap_texture_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     depth_format: wgpu::TextureFormat,
     surface_width: u32,
@@ -114,56 +116,6 @@ impl TileRenderer {
                     ],
                 });
 
-        // ── Shader + Pipeline ──
-        let shader = gpu
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("raster-tile-shader"),
-                source: wgpu::ShaderSource::Wgsl(RASTER_TILE_SHADER.into()),
-            });
-
-        let pipeline_layout =
-            gpu.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("raster-tile-layout"),
-                    bind_group_layouts: &[&_viewport_bgl, &tile_bgl],
-                    push_constant_ranges: &[],
-                });
-
-        let pipeline =
-            gpu.device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("raster-tile-pipeline"),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some("vs_main"),
-                        buffers: &[TileVertex::layout()],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some("fs_main"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState::default(),
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: Self::depth_format(),
-                        depth_write_enabled: true,
-                        depth_compare: wgpu::CompareFunction::LessEqual,
-                        stencil: wgpu::StencilState::default(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview: None,
-                    cache: None,
-                });
-
         // ── Globe Shader + Pipeline ──
         let globe_shader = gpu
             .device
@@ -217,6 +169,42 @@ impl TileRenderer {
                     cache: None,
                 });
 
+        // ── Centered (oblique Mercator) pipeline: same shader as globe (vec3)
+        //    but no back-face culling (flat z=0 meshes).
+        let centered_pipeline =
+            gpu.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("raster-tile-centered-pipeline"),
+                    layout: Some(&globe_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &globe_shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[GlobeTileVertex::layout()],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &globe_shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(), // no back-face culling
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: Self::depth_format(),
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::LessEqual,
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                });
+
         // ── Viewport uniform buffer (updated per frame) ──
         let viewport_uniforms = ViewportUniforms {
             view_proj: [0.0; 16],
@@ -245,6 +233,35 @@ impl TileRenderer {
             ..Default::default()
         });
 
+        // ── 1×1 white texture for polar caps ──
+        let polar_cap_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("polar-cap-texture"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // Ice-white color: #E8EEF2
+        gpu.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &polar_cap_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0xE8, 0xEE, 0xF2, 0xFF],
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let polar_cap_texture_view = polar_cap_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         // ── Depth texture ──
         let (surface_width, surface_height) = gpu
             .surface
@@ -257,13 +274,14 @@ impl TileRenderer {
         log::info!("TileRenderer created (format: {:?}, depth: {:?})", format, depth_format);
 
         Self {
-            pipeline,
             globe_pipeline,
+            centered_pipeline,
             _viewport_bgl,
             tile_bgl,
             viewport_buffer,
             viewport_bg,
             sampler,
+            polar_cap_texture_view,
             depth_view,
             depth_format,
             surface_width,
@@ -313,23 +331,20 @@ impl TileRenderer {
         }
     }
 
-    /// Prepare a tile for rendering: create uniform buffer + bind group.
-    ///
-    /// Uses display_x from the `RenderableTile` for antimeridian wrapping.
-    fn prepare_tile(
+    /// Prepare a tile for globe rendering: uses 3D sphere uniforms.
+    fn prepare_tile_globe(
         &self,
         gpu: &GpuContext,
         rt: &RenderableTile,
         texture_view: &wgpu::TextureView,
         opacity: f32,
         vp_f64: &glam::DMat4,
-        mode: x_planets_math::ProjectionMode,
     ) -> PreparedTile {
-        let uniforms = tile_uniforms_for_visible_projected(rt, opacity, vp_f64, mode);
-        let buffer = gpu.create_uniform_buffer("tile-uniforms", &uniforms);
+        let uniforms = tile_uniforms_for_globe(rt, opacity, vp_f64);
+        let buffer = gpu.create_uniform_buffer("globe-tile-uniforms", &uniforms);
 
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("tile-bg"),
+            label: Some("globe-tile-bg"),
             layout: &self.tile_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -353,20 +368,23 @@ impl TileRenderer {
         }
     }
 
-    /// Prepare a tile for globe rendering: uses 3D sphere uniforms.
-    fn prepare_tile_globe(
+    /// Prepare a tile for centered Mercator rendering: uses oblique Mercator uniforms.
+    fn prepare_tile_centered(
         &self,
         gpu: &GpuContext,
         rt: &RenderableTile,
         texture_view: &wgpu::TextureView,
         opacity: f32,
         vp_f64: &glam::DMat4,
+        center_lat_rad: f64,
+        center_lon_rad: f64,
     ) -> PreparedTile {
-        let uniforms = tile_uniforms_for_globe(rt, opacity, vp_f64);
-        let buffer = gpu.create_uniform_buffer("globe-tile-uniforms", &uniforms);
+        let uniforms =
+            tile_uniforms_for_centered(rt, opacity, vp_f64, center_lat_rad, center_lon_rad);
+        let buffer = gpu.create_uniform_buffer("centered-tile-uniforms", &uniforms);
 
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("globe-tile-bg"),
+            label: Some("centered-tile-bg"),
             layout: &self.tile_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -569,6 +587,41 @@ impl TileRenderer {
                     })
                     .collect();
 
+                // ── Polar cap buffers ──
+                let (cap_verts, cap_idxs) = build_polar_caps();
+                let cap_idx_count = cap_idxs.len() as u32;
+                let cap_vb = gpu.create_vertex_buffer("polar-cap-vertices", &cap_verts);
+                let cap_ib = gpu.create_index_buffer("polar-cap-indices", &cap_idxs);
+                // Cap uses VP directly (no per-tile model translation)
+                let cap_mvp = vp_f64.as_mat4();
+                let cap_uniforms = x_planets_math::TileUniforms {
+                    mvp: cap_mvp.to_cols_array(),
+                    bounds: [0.0; 4],
+                    meta: [0.0, 1.0, 0.0, 0.0], // zoom=0, opacity=1
+                    uv_rect: [0.0, 0.0, 1.0, 1.0],
+                };
+                let cap_uniform_buf = gpu.create_uniform_buffer("polar-cap-uniforms", &cap_uniforms);
+                let cap_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("polar-cap-bg"),
+                    layout: &self.tile_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: cap_uniform_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.polar_cap_texture_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                });
+
                 {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("globe-render-pass"),
@@ -603,23 +656,34 @@ impl TileRenderer {
                         pass.draw_indexed(idx_offset..idx_offset + count, 0, 0..1);
                         idx_offset += count;
                     }
+
+                    // ── Polar caps (fill holes at ±85.05° to ±90°) ──
+                    pass.set_vertex_buffer(0, cap_vb.slice(..));
+                    pass.set_index_buffer(cap_ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_bind_group(1, &cap_bg, &[]);
+                    pass.draw_indexed(0..cap_idx_count, 0, 0..1);
                 }
             } else {
-                // ── Flat path: 2D quad mesh ──
-                let coords: Vec<TileCoord> = layer.tiles.iter().map(|t| t.coord).collect();
-                let (vertices, indices) = build_tile_mesh_projected(&coords, mode);
+                // ── Centered Mercator path: tessellated oblique Mercator mesh ──
+                // Tiles are re-projected through oblique Mercator centered on
+                // the viewport center, minimising distortion near the view.
+                let center_lat_rad = viewport.center.lat.to_radians();
+                let center_lon_rad = viewport.center.lon.to_radians();
 
-                if vertices.is_empty() {
+                let (centered_verts, centered_idxs, tile_idx_counts) =
+                    build_centered_tile_mesh(&layer.tiles, center_lat_rad, center_lon_rad);
+
+                if centered_verts.is_empty() {
                     continue;
                 }
 
                 let vertex_buffer = gpu.create_vertex_buffer(
-                    &format!("tile-vertices-{}", layer.name),
-                    &vertices,
+                    &format!("centered-vertices-{}", layer.name),
+                    &centered_verts,
                 );
                 let index_buffer = gpu.create_index_buffer(
-                    &format!("tile-indices-{}", layer.name),
-                    &indices,
+                    &format!("centered-indices-{}", layer.name),
+                    &centered_idxs,
                 );
 
                 let prepared: Vec<PreparedTile> = layer
@@ -632,14 +696,22 @@ impl TileRenderer {
                                 .get(&rt.coord)
                                 .copied()
                                 .unwrap_or(layer.opacity);
-                            self.prepare_tile(gpu, rt, tex_view, tile_opacity, &vp_f64, mode)
+                            self.prepare_tile_centered(
+                                gpu,
+                                rt,
+                                tex_view,
+                                tile_opacity,
+                                &vp_f64,
+                                center_lat_rad,
+                                center_lon_rad,
+                            )
                         })
                     })
                     .collect();
 
                 {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("tile-render-pass"),
+                        label: Some("centered-render-pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: target,
                             resolve_target: None,
@@ -659,15 +731,17 @@ impl TileRenderer {
                         ..Default::default()
                     });
 
-                    pass.set_pipeline(&self.pipeline);
+                    pass.set_pipeline(&self.centered_pipeline);
                     pass.set_bind_group(0, &self.viewport_bg, &[]);
                     pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                     pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
+                    let mut idx_offset = 0u32;
                     for (i, tile) in prepared.iter().enumerate() {
                         pass.set_bind_group(1, &tile.bind_group, &[]);
-                        let start = (i * 6) as u32;
-                        pass.draw_indexed(start..start + 6, 0, 0..1);
+                        let count = tile_idx_counts[i];
+                        pass.draw_indexed(idx_offset..idx_offset + count, 0, 0..1);
+                        idx_offset += count;
                     }
                 }
             }

@@ -274,6 +274,139 @@ pub fn tile_globe_mesh(
     (vertices, indices)
 }
 
+/// Subdivisions for centered Mercator tessellation.
+///
+/// Same logic as globe — lower zoom needs more subdivisions because tiles
+/// cover a larger angular extent and the oblique reprojection curves them.
+pub fn centered_subdivisions(zoom: u8) -> u32 {
+    match zoom {
+        0..=2 => 16,
+        3..=5 => 8,
+        6..=9 => 4,
+        _ => 2,
+    }
+}
+
+/// Build a tessellated mesh for a tile using oblique (viewport-centered) Mercator.
+///
+/// Each vertex is projected through `oblique_mercator(lat, lon, center)` and
+/// placed in 3D with z=0 (uses `GlobeTileVertex` layout for pipeline reuse).
+/// `tile_center_2d` is the tile center in centered Mercator [0,1]² space.
+pub fn tile_centered_mesh(
+    coord: &x_planets_math::TileCoord,
+    center_lat_rad: f64,
+    center_lon_rad: f64,
+    tile_center_2d: glam::DVec2,
+) -> (Vec<GlobeTileVertex>, Vec<u32>) {
+    use std::f64::consts::PI;
+
+    let subdiv = centered_subdivisions(coord.z);
+    let seg = subdiv + 1;
+    let n = coord.extent() as f64;
+    let mut vertices = Vec::with_capacity((seg * seg) as usize);
+    let mut indices = Vec::with_capacity((subdiv * subdiv * 6) as usize);
+
+    for j in 0..=subdiv {
+        for i in 0..=subdiv {
+            let u = i as f64 / subdiv as f64;
+            let v = j as f64 / subdiv as f64;
+
+            let mx = (coord.x as f64 + u) / n;
+            let my = (coord.y as f64 + v) / n;
+
+            // Standard Mercator → lat/lon
+            let lon_rad = (mx * 2.0 - 1.0) * PI;
+            let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+
+            // Oblique (centered) Mercator
+            let centered = x_planets_math::oblique_mercator(
+                lat_rad,
+                lon_rad,
+                center_lat_rad,
+                center_lon_rad,
+            );
+
+            // RTE: subtract tile center in 2D
+            let rx = (centered.x - tile_center_2d.x) as f32;
+            let ry = (centered.y - tile_center_2d.y) as f32;
+
+            vertices.push(GlobeTileVertex {
+                position: [rx, ry, 0.0], // flat, z=0
+                tex_coord: [u as f32, v as f32],
+            });
+        }
+    }
+
+    // Triangle indices (standard grid, no back-face culling needed for 2D)
+    for j in 0..subdiv {
+        for i in 0..subdiv {
+            let tl = j * seg + i;
+            let tr = j * seg + i + 1;
+            let bl = (j + 1) * seg + i;
+            let br = (j + 1) * seg + i + 1;
+            indices.extend_from_slice(&[tl, tr, bl, bl, tr, br]);
+        }
+    }
+
+    (vertices, indices)
+}
+
+/// Number of segments for each polar cap ring.
+const POLAR_CAP_SEGMENTS: u32 = 64;
+
+/// Build a polar cap mesh (triangle fan from the pole to ±85.05° latitude).
+///
+/// `north`: true for north pole, false for south pole.
+/// Returns (vertices, indices) with positions *not* RTE (absolute unit sphere coords).
+/// The caller adds a center at the pole and the cap fills the gap
+/// where no Mercator tiles exist.
+pub fn polar_cap_mesh(north: bool) -> (Vec<GlobeTileVertex>, Vec<u32>) {
+    use std::f64::consts::PI;
+
+    // Mercator tile boundary latitude (rad)
+    let cap_lat_deg: f64 = if north { 85.05112878 } else { -85.05112878 };
+    let pole_lat_deg: f64 = if north { 90.0 } else { -90.0 };
+    let cap_lat = cap_lat_deg.to_radians();
+    let pole_lat = pole_lat_deg.to_radians();
+
+    // Pole center vertex
+    let pole_center = x_planets_math::geo_to_unit_sphere(pole_lat, 0.0);
+
+    let seg = POLAR_CAP_SEGMENTS;
+    let mut vertices = Vec::with_capacity(seg as usize + 1);
+    let mut indices = Vec::with_capacity(seg as usize * 3);
+
+    // Vertex 0 = pole
+    vertices.push(GlobeTileVertex {
+        position: [pole_center.x as f32, pole_center.y as f32, pole_center.z as f32],
+        tex_coord: [0.5, 0.5],
+    });
+
+    // Ring of vertices at cap latitude
+    for i in 0..=seg {
+        let t = i as f64 / seg as f64;
+        let lon = t * 2.0 * PI - PI;
+        let pos = x_planets_math::geo_to_unit_sphere(cap_lat, lon);
+        vertices.push(GlobeTileVertex {
+            position: [pos.x as f32, pos.y as f32, pos.z as f32],
+            tex_coord: [t as f32, if north { 0.0 } else { 1.0 }],
+        });
+    }
+
+    // Triangle fan indices (CCW from outside for back-face culling)
+    for i in 0..seg {
+        if north {
+            // North: pole at top, ring going counter-clockwise from outside
+            indices.extend_from_slice(&[0, i + 2, i + 1]);
+        } else {
+            // South: opposite winding
+            indices.extend_from_slice(&[0, i + 1, i + 2]);
+        }
+    }
+
+    (vertices, indices)
+}
+
 /// Vertex layout for terrain tile rendering (3D displaced positions + normals).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

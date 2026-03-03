@@ -54,7 +54,12 @@ impl AnimationState {
             || !self.tile_fade_start.is_empty()
     }
 
-    pub fn tick_zoom(&mut self, engine: &mut MapEngine, dt: f64) {
+    pub fn tick_zoom_for_mode(
+        &mut self,
+        engine: &mut MapEngine,
+        dt: f64,
+        mode: x_planets_math::ProjectionMode,
+    ) {
         let current = engine.viewport.zoom;
         let target = self
             .zoom_target
@@ -70,19 +75,24 @@ impl AnimationState {
         let new_zoom = exp_decay(current, target, ZOOM_ANIM_SPEED, dt);
         let delta = new_zoom - current;
         match self.zoom_anchor {
-            Some((mx, my)) => engine.zoom_at(delta, mx, my),
+            Some((mx, my)) => engine.zoom_at_for_mode(delta, mx, my, mode),
             None => engine.zoom(delta),
         }
     }
 
-    pub fn tick_pan(&mut self, engine: &mut MapEngine, dt: f64) {
+    pub fn tick_pan_for_mode(
+        &mut self,
+        engine: &mut MapEngine,
+        dt: f64,
+        mode: x_planets_math::ProjectionMode,
+    ) {
         let (vx, vy) = self.pan_velocity;
         let speed = (vx * vx + vy * vy).sqrt();
         if speed < INERTIA_MIN_SPEED {
             self.pan_velocity = (0.0, 0.0);
             return;
         }
-        engine.pan(vx * dt, -(vy * dt));
+        engine.pan_for_mode(vx * dt, -(vy * dt), mode);
         let friction = (-INERTIA_FRICTION * dt).exp();
         self.pan_velocity = (vx * friction, vy * friction);
     }

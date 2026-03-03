@@ -407,6 +407,82 @@ pub fn geo_to_unit_sphere(lat_rad: f64, lon_rad: f64) -> DVec3 {
     )
 }
 
+/// Oblique Mercator projection centered on a given reference point.
+///
+/// Rotates the sphere so `(center_lat_rad, center_lon_rad)` maps to the
+/// equator/prime-meridian, then applies standard Web Mercator.
+/// This minimizes distortion near the viewport center.
+///
+/// Returns coordinates in [0, 1] × [0, 1] just like standard Mercator,
+/// but centered on the given point instead of (0°, 0°).
+pub fn oblique_mercator(
+    lat_rad: f64,
+    lon_rad: f64,
+    center_lat_rad: f64,
+    center_lon_rad: f64,
+) -> DVec2 {
+    // 1. Convert to 3D unit sphere
+    let p = geo_to_unit_sphere(lat_rad, lon_rad);
+
+    // 2. Rotate by -center_lon around Z axis (align center longitude to prime meridian)
+    let sin_clon = center_lon_rad.sin();
+    let cos_clon = center_lon_rad.cos();
+    let rx = p.x * cos_clon + p.y * sin_clon;
+    let ry = -p.x * sin_clon + p.y * cos_clon;
+    let rz = p.z;
+
+    // 3. Rotate by -center_lat around Y axis (align center latitude to equator)
+    let sin_clat = center_lat_rad.sin();
+    let cos_clat = center_lat_rad.cos();
+    let fx = rx * cos_clat + rz * sin_clat;
+    let fy = ry;
+    let fz = -rx * sin_clat + rz * cos_clat;
+
+    // 4. Convert back to lat/lon in the rotated frame
+    let rot_lat = fz.asin();
+    let rot_lon = fy.atan2(fx);
+
+    // 5. Standard Mercator of the rotated coordinates
+    let x = (rot_lon + PI) / (2.0 * PI);
+    let y = (1.0 - (rot_lat.tan() + 1.0 / rot_lat.cos()).ln() / PI) / 2.0;
+    DVec2::new(x, y)
+}
+
+/// Inverse of [`oblique_mercator`]: convert centered Mercator back to geographic (radians).
+pub fn oblique_mercator_inverse(
+    merc: DVec2,
+    center_lat_rad: f64,
+    center_lon_rad: f64,
+) -> (f64, f64) {
+    // 1. Inverse standard Mercator → rotated lat/lon
+    let rot_lon = merc.x * 2.0 * PI - PI;
+    let rot_lat = (PI * (1.0 - 2.0 * merc.y)).sinh().atan();
+
+    // 2. Convert to 3D
+    let fx = rot_lat.cos() * rot_lon.cos();
+    let fy = rot_lat.cos() * rot_lon.sin();
+    let fz = rot_lat.sin();
+
+    // 3. Inverse latitude rotation (+center_lat around Y)
+    let sin_clat = center_lat_rad.sin();
+    let cos_clat = center_lat_rad.cos();
+    let rx = fx * cos_clat - fz * sin_clat;
+    let ry = fy;
+    let rz = fx * sin_clat + fz * cos_clat;
+
+    // 4. Inverse longitude rotation (+center_lon around Z)
+    let sin_clon = center_lon_rad.sin();
+    let cos_clon = center_lon_rad.cos();
+    let px = rx * cos_clon - ry * sin_clon;
+    let py = rx * sin_clon + ry * cos_clon;
+    let pz = rz;
+
+    // 5. Convert back to lat/lon
+    let lat_rad = pz.asin();
+    let lon_rad = py.atan2(px);
+    (lat_rad, lon_rad)
+}
+
 // ---------------------------------------------------------------------------
 // Convex Polygon 2D (for precise frustum culling)
 // ---------------------------------------------------------------------------
