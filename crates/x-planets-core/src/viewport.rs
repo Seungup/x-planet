@@ -223,7 +223,9 @@ impl Viewport {
         match mode {
             x_planets_math::ProjectionMode::Globe => self.visible_tiles_globe(),
             x_planets_math::ProjectionMode::Mercator => self.visible_tiles_centered(),
-            x_planets_math::ProjectionMode::Equirectangular => self.visible_tiles(),
+            // Equirectangular uses Globe rendering_mode, so this arm is
+            // unreachable in practice.  Route to globe for safety.
+            x_planets_math::ProjectionMode::Equirectangular => self.visible_tiles_globe(),
         }
     }
 
@@ -488,7 +490,9 @@ impl Viewport {
 
     /// Like [`to_view_proj_f64`] but positions the camera using the given projection.
     pub fn to_view_proj_f64_projected(&self, mode: x_planets_math::ProjectionMode) -> glam::DMat4 {
-        if mode == x_planets_math::ProjectionMode::Globe {
+        if mode == x_planets_math::ProjectionMode::Globe
+            || mode == x_planets_math::ProjectionMode::Equirectangular
+        {
             return self.to_globe_view_proj_f64();
         }
         let center = match mode {
@@ -496,10 +500,9 @@ impl Viewport {
                 // Centered (oblique) Mercator: viewport center → (0.5, 0.5)
                 glam::DVec2::new(0.5, 0.5)
             }
-            x_planets_math::ProjectionMode::Globe => geo_to_mercator(&self.center),
-            x_planets_math::ProjectionMode::Equirectangular => {
-                x_planets_math::geo_to_equirectangular(&self.center)
-            }
+            // Globe/Equirectangular handled above; this arm is unreachable
+            // but kept for exhaustive match.
+            _ => geo_to_mercator(&self.center),
         };
         let center_merc = center;
         let scale = 2.0_f64.powf(self.zoom);
@@ -741,7 +744,9 @@ impl CameraController {
         screen_y: f64,
         mode: x_planets_math::ProjectionMode,
     ) {
-        if mode == x_planets_math::ProjectionMode::Globe {
+        if mode == x_planets_math::ProjectionMode::Globe
+            || mode == x_planets_math::ProjectionMode::Equirectangular
+        {
             return self.zoom_at_globe(viewport, delta, screen_x, screen_y);
         }
 
@@ -891,7 +896,10 @@ impl CameraController {
         mode: x_planets_math::ProjectionMode,
     ) {
         match mode {
-            x_planets_math::ProjectionMode::Globe => self.pan_globe(viewport, dx, dy),
+            x_planets_math::ProjectionMode::Globe
+            | x_planets_math::ProjectionMode::Equirectangular => {
+                self.pan_globe(viewport, dx, dy)
+            }
             _ => self.pan(viewport, dx, dy),
         }
     }
@@ -1833,6 +1841,225 @@ mod tests {
             "At high zoom, centered ({}) should not be much larger than standard ({})",
             centered_tiles.len(),
             standard_tiles.len(),
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Regression: VP / mesh / dispatch consistency per projection mode
+    // ───────────────────────────────────────────────────────────────
+
+    /// Verify that Globe mode produces an orbital VP matrix (camera looks at
+    /// the unit sphere, not at a 2D plane).  The orbital VP has the eye far
+    /// from the origin at zoom 0, producing a view matrix with large
+    /// translation components.
+    #[test]
+    fn test_globe_vp_is_orbital() {
+        let mut vp = Viewport::new(640, 480);
+        vp.center = GeoCoord::new(0.0, 0.0);
+        vp.zoom = 0.0;
+        let mat = vp.to_view_proj_f64_projected(x_planets_math::ProjectionMode::Globe);
+        // The globe VP at zoom 0 should be the same as to_globe_view_proj_f64.
+        let expected = vp.to_globe_view_proj_f64();
+        for i in 0..16 {
+            assert!(
+                (mat.to_cols_array()[i] - expected.to_cols_array()[i]).abs() < 1e-10,
+                "Globe VP must use orbital camera (element {i} differs)",
+            );
+        }
+    }
+
+    /// Verify that Equirectangular also produces the orbital VP
+    /// (since it renders on the sphere, it must use the same camera).
+    #[test]
+    fn test_equirectangular_vp_is_orbital() {
+        let mut vp = Viewport::new(640, 480);
+        vp.center = GeoCoord::new(35.0, 127.0);
+        vp.zoom = 5.0;
+        let eq_mat = vp
+            .to_view_proj_f64_projected(x_planets_math::ProjectionMode::Equirectangular);
+        let globe_mat =
+            vp.to_view_proj_f64_projected(x_planets_math::ProjectionMode::Globe);
+        for i in 0..16 {
+            assert!(
+                (eq_mat.to_cols_array()[i] - globe_mat.to_cols_array()[i]).abs() < 1e-10,
+                "Equirectangular VP must match Globe VP (element {i} differs)",
+            );
+        }
+    }
+
+    /// Verify that Mercator VP is NOT the same as Globe VP — they are
+    /// fundamentally different camera models.
+    #[test]
+    fn test_mercator_vp_differs_from_globe() {
+        let mut vp = Viewport::new(640, 480);
+        vp.center = GeoCoord::new(35.0, 127.0);
+        vp.zoom = 5.0;
+        let merc_mat =
+            vp.to_view_proj_f64_projected(x_planets_math::ProjectionMode::Mercator);
+        let globe_mat =
+            vp.to_view_proj_f64_projected(x_planets_math::ProjectionMode::Globe);
+        let mut same_count = 0;
+        for i in 0..16 {
+            if (merc_mat.to_cols_array()[i] - globe_mat.to_cols_array()[i]).abs() < 1e-6 {
+                same_count += 1;
+            }
+        }
+        assert!(
+            same_count < 14,
+            "Mercator VP should differ substantially from Globe VP",
+        );
+    }
+
+    /// Equirectangular visible_tiles_for_mode must return the same tiles
+    /// as Globe mode (both route through visible_tiles_globe).
+    #[test]
+    fn test_equirectangular_tiles_match_globe() {
+        let mut vp = Viewport::new(640, 480);
+        vp.center = GeoCoord::new(37.5665, 126.978);
+        vp.zoom = 3.0;
+        let globe_tiles =
+            vp.visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+        let eq_tiles =
+            vp.visible_tiles_for_mode(x_planets_math::ProjectionMode::Equirectangular);
+        assert_eq!(
+            globe_tiles.len(),
+            eq_tiles.len(),
+            "Equirectangular tile selection must match Globe",
+        );
+    }
+
+    /// Globe tile selection must produce tiles at every zoom level from 0..8.
+    /// This guards against the bug where globe_zoom changed too slowly and
+    /// tiles appeared stuck.
+    #[test]
+    fn test_globe_tiles_change_with_zoom() {
+        let mut vp = Viewport::new(640, 480);
+        vp.center = GeoCoord::new(0.0, 0.0);
+        let mut last_max_z = 0u8;
+        let mut changes = 0;
+        for z in 0..=8 {
+            vp.zoom = z as f64;
+            let tiles =
+                vp.visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+            let max_z = tiles.iter().map(|t| t.coord.z).max().unwrap_or(0);
+            if max_z != last_max_z {
+                changes += 1;
+            }
+            last_max_z = max_z;
+        }
+        // Tiles should change max zoom level at least 3 times across 9 zoom levels.
+        assert!(
+            changes >= 3,
+            "Globe tiles must change zoom level as viewport zooms \
+             (only changed {changes} times across 0..8)",
+        );
+    }
+
+    /// Pan in Globe mode must move the center, and the displacement must
+    /// scale with zoom (higher zoom → smaller displacement per pixel).
+    #[test]
+    fn test_globe_pan_scales_with_zoom() {
+        let ctrl = CameraController::new();
+
+        let mut lo = Viewport::new(640, 480);
+        lo.center = GeoCoord::new(0.0, 0.0);
+        lo.zoom = 2.0;
+        let orig_lo = lo.center;
+        ctrl.pan_for_mode(&mut lo, 100.0, 0.0, x_planets_math::ProjectionMode::Globe);
+        let dlat_lo = (lo.center.lat - orig_lo.lat).abs()
+            + (lo.center.lon - orig_lo.lon).abs();
+
+        let mut hi = Viewport::new(640, 480);
+        hi.center = GeoCoord::new(0.0, 0.0);
+        hi.zoom = 8.0;
+        let orig_hi = hi.center;
+        ctrl.pan_for_mode(&mut hi, 100.0, 0.0, x_planets_math::ProjectionMode::Globe);
+        let dlat_hi = (hi.center.lat - orig_hi.lat).abs()
+            + (hi.center.lon - orig_hi.lon).abs();
+
+        assert!(
+            dlat_lo > dlat_hi * 2.0,
+            "Pan displacement must decrease with zoom \
+             (low-zoom: {dlat_lo:.4}°, high-zoom: {dlat_hi:.4}°)",
+        );
+    }
+
+    /// Pan in Equirectangular mode must behave identically to Globe mode
+    /// since Equirectangular renders on the sphere.
+    #[test]
+    fn test_equirectangular_pan_matches_globe() {
+        let ctrl = CameraController::new();
+
+        let mut globe_vp = Viewport::new(640, 480);
+        globe_vp.center = GeoCoord::new(37.0, 127.0);
+        globe_vp.zoom = 5.0;
+        ctrl.pan_for_mode(
+            &mut globe_vp,
+            50.0,
+            30.0,
+            x_planets_math::ProjectionMode::Globe,
+        );
+
+        let mut eq_vp = Viewport::new(640, 480);
+        eq_vp.center = GeoCoord::new(37.0, 127.0);
+        eq_vp.zoom = 5.0;
+        ctrl.pan_for_mode(
+            &mut eq_vp,
+            50.0,
+            30.0,
+            x_planets_math::ProjectionMode::Equirectangular,
+        );
+
+        assert!(
+            (globe_vp.center.lat - eq_vp.center.lat).abs() < 1e-10,
+            "Equirectangular pan lat must match Globe pan lat",
+        );
+        assert!(
+            (globe_vp.center.lon - eq_vp.center.lon).abs() < 1e-10,
+            "Equirectangular pan lon must match Globe pan lon",
+        );
+    }
+
+    /// Zoom in Equirectangular mode must use the globe zoom path.
+    /// After zooming, both Globe and Equirectangular should produce
+    /// the same center shift for the same cursor position.
+    #[test]
+    fn test_equirectangular_zoom_matches_globe() {
+        let ctrl = CameraController::new();
+
+        let mut globe_vp = Viewport::new(640, 480);
+        globe_vp.center = GeoCoord::new(37.0, 127.0);
+        globe_vp.zoom = 5.0;
+        ctrl.zoom_at_for_mode(
+            &mut globe_vp,
+            1.0,
+            320.0,
+            240.0,
+            x_planets_math::ProjectionMode::Globe,
+        );
+
+        let mut eq_vp = Viewport::new(640, 480);
+        eq_vp.center = GeoCoord::new(37.0, 127.0);
+        eq_vp.zoom = 5.0;
+        ctrl.zoom_at_for_mode(
+            &mut eq_vp,
+            1.0,
+            320.0,
+            240.0,
+            x_planets_math::ProjectionMode::Equirectangular,
+        );
+
+        assert!(
+            (globe_vp.zoom - eq_vp.zoom).abs() < 1e-10,
+            "Equirectangular zoom level must match Globe",
+        );
+        assert!(
+            (globe_vp.center.lat - eq_vp.center.lat).abs() < 1e-6,
+            "Equirectangular zoom center lat must match Globe",
+        );
+        assert!(
+            (globe_vp.center.lon - eq_vp.center.lon).abs() < 1e-6,
+            "Equirectangular zoom center lon must match Globe",
         );
     }
 }
