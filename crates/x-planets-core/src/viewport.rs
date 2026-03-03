@@ -678,14 +678,14 @@ impl CameraController {
         screen_x: f64,
         screen_y: f64,
     ) {
-        // Globe zoom damping: at low zoom, each level halves altitude,
-        // causing a huge visual change. Smoothly ramp from 30% to 100%
-        // sensitivity over zoom 0–4.
-        let damping = if viewport.zoom < 4.0 {
-            0.3 + 0.175 * viewport.zoom
-        } else {
-            1.0
-        };
+        // Globe zoom damping: provide consistent visual zoom speed across
+        // all zoom levels. At low zoom (z<3), altitude halves dramatically
+        // per step. At high zoom (z>12), the camera is so close that each
+        // step causes hyper-sensitive movement. Damping smooths both extremes.
+        let z = viewport.zoom;
+        let ramp_up = 0.3 + 0.7 / (1.0 + (-1.5 * (z - 2.5)).exp());
+        let ramp_down = 1.0 / (1.0 + 0.02 * (z - 6.0).max(0.0).powi(2));
+        let damping = ramp_up * ramp_down;
         let delta = delta * damping;
 
         // Compute angular offset of cursor from center before zoom.
@@ -1308,6 +1308,91 @@ mod tests {
             viewport.center.lon > 0.0,
             "Zoom at right edge should shift center east, got lon={:.4}",
             viewport.center.lon
+        );
+    }
+
+    #[test]
+    fn test_globe_zoom_damped_at_high_zoom() {
+        // At high zoom (z=15+), zoom should be damped to prevent hyper-sensitivity.
+        let ctrl = CameraController::new();
+
+        // Measure effective zoom delta at medium zoom (z=8)
+        let mut vp_mid = Viewport::new(800, 600);
+        vp_mid.center = GeoCoord::new(0.0, 0.0);
+        vp_mid.zoom = 8.0;
+        let z_before = vp_mid.zoom;
+        ctrl.zoom_at_globe(&mut vp_mid, 0.3, 400.0, 300.0);
+        let dz_mid = (vp_mid.zoom - z_before).abs();
+
+        // Measure effective zoom delta at high zoom (z=18)
+        let mut vp_high = Viewport::new(800, 600);
+        vp_high.center = GeoCoord::new(0.0, 0.0);
+        vp_high.zoom = 18.0;
+        let z_before = vp_high.zoom;
+        ctrl.zoom_at_globe(&mut vp_high, 0.3, 400.0, 300.0);
+        let dz_high = (vp_high.zoom - z_before).abs();
+
+        // High zoom delta should be strictly less than mid zoom delta (damping kicks in)
+        assert!(
+            dz_high < dz_mid,
+            "Zoom at z=18 ({:.4}) should be more damped than at z=8 ({:.4})",
+            dz_high, dz_mid
+        );
+    }
+
+    #[test]
+    fn test_globe_zoom_damping_smooth_no_discontinuity() {
+        // Damping should change smoothly across all zoom levels (no abrupt jumps).
+        let ctrl = CameraController::new();
+        let delta = 0.3;
+        let mut prev_dz = None;
+
+        for z_int in 0..=20 {
+            let z = z_int as f64;
+            let mut vp = Viewport::new(800, 600);
+            vp.center = GeoCoord::new(0.0, 0.0);
+            vp.zoom = z;
+            let z_before = vp.zoom;
+            ctrl.zoom_at_globe(&mut vp, delta, 400.0, 300.0);
+            let dz = (vp.zoom - z_before).abs();
+
+            if let Some(prev) = prev_dz {
+                let ratio: f64 = if prev > 1e-9 { dz / prev } else { 1.0 };
+                assert!(
+                    ratio < 3.0 && ratio > 0.3,
+                    "Zoom damping discontinuity at z={}: dz={:.6}, prev_dz={:.6}, ratio={:.2}",
+                    z, dz, prev, ratio
+                );
+            }
+            prev_dz = Some(dz);
+        }
+    }
+
+    #[test]
+    fn test_globe_zoom_round_trip_preserves_center() {
+        // Zooming in then out by the same amount at screen center should
+        // return to approximately the same viewport center.
+        let ctrl = CameraController::new();
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(35.0, 120.0);
+        viewport.zoom = 10.0;
+
+        let lat_orig = viewport.center.lat;
+        let lon_orig = viewport.center.lon;
+
+        // Zoom in then out at center
+        ctrl.zoom_at_globe(&mut viewport, 3.0, 400.0, 300.0);
+        ctrl.zoom_at_globe(&mut viewport, -3.0, 400.0, 300.0);
+
+        assert!(
+            (viewport.center.lat - lat_orig).abs() < 0.1,
+            "Round-trip lat: orig={:.4}, after={:.4}",
+            lat_orig, viewport.center.lat
+        );
+        assert!(
+            (viewport.center.lon - lon_orig).abs() < 0.1,
+            "Round-trip lon: orig={:.4}, after={:.4}",
+            lon_orig, viewport.center.lon
         );
     }
 }
