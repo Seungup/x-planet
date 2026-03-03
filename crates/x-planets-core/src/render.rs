@@ -280,9 +280,10 @@ pub fn tile_globe_mesh(
 /// cover a larger angular extent and the oblique reprojection curves them.
 pub fn centered_subdivisions(zoom: u8) -> u32 {
     match zoom {
-        0..=2 => 16,
-        3..=5 => 8,
-        6..=9 => 4,
+        0..=2 => 32,
+        3..=5 => 16,
+        6..=9 => 8,
+        10..=13 => 4,
         _ => 2,
     }
 }

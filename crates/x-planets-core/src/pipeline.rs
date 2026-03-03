@@ -323,6 +323,40 @@ fn centered_tile_center(
     x_planets_math::oblique_mercator(lat_rad, lon_rad, center_lat_rad, center_lon_rad)
 }
 
+/// Angular-distance threshold (degrees) for the oblique Mercator
+/// singularity guard.  The winding check in `tile_centered_mesh` is
+/// the real safeguard; this pre-filter only avoids wasting work on
+/// tiles that are deep behind the singularity.
+///
+/// Returns the threshold in degrees.
+pub fn centered_angular_threshold_deg(zoom: f64) -> f64 {
+    if zoom < 4.0 { 89.0 } else { 85.0 }
+}
+
+/// Returns `true` if a tile passes the angular-distance pre-filter
+/// for the centered Mercator rendering path.
+///
+/// Pure function.  Mirrors the filter in `TileRenderer::render_frame_layered_projected`.
+pub fn tile_passes_angular_filter(
+    tile: &RenderableTile,
+    viewport_center_lat_rad: f64,
+    viewport_center_lon_rad: f64,
+    zoom: f64,
+) -> bool {
+    let center_sphere =
+        x_planets_math::geo_to_unit_sphere(viewport_center_lat_rad, viewport_center_lon_rad);
+    let cos_threshold = centered_angular_threshold_deg(zoom).to_radians().cos();
+
+    let n = tile.coord.extent() as f64;
+    let mx = (tile.display_x as f64 + 0.5) / n;
+    let my = (tile.coord.y as f64 + 0.5) / n;
+    let lon_rad = (mx * 2.0 - 1.0) * std::f64::consts::PI;
+    let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+    let tile_sphere = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
+    let cos_angle = center_sphere.dot(tile_sphere);
+    cos_angle > cos_threshold
+}
+
 /// Build tessellated centered-Mercator meshes for all tiles.
 ///
 /// Tiles are projected through oblique Mercator centered on
@@ -3197,6 +3231,256 @@ mod tests {
             "far tile should have <= indices than near tile: {} vs {}",
             counts_far[0],
             counts_near[0]
+        );
+    }
+
+    // ── End-to-end: visible tiles → angular filter → mesh coverage ──
+
+    /// Helper: build RenderableTile from a VisibleTile.
+    fn renderable(vt: &VisibleTile) -> RenderableTile {
+        RenderableTile {
+            coord: vt.coord,
+            texture_coord: vt.coord,
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x: vt.display_x,
+        }
+    }
+
+    // ── End-to-end: visible_tiles → angular filter → mesh ──
+    //
+    // The oblique (centered) Mercator has a mathematical singularity
+    // at 90° from the projection center.  Tiles beyond ~89° CANNOT
+    // be rendered through this projection — the angular filter is
+    // the guard.
+    //
+    // At zoom >= 3 the viewport shows < 45° of the globe, so all
+    // visible tiles are well within the 85° threshold.  At zoom < 3
+    // the viewport spans most of the world and the standard-Mercator
+    // frustum may include tiles on the opposite hemisphere that are
+    // unreachable via oblique Mercator; those are correctly dropped.
+    //
+    // These tests verify the FULL pipeline from tile selection through
+    // mesh generation to ensure the fan/wedge rendering bug is caught.
+
+    /// At zoom 5 (typical desktop), all visible tiles must pass
+    /// the angular filter AND produce non-zero mesh indices.
+    #[test]
+    fn test_e2e_zoom5_all_visible_tiles_have_mesh() {
+        use crate::viewport::Viewport;
+
+        let mut viewport = Viewport::new(1920, 1080);
+        viewport.center = GeoCoord::new(37.5, 127.0);
+        viewport.zoom = 5.0;
+
+        let visible = viewport.visible_tiles();
+        let center_lat_rad = viewport.center.lat.to_radians();
+        let center_lon_rad = viewport.center.lon.to_radians();
+
+        let tiles: Vec<RenderableTile> = visible
+            .iter()
+            .map(|vt| renderable(vt))
+            .filter(|rt| {
+                tile_passes_angular_filter(
+                    rt,
+                    center_lat_rad,
+                    center_lon_rad,
+                    viewport.zoom,
+                )
+            })
+            .collect();
+
+        // At zoom 5 the viewport spans ~11° — all tiles must pass
+        assert_eq!(
+            tiles.len(),
+            visible.len(),
+            "at zoom 5 all visible tiles must pass angular filter",
+        );
+
+        // Every tile must produce renderable geometry
+        let (_verts, _idxs, counts) =
+            build_centered_tile_mesh(&tiles, center_lat_rad, center_lon_rad);
+
+        for (i, &count) in counts.iter().enumerate() {
+            assert!(
+                count > 0,
+                "tile {} ({:?}) at zoom 5 must produce mesh indices, got 0",
+                i,
+                tiles[i].coord,
+            );
+        }
+    }
+
+    /// Zoom 3 boundary: the viewport spans ~45° from center.
+    /// The quadtree LOD may include coarser fallback tiles on the
+    /// opposite hemisphere that are unreachable via oblique Mercator.
+    /// At most 1-2 tiles should be dropped; the vast majority pass.
+    #[test]
+    fn test_e2e_zoom3_almost_all_visible_tiles_pass_filter() {
+        use crate::viewport::Viewport;
+
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(37.5, 127.0);
+        viewport.zoom = 3.0;
+
+        let visible = viewport.visible_tiles();
+        let center_lat_rad = viewport.center.lat.to_radians();
+        let center_lon_rad = viewport.center.lon.to_radians();
+
+        let filtered_count = visible
+            .iter()
+            .map(|vt| renderable(vt))
+            .filter(|rt| {
+                tile_passes_angular_filter(
+                    rt,
+                    center_lat_rad,
+                    center_lon_rad,
+                    viewport.zoom,
+                )
+            })
+            .count();
+
+        // At zoom 3 the quadtree may include 1-2 coarse fallback
+        // tiles beyond the oblique Mercator range.  Ensure at least
+        // 90% pass — the old 80° filter dropped ~50%.
+        let pass_ratio = filtered_count as f64 / visible.len() as f64;
+        assert!(
+            pass_ratio >= 0.9,
+            "at zoom 3 at least 90% of visible tiles must pass, got {}/{} ({:.0}%)",
+            filtered_count,
+            visible.len(),
+            pass_ratio * 100.0,
+        );
+    }
+
+    /// Mobile viewport at zoom 10: simulate 375×812 screen.
+    /// All visible tiles must pass the filter AND produce mesh.
+    #[test]
+    fn test_e2e_mobile_zoom10_all_visible_tiles_have_mesh() {
+        use crate::viewport::Viewport;
+
+        let mut viewport = Viewport::new(375, 812);
+        viewport.center = GeoCoord::new(37.5, 127.0);
+        viewport.zoom = 10.0;
+
+        let visible = viewport.visible_tiles();
+        let center_lat_rad = viewport.center.lat.to_radians();
+        let center_lon_rad = viewport.center.lon.to_radians();
+
+        let tiles: Vec<RenderableTile> = visible
+            .iter()
+            .map(|vt| renderable(vt))
+            .filter(|rt| {
+                tile_passes_angular_filter(
+                    rt,
+                    center_lat_rad,
+                    center_lon_rad,
+                    viewport.zoom,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            tiles.len(),
+            visible.len(),
+            "at zoom 10 mobile, all visible tiles must pass angular filter",
+        );
+
+        let (_verts, _idxs, counts) =
+            build_centered_tile_mesh(&tiles, center_lat_rad, center_lon_rad);
+
+        for (i, &count) in counts.iter().enumerate() {
+            assert!(
+                count > 0,
+                "mobile tile {} ({:?}) at zoom 10 must produce mesh indices, got 0",
+                i,
+                tiles[i].coord,
+            );
+        }
+    }
+
+    /// Multiple viewport centers at zoom 8: ensures the fix works
+    /// everywhere, not just Seoul.
+    #[test]
+    fn test_e2e_zoom8_various_centers_all_tiles_have_mesh() {
+        use crate::viewport::Viewport;
+
+        let centers: [(f64, f64); 4] = [
+            (0.0, 0.0),         // equator / prime meridian
+            (37.5, 127.0),      // Seoul
+            (-33.9, 18.4),      // Cape Town
+            (60.0, -120.0),     // Northern Canada
+        ];
+
+        for (lat, lon) in centers {
+            let mut viewport = Viewport::new(800, 600);
+            viewport.center = GeoCoord::new(lat, lon);
+            viewport.zoom = 8.0;
+
+            let visible = viewport.visible_tiles();
+            let center_lat_rad = lat.to_radians();
+            let center_lon_rad = lon.to_radians();
+
+            let tiles: Vec<RenderableTile> = visible
+                .iter()
+                .map(|vt| renderable(vt))
+                .filter(|rt| {
+                    tile_passes_angular_filter(
+                        rt,
+                        center_lat_rad,
+                        center_lon_rad,
+                        viewport.zoom,
+                    )
+                })
+                .collect();
+
+            assert_eq!(
+                tiles.len(),
+                visible.len(),
+                "zoom 8 center ({},{}) all tiles must pass filter",
+                lat, lon,
+            );
+
+            let (_verts, _idxs, counts) =
+                build_centered_tile_mesh(&tiles, center_lat_rad, center_lon_rad);
+
+            for (i, &count) in counts.iter().enumerate() {
+                assert!(
+                    count > 0,
+                    "zoom 8 center ({},{}) tile {} must produce mesh",
+                    lat, lon, i,
+                );
+            }
+        }
+    }
+
+    /// Regression guard: the angular threshold values must stay
+    /// above the minimum floors to prevent the fan/wedge bug.
+    #[test]
+    fn test_angular_threshold_floor() {
+        assert!(
+            centered_angular_threshold_deg(0.0) >= 89.0,
+            "zoom 0 threshold must be >= 89°"
+        );
+        assert!(
+            centered_angular_threshold_deg(3.0) >= 89.0,
+            "zoom 3 threshold must be >= 89° (viewport spans ~45°)"
+        );
+        assert!(
+            centered_angular_threshold_deg(3.9) >= 89.0,
+            "zoom 3.9 threshold must be >= 89°"
+        );
+        assert!(
+            centered_angular_threshold_deg(4.0) >= 85.0,
+            "zoom 4 threshold must be >= 85°"
+        );
+        assert!(
+            centered_angular_threshold_deg(10.0) >= 85.0,
+            "zoom 10 threshold must be >= 85°"
+        );
+        // Must never exceed 89.5° to avoid oblique Mercator singularity at 90°
+        assert!(
+            centered_angular_threshold_deg(0.0) <= 89.5,
+            "threshold must stay below singularity (90°)"
         );
     }
 }
