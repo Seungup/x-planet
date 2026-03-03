@@ -973,4 +973,177 @@ mod tests {
         assert!((center.x - 0.25).abs() < 1e-10);
         assert!((center.y - 0.25).abs() < 1e-10);
     }
+
+    // ── Polar frustum tile selection tests ─────────────────
+
+    #[test]
+    fn test_frustum_visible_tiles_near_north_pole() {
+        // Viewport centered at lat=80° should select tiles near y=0.
+        let center = GeoCoord::new(80.0, 0.0);
+        let center_merc = geo_to_mercator(&center);
+        let zoom = 3u8;
+        let scale = 2.0_f64.powf(-(zoom as f64));
+        let half_h = scale * 1.1;
+        let half_w = scale * (800.0 / 600.0) * 1.1;
+
+        let sw = DVec2::new(
+            center_merc.x - half_w,
+            (center_merc.y + half_h).clamp(0.0, 1.0),
+        );
+        let ne = DVec2::new(
+            center_merc.x + half_w,
+            (center_merc.y - half_h).clamp(0.0, 1.0),
+        );
+
+        let frustum = Frustum2D::with_merc_bounds(
+            BoundingBox::new(
+                mercator_to_geo(DVec2::new(sw.x.clamp(0.0, 1.0), sw.y)),
+                mercator_to_geo(DVec2::new(ne.x.clamp(0.0, 1.0), ne.y)),
+            ),
+            sw,
+            ne,
+        );
+
+        let tiles = frustum.visible_tiles(zoom);
+        assert!(!tiles.is_empty(), "Should have tiles near north pole");
+        assert!(
+            tiles.iter().any(|t| t.coord.y == 0),
+            "Should include northernmost tiles (y=0)"
+        );
+    }
+
+    #[test]
+    fn test_frustum_visible_tiles_near_south_pole() {
+        // Viewport centered at lat=-80° should select tiles near y=max.
+        let center = GeoCoord::new(-80.0, 0.0);
+        let center_merc = geo_to_mercator(&center);
+        let zoom = 3u8;
+        let n = 1u32 << zoom;
+        let scale = 2.0_f64.powf(-(zoom as f64));
+        let half_h = scale * 1.1;
+        let half_w = scale * (800.0 / 600.0) * 1.1;
+
+        let sw = DVec2::new(
+            center_merc.x - half_w,
+            (center_merc.y + half_h).clamp(0.0, 1.0),
+        );
+        let ne = DVec2::new(
+            center_merc.x + half_w,
+            (center_merc.y - half_h).clamp(0.0, 1.0),
+        );
+
+        let frustum = Frustum2D::with_merc_bounds(
+            BoundingBox::new(
+                mercator_to_geo(DVec2::new(sw.x.clamp(0.0, 1.0), sw.y)),
+                mercator_to_geo(DVec2::new(ne.x.clamp(0.0, 1.0), ne.y)),
+            ),
+            sw,
+            ne,
+        );
+
+        let tiles = frustum.visible_tiles(zoom);
+        assert!(!tiles.is_empty(), "Should have tiles near south pole");
+        assert!(
+            tiles.iter().any(|t| t.coord.y == n - 1),
+            "Should include southernmost tiles (y={})",
+            n - 1
+        );
+    }
+
+    #[test]
+    fn test_frustum_at_mercator_boundary_selects_tiles() {
+        // At the Mercator boundary (lat≈85°), the frustum should still produce tiles.
+        let center = GeoCoord::new(85.0, 0.0);
+        let center_merc = geo_to_mercator(&center);
+        let zoom = 2u8;
+        let scale = 2.0_f64.powf(-(zoom as f64));
+        let half_h = scale * 1.1;
+        let half_w = scale * 1.3 * 1.1;
+
+        let sw = DVec2::new(
+            center_merc.x - half_w,
+            (center_merc.y + half_h).clamp(0.0, 1.0),
+        );
+        let ne = DVec2::new(
+            center_merc.x + half_w,
+            (center_merc.y - half_h).clamp(0.0, 1.0),
+        );
+
+        let frustum = Frustum2D::with_merc_bounds(
+            BoundingBox::new(
+                mercator_to_geo(DVec2::new(sw.x.clamp(0.0, 1.0), sw.y)),
+                mercator_to_geo(DVec2::new(ne.x.clamp(0.0, 1.0), ne.y)),
+            ),
+            sw,
+            ne,
+        );
+
+        let tiles = frustum.visible_tiles(zoom);
+        assert!(
+            !tiles.is_empty(),
+            "Should select tiles even at Mercator boundary (lat=85°)"
+        );
+    }
+
+    #[test]
+    fn test_geo_to_unit_sphere_poles() {
+        // North pole should be at (0, 0, 1)
+        let north = geo_to_unit_sphere(std::f64::consts::FRAC_PI_2, 0.0);
+        assert!((north.x).abs() < 1e-10);
+        assert!((north.y).abs() < 1e-10);
+        assert!((north.z - 1.0).abs() < 1e-10);
+
+        // South pole should be at (0, 0, -1)
+        let south = geo_to_unit_sphere(-std::f64::consts::FRAC_PI_2, 0.0);
+        assert!((south.x).abs() < 1e-10);
+        assert!((south.y).abs() < 1e-10);
+        assert!((south.z + 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_geo_to_unit_sphere_equator() {
+        // Equator, prime meridian → (1, 0, 0)
+        let point = geo_to_unit_sphere(0.0, 0.0);
+        assert!((point.x - 1.0).abs() < 1e-10);
+        assert!((point.y).abs() < 1e-10);
+        assert!((point.z).abs() < 1e-10);
+
+        // Equator, 90°E → (0, 1, 0)
+        let east = geo_to_unit_sphere(0.0, std::f64::consts::FRAC_PI_2);
+        assert!((east.x).abs() < 1e-10);
+        assert!((east.y - 1.0).abs() < 1e-10);
+        assert!((east.z).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_mercator_roundtrip_near_poles() {
+        // Mercator roundtrip should work near the boundary latitude.
+        for &lat in &[80.0, -80.0, 84.0, -84.0, 85.0, -85.0] {
+            let original = GeoCoord::new(lat, 30.0);
+            let merc = geo_to_mercator(&original);
+            let recovered = mercator_to_geo(merc);
+            assert!(
+                (original.lat - recovered.lat).abs() < 1e-6,
+                "Roundtrip failed at lat={}: got {:.6}",
+                lat, recovered.lat
+            );
+            assert!(
+                (original.lon - recovered.lon).abs() < 1e-6,
+                "Roundtrip failed at lat={}: lon {:.6} != {:.6}",
+                lat, original.lon, recovered.lon
+            );
+        }
+    }
+
+    #[test]
+    fn test_mercator_y_range_near_poles() {
+        // Mercator y should be within [0, 1] for valid latitudes
+        let north = geo_to_mercator(&GeoCoord::new(85.0, 0.0));
+        let south = geo_to_mercator(&GeoCoord::new(-85.0, 0.0));
+        let equator = geo_to_mercator(&GeoCoord::new(0.0, 0.0));
+
+        assert!(north.y > 0.0 && north.y < 0.1, "North pole merc.y={:.4}", north.y);
+        assert!(south.y > 0.9 && south.y < 1.0, "South pole merc.y={:.4}", south.y);
+        assert!((equator.y - 0.5).abs() < 1e-10, "Equator merc.y={:.4}", equator.y);
+    }
 }
