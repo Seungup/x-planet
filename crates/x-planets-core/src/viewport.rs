@@ -428,7 +428,7 @@ pub struct CameraController {
 impl CameraController {
     pub fn new() -> Self {
         Self {
-            pan_speed: 1.0,
+            pan_speed: 2.0,
             zoom_speed: 1.0,
             min_zoom: 0.0,
             max_zoom: 22.0,

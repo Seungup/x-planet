@@ -105,6 +105,11 @@ fn register_mouse_events(
     app: Rc<RefCell<WebApp>>,
     mouse: Rc<RefCell<MouseDragState>>,
 ) {
+    // Mouse offset_x/y returns CSS pixels, but viewport dimensions are
+    // physical pixels (CSS × DPR).  Scale position-sensitive values by
+    // DPR so pan deltas and zoom anchors match the viewport coordinate space.
+    let dpr = web_sys::window().unwrap().device_pixel_ratio();
+
     // Disable context menu so right-click drag works
     {
         let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::MouseEvent| {
@@ -131,7 +136,7 @@ fn register_mouse_events(
                     if app.anim.check_double_click(pos, now) {
                         // Double-click: smooth zoom in +1 level at cursor
                         app.anim.zoom_target += 1.0;
-                        app.anim.zoom_anchor = Some(pos);
+                        app.anim.zoom_anchor = Some((pos.0 * dpr, pos.1 * dpr));
                     }
 
                     // Stop inertia when starting a new drag
@@ -164,17 +169,17 @@ fn register_mouse_events(
             let mut ms = ms.borrow_mut();
             let mut app = app.borrow_mut();
 
-            // Track mouse position for zoom anchor fallback
-            app.anim.last_mouse_pos = Some((x, y));
+            // Track mouse position for zoom anchor fallback (physical pixels)
+            app.anim.last_mouse_pos = Some((x * dpr, y * dpr));
 
-            // Left-drag: pan
+            // Left-drag: pan (scale delta to physical pixels)
             if ms.left_pressed {
                 if let Some((lx, ly)) = ms.left {
-                    let dx = x - lx;
-                    let dy = y - ly;
+                    let dx = (x - lx) * dpr;
+                    let dy = (y - ly) * dpr;
                     app.engine.pan(dx, -dy);
                 }
-                app.anim.record_drag((x, y), now_secs());
+                app.anim.record_drag((x * dpr, y * dpr), now_secs());
                 ms.left = Some((x, y));
             }
 
@@ -233,11 +238,12 @@ fn register_mouse_events(
 // ═══════════════════════════════════════════════════════════════════
 
 fn register_wheel_event(canvas: &web_sys::HtmlCanvasElement, app: Rc<RefCell<WebApp>>) {
+    let dpr = web_sys::window().unwrap().device_pixel_ratio();
     let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::WheelEvent| {
         e.prevent_default();
         let delta = -e.delta_y() / 300.0;
-        let x = e.offset_x() as f64;
-        let y = e.offset_y() as f64;
+        let x = e.offset_x() as f64 * dpr;
+        let y = e.offset_y() as f64 * dpr;
         let mut app = app.borrow_mut();
         app.anim.zoom_target += delta;
         app.anim.zoom_anchor = Some((x, y));
