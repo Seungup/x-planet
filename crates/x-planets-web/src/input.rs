@@ -41,6 +41,21 @@ fn now_secs() -> f64 {
         / 1000.0
 }
 
+/// Register an event listener with `{ passive: false }` so that
+/// `preventDefault()` actually works. Mobile browsers default touch
+/// and wheel listeners to passive, silently ignoring `preventDefault()`.
+fn add_non_passive_listener(
+    target: &web_sys::EventTarget,
+    event_type: &str,
+    cb: &js_sys::Function,
+) {
+    let opts = web_sys::AddEventListenerOptions::new();
+    opts.set_passive(false);
+    target
+        .add_event_listener_with_callback_and_add_event_listener_options(event_type, cb, &opts)
+        .unwrap();
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Mouse drag state (platform-specific: tracks which buttons are held)
 // ═══════════════════════════════════════════════════════════════════
@@ -227,9 +242,8 @@ fn register_wheel_event(canvas: &web_sys::HtmlCanvasElement, app: Rc<RefCell<Web
         app.anim.zoom_target += delta;
         app.anim.zoom_anchor = Some((x, y));
     });
-    canvas
-        .add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref())
-        .unwrap();
+    // Must be non-passive so preventDefault() stops browser scroll/zoom
+    add_non_passive_listener(canvas, "wheel", cb.as_ref().unchecked_ref());
     cb.forget();
 }
 
@@ -288,7 +302,7 @@ fn register_touch_events(
 ) {
     let dpr = web_sys::window().unwrap().device_pixel_ratio();
 
-    // touchstart
+    // touchstart (must be non-passive so preventDefault() works on mobile)
     {
         let ts = Rc::clone(&touch_state);
         let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::TouchEvent| {
@@ -307,13 +321,11 @@ fn register_touch_events(
                 }
             }
         });
-        canvas
-            .add_event_listener_with_callback("touchstart", cb.as_ref().unchecked_ref())
-            .unwrap();
+        add_non_passive_listener(canvas, "touchstart", cb.as_ref().unchecked_ref());
         cb.forget();
     }
 
-    // touchmove
+    // touchmove (must be non-passive so preventDefault() works on mobile)
     {
         let ts = Rc::clone(&touch_state);
         let app = Rc::clone(&app);
@@ -351,13 +363,11 @@ fn register_touch_events(
                 }
             }
         });
-        canvas
-            .add_event_listener_with_callback("touchmove", cb.as_ref().unchecked_ref())
-            .unwrap();
+        add_non_passive_listener(canvas, "touchmove", cb.as_ref().unchecked_ref());
         cb.forget();
     }
 
-    // touchend / touchcancel
+    // touchend / touchcancel (must be non-passive so preventDefault() works on mobile)
     {
         let ts = Rc::clone(&touch_state);
         let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::TouchEvent| {
@@ -371,12 +381,8 @@ fn register_touch_events(
                 }
             }
         });
-        canvas
-            .add_event_listener_with_callback("touchend", cb.as_ref().unchecked_ref())
-            .unwrap();
-        canvas
-            .add_event_listener_with_callback("touchcancel", cb.as_ref().unchecked_ref())
-            .unwrap();
+        add_non_passive_listener(canvas, "touchend", cb.as_ref().unchecked_ref());
+        add_non_passive_listener(canvas, "touchcancel", cb.as_ref().unchecked_ref());
         cb.forget();
     }
 }

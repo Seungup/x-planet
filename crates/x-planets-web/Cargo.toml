@@ -37,6 +37,8 @@ web-sys = { version = "0.3", features = [
     "Touch",
     "TouchList",
     "KeyboardEvent",
+    # Event listener options (passive: false for touch/wheel)
+    "AddEventListenerOptions",
     # Timing
     "Performance",
 ] }
