@@ -19,6 +19,7 @@ use x_planets_math::{TileCoord, ViewportUniforms};
 use crate::pipeline::{
     build_globe_tile_mesh, build_polar_caps, tile_uniforms_for_globe,
     build_centered_tile_mesh, tile_uniforms_for_centered,
+    build_equirectangular_tile_mesh, tile_uniforms_for_equirectangular,
     tile_passes_angular_filter,
     RenderableTile,
 };
@@ -412,6 +413,43 @@ impl TileRenderer {
         }
     }
 
+    /// Prepare a tile for Equirectangular rendering: flat mesh with Equirectangular uniforms.
+    fn prepare_tile_equirectangular(
+        &self,
+        gpu: &GpuContext,
+        rt: &RenderableTile,
+        texture_view: &wgpu::TextureView,
+        opacity: f32,
+        vp_f64: &glam::DMat4,
+    ) -> PreparedTile {
+        let uniforms = tile_uniforms_for_equirectangular(rt, opacity, vp_f64);
+        let buffer = gpu.create_uniform_buffer("equirect-tile-uniforms", &uniforms);
+
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("equirect-tile-bg"),
+            layout: &self.tile_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+
+        PreparedTile {
+            _buffer: buffer,
+            bind_group,
+        }
+    }
+
     /// Render a single layer of tiles (backward-compatible convenience wrapper).
     ///
     /// `tiles` — renderable tiles (with fallback resolution).
@@ -674,6 +712,85 @@ impl TileRenderer {
                     pass.set_index_buffer(cap_ib.slice(..), wgpu::IndexFormat::Uint32);
                     pass.set_bind_group(1, &cap_bg, &[]);
                     pass.draw_indexed(0..cap_idx_count, 0, 0..1);
+                }
+            } else if mode == x_planets_math::ProjectionMode::Equirectangular {
+                // ── Equirectangular path: tessellated flat mesh ──
+                // Tiles are re-projected from Mercator to Equirectangular
+                // coordinates.  No singularity, no angular filter needed.
+                let renderable_tiles: Vec<&RenderableTile> = layer
+                    .tiles
+                    .iter()
+                    .filter(|rt| layer.texture_views.contains_key(&rt.texture_coord))
+                    .collect();
+
+                let renderable_refs: Vec<RenderableTile> =
+                    renderable_tiles.iter().map(|rt| (*rt).clone()).collect();
+                let (eq_verts, eq_idxs, tile_idx_counts) =
+                    build_equirectangular_tile_mesh(&renderable_refs);
+
+                if eq_verts.is_empty() {
+                    continue;
+                }
+
+                let vertex_buffer = gpu.create_vertex_buffer(
+                    &format!("equirect-vertices-{}", layer.name),
+                    &eq_verts,
+                );
+                let index_buffer = gpu.create_index_buffer(
+                    &format!("equirect-indices-{}", layer.name),
+                    &eq_idxs,
+                );
+
+                let prepared: Vec<PreparedTile> = renderable_tiles
+                    .iter()
+                    .map(|rt| {
+                        let tex_view = layer.texture_views.get(&rt.texture_coord).unwrap();
+                        let tile_opacity = layer
+                            .tile_opacity_overrides
+                            .get(&rt.coord)
+                            .copied()
+                            .unwrap_or(layer.opacity);
+                        self.prepare_tile_equirectangular(
+                            gpu, rt, tex_view, tile_opacity, &vp_f64,
+                        )
+                    })
+                    .collect();
+
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("equirect-render-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: color_load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: depth_load,
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+
+                    // Reuse centered pipeline (same vertex layout, flat z=0 mesh).
+                    pass.set_pipeline(&self.centered_pipeline);
+                    pass.set_bind_group(0, &self.viewport_bg, &[]);
+                    pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
+                    let mut idx_offset = 0u32;
+                    for (i, tile) in prepared.iter().enumerate() {
+                        pass.set_bind_group(1, &tile.bind_group, &[]);
+                        let count = tile_idx_counts[i];
+                        pass.draw_indexed(idx_offset..idx_offset + count, 0, 0..1);
+                        idx_offset += count;
+                    }
                 }
             } else {
                 // ── Centered Mercator path: tessellated oblique Mercator mesh ──

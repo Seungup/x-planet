@@ -371,6 +371,79 @@ pub fn tile_centered_mesh(
     (vertices, indices)
 }
 
+/// Subdivisions for Equirectangular tessellation.
+///
+/// Lower zoom tiles span more latitude range and need more subdivisions
+/// because the Mercator→Equirectangular Y transform is nonlinear.
+/// At high zoom the mapping is nearly linear and fewer subdivisions suffice.
+pub fn equirectangular_subdivisions(zoom: u8) -> u32 {
+    match zoom {
+        0..=2 => 16,
+        3..=5 => 8,
+        6..=9 => 4,
+        _ => 2,
+    }
+}
+
+/// Build a tessellated mesh for a tile in Equirectangular [0,1]² space.
+///
+/// Each vertex is re-projected from Mercator UV to Equirectangular (x, y)
+/// where x = (lon+180)/360, y = (90-lat)/180.  The mesh is flat (z=0)
+/// and uses RTE relative to `tile_center_eq`.
+pub fn tile_equirectangular_mesh(
+    coord: &x_planets_math::TileCoord,
+    tile_center_eq: glam::DVec2,
+) -> (Vec<GlobeTileVertex>, Vec<u32>) {
+    use std::f64::consts::PI;
+
+    let subdiv = equirectangular_subdivisions(coord.z);
+    let seg = subdiv + 1;
+    let n = coord.extent() as f64;
+    let mut vertices = Vec::with_capacity((seg * seg) as usize);
+    let mut indices = Vec::with_capacity((subdiv * subdiv * 6) as usize);
+
+    for j in 0..=subdiv {
+        for i in 0..=subdiv {
+            let u = i as f64 / subdiv as f64;
+            let v = j as f64 / subdiv as f64;
+
+            let mx = (coord.x as f64 + u) / n;
+            let my = (coord.y as f64 + v) / n;
+
+            // Standard Mercator → geographic
+            let lon_rad = (mx * 2.0 - 1.0) * PI;
+            let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+
+            // Geographic → Equirectangular [0,1]²
+            let x_eq = (lon_rad.to_degrees() + 180.0) / 360.0;
+            let y_eq = (90.0 - lat_rad.to_degrees()) / 180.0;
+
+            // RTE: subtract tile center in f64
+            let rx = (x_eq - tile_center_eq.x) as f32;
+            let ry = (y_eq - tile_center_eq.y) as f32;
+
+            vertices.push(GlobeTileVertex {
+                position: [rx, ry, 0.0],
+                tex_coord: [u as f32, v as f32],
+            });
+        }
+    }
+
+    // Triangle indices — Equirectangular has no singularity so no winding check needed.
+    for j in 0..subdiv {
+        for i in 0..subdiv {
+            let tl = j * seg + i;
+            let tr = j * seg + i + 1;
+            let bl = (j + 1) * seg + i;
+            let br = (j + 1) * seg + i + 1;
+            // CCW winding (matches centered Mercator convention)
+            indices.extend_from_slice(&[tl, tr, bl, bl, tr, br]);
+        }
+    }
+
+    (vertices, indices)
+}
+
 /// Number of segments for each polar cap ring.
 const POLAR_CAP_SEGMENTS: u32 = 64;
 

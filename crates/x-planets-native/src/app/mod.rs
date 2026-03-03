@@ -352,10 +352,7 @@ impl NativeApp {
             let gpu = self.gpu.as_ref().unwrap();
             let engine = self.engine.as_ref().unwrap();
 
-            let proj_mode = match engine.active_projection.as_str() {
-                "Equirectangular" => x_planets_math::ProjectionMode::Globe,
-                _ => x_planets_math::ProjectionMode::Mercator,
-            };
+            let proj_mode = engine.rendering_mode();
             renderer.render_frame_layered_projected(gpu, &view, &engine.viewport, &render_layers, proj_mode);
 
             // Render terrain layers (displaced meshes) on top of raster
