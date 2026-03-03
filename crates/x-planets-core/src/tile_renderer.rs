@@ -688,7 +688,13 @@ impl TileRenderer {
                 // center; skip tiles whose angular distance exceeds 80° to
                 // prevent extreme distortion (the V-shape artifact).
                 let center_sphere = x_planets_math::geo_to_unit_sphere(center_lat_rad, center_lon_rad);
-                let cos_threshold = 80.0_f64.to_radians().cos(); // ~0.17
+                // At low zoom the viewport can see most of the world — relax the
+                // singularity guard to 89°.  At higher zoom the visible extent is
+                // small so 85° is generous while still avoiding the Mercator
+                // singularity at exactly 90°.  The winding check in
+                // tile_centered_mesh is the real singularity safeguard.
+                let max_angular_deg: f64 = if viewport.zoom < 3.0 { 89.0 } else { 85.0 };
+                let cos_threshold = max_angular_deg.to_radians().cos();
 
                 let renderable_tiles: Vec<&RenderableTile> = layer
                     .tiles
