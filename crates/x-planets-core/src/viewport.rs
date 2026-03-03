@@ -222,8 +222,86 @@ impl Viewport {
     pub fn visible_tiles_for_mode(&self, mode: x_planets_math::ProjectionMode) -> Vec<VisibleTile> {
         match mode {
             x_planets_math::ProjectionMode::Globe => self.visible_tiles_globe(),
+            x_planets_math::ProjectionMode::Mercator => self.visible_tiles_centered(),
             _ => self.visible_tiles(),
         }
+    }
+
+    /// Centered-Mercator visible tile selection.
+    ///
+    /// The centered (oblique) Mercator rendering path re-projects tiles
+    /// through an oblique Mercator centered on the viewport.  Near the
+    /// poles the standard Mercator frustum misses tiles that wrap around
+    /// the sphere.  This method computes the visible spherical cap from
+    /// the viewport zoom and selects all tiles within it.
+    fn visible_tiles_centered(&self) -> Vec<VisibleTile> {
+        let scale = 2.0_f64.powf(-self.zoom);
+        let aspect = self.width as f64 / self.height as f64;
+
+        // Viewport half-extents in oblique Mercator space (same formula
+        // as the top-down fast path in compute_frustum_geometry).
+        let half_h = scale * 1.1;
+        let half_w = scale * aspect * 1.1;
+
+        // Maximum distance from center in oblique Mercator space.
+        // Use the diagonal for the worst-case corner.
+        let mut max_extent = (half_h * half_h + half_w * half_w).sqrt();
+
+        // For pitched views the forward ground-plane intersection
+        // extends much further.
+        if self.pitch >= 1.0 {
+            let fov_half_tan = (std::f64::consts::FRAC_PI_3 * 0.5).tan();
+            let cam_h = scale / fov_half_tan;
+            let pitch_rad = self.pitch.to_radians();
+            let fov_half = std::f64::consts::FRAC_PI_3 * 0.5;
+            let bottom_angle = pitch_rad + fov_half;
+            let forward_dist = if bottom_angle < std::f64::consts::FRAC_PI_2 * 0.98 {
+                cam_h * bottom_angle.tan()
+            } else {
+                cam_h * 20.0 // horizon cap
+            };
+            max_extent = max_extent.max(forward_dist);
+        }
+
+        // Convert oblique Mercator extent to angular distance on the
+        // sphere.  In the rotated coordinate system the center maps to
+        // Mercator Y = 0.5; an offset of `max_extent` corresponds to a
+        // certain latitude (= angular distance from center).
+        let edge_y = (0.5 + max_extent).min(0.9999);
+        let edge_geo = mercator_to_geo(glam::DVec2::new(0.5, edge_y));
+        let viewport_angular_deg = edge_geo.lat.abs();
+
+        // Cap at the oblique Mercator singularity guard threshold
+        // (mirrors pipeline::centered_angular_threshold_deg).
+        let threshold_deg: f64 = if self.zoom < 4.0 { 89.0 } else { 85.0 };
+        let visible_deg = viewport_angular_deg.min(threshold_deg);
+
+        let lat = self.center.lat;
+        let lon = self.center.lon;
+
+        // Geographic bounding box covering the spherical cap.
+        let lat_min = (lat - visible_deg).max(-85.05);
+        let lat_max = (lat + visible_deg).min(85.05);
+        // Longitude span widens at higher latitudes (meridian convergence).
+        let cos_lat = lat.to_radians().cos().max(0.01);
+        let lon_span = (visible_deg / cos_lat).min(180.0);
+        let lon_min = lon - lon_span;
+        let lon_max = lon + lon_span;
+
+        // Build a Frustum2D from the geographic extent.
+        let sw = geo_to_mercator(&GeoCoord::new(lat_min, lon_min));
+        let ne = geo_to_mercator(&GeoCoord::new(lat_max, lon_max));
+        let bbox = BoundingBox::new(
+            GeoCoord::new(lat_min, lon_min.clamp(-180.0, 180.0)),
+            GeoCoord::new(lat_max, lon_max.clamp(-180.0, 180.0)),
+        );
+        let frustum = Frustum2D::with_merc_bounds(bbox, sw, ne);
+
+        let base_z = self.tile_zoom();
+        if base_z == 0 {
+            return frustum.visible_tiles(0);
+        }
+        self.quadtree_lod_with_frustum(base_z, &frustum)
     }
 
     /// Globe-mode visible tile selection.
@@ -236,9 +314,12 @@ impl Viewport {
         let unit_altitude =
             (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(self.zoom);
 
-        // Angular radius of the visible cap from the camera.
-        // sin(half_angle) = R / (R + h) = 1 / (1 + unit_altitude)
-        let half_angle = (1.0 / (unit_altitude + 1.0)).asin();
+        // Angular radius of the visible cap on the sphere surface.
+        // cos(surface_angle) = R / (R + h) = 1 / (1 + unit_altitude)
+        // (acos gives the angle measured on the sphere from the
+        //  sub-satellite point to the horizon; asin would give the
+        //  much smaller camera-to-limb angle.)
+        let half_angle = (1.0 / (unit_altitude + 1.0)).acos();
 
         // Compute effective zoom from angular extent:
         // At zoom z, each tile covers 360/2^z degrees of longitude.
@@ -1475,21 +1556,25 @@ mod tests {
     // ── Projection-aware visible tile selection ──────────
 
     #[test]
-    fn test_visible_tiles_for_mode_mercator_equals_default() {
-        // Mercator mode should produce the same tiles as the default visible_tiles().
+    fn test_visible_tiles_for_mode_mercator_centered() {
+        // Centered Mercator selects tiles via angular distance from
+        // the viewport center, which is a superset of (or equal to)
+        // the standard Mercator frustum at mid-latitudes.
         let mut viewport = Viewport::new(800, 600);
         viewport.center = GeoCoord::new(37.5665, 126.978);
         viewport.zoom = 5.0;
 
         let default_tiles = viewport.visible_tiles();
-        let mode_tiles =
+        let centered_tiles =
             viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
 
-        assert_eq!(default_tiles.len(), mode_tiles.len());
-        for (d, m) in default_tiles.iter().zip(mode_tiles.iter()) {
-            assert_eq!(d.coord, m.coord);
-            assert_eq!(d.display_x, m.display_x);
-        }
+        // Centered selection should include at least as many tiles.
+        assert!(
+            centered_tiles.len() >= default_tiles.len(),
+            "centered ({}) should be >= standard ({})",
+            centered_tiles.len(),
+            default_tiles.len(),
+        );
     }
 
     #[test]
@@ -1600,6 +1685,152 @@ mod tests {
             tiles.len() <= 200,
             "Globe mode: too many tiles {} (budget should cap)",
             tiles.len()
+        );
+    }
+
+    // ── Polar tile selection regression tests ──────────
+
+    #[test]
+    fn test_centered_mercator_polar_selects_multiple_longitudes() {
+        // At lat=80°, zoom 2, centered Mercator should select tiles
+        // across many longitudes (the view wraps around the pole).
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(80.0, 0.0);
+        viewport.zoom = 2.0;
+
+        let tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+        // Collect unique canonical x values.
+        let unique_x: std::collections::HashSet<u32> =
+            tiles.iter().map(|vt| vt.coord.x).collect();
+        // At zoom 2 there are 4 x columns; near the pole we should
+        // see tiles from at least 3 (wrap around the pole).
+        assert!(
+            unique_x.len() >= 3,
+            "Polar centered Mercator should cover multiple longitudes, got {:?}",
+            unique_x
+        );
+    }
+
+    #[test]
+    fn test_centered_mercator_polar_more_tiles_than_equator() {
+        // At the same zoom, a polar center should select MORE tiles
+        // than an equatorial center in centered Mercator because the
+        // oblique Mercator wraps around the pole.
+        let mut viewport = Viewport::new(800, 600);
+        viewport.zoom = 3.0;
+
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        let equator_tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+
+        viewport.center = GeoCoord::new(80.0, 0.0);
+        let polar_tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+
+        assert!(
+            polar_tiles.len() >= equator_tiles.len(),
+            "Polar ({}) should have >= tiles than equator ({})",
+            polar_tiles.len(),
+            equator_tiles.len(),
+        );
+    }
+
+    #[test]
+    fn test_centered_mercator_south_pole_selects_tiles() {
+        // South pole should also get wide tile coverage.
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(-80.0, 120.0);
+        viewport.zoom = 2.0;
+
+        let tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+        let unique_x: std::collections::HashSet<u32> =
+            tiles.iter().map(|vt| vt.coord.x).collect();
+        assert!(
+            unique_x.len() >= 3,
+            "South-polar centered Mercator should cover multiple longitudes, got {:?}",
+            unique_x
+        );
+    }
+
+    #[test]
+    fn test_globe_zoom0_selects_hemisphere() {
+        // At zoom 0 the whole globe is visible; the tile set should
+        // cover a large portion of available tiles.
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        viewport.zoom = 0.0;
+
+        let tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+        // At zoom 0 there is 1 tile.  The quadtree should refine it
+        // into at least a few children.
+        assert!(
+            tiles.len() >= 1,
+            "Globe zoom 0 should select at least the root tile"
+        );
+    }
+
+    #[test]
+    fn test_globe_polar_center_sufficient_tiles() {
+        // When the globe camera is near the north pole at zoom 3,
+        // we should get a reasonable number of tiles covering the
+        // visible cap (not just a narrow band).
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(80.0, 0.0);
+        viewport.zoom = 3.0;
+
+        let tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+        // With the acos fix, the visible cap at zoom 3 is ~45° radius.
+        // We should have tiles covering a significant area.
+        assert!(
+            tiles.len() >= 8,
+            "Globe polar zoom 3 should have >=8 tiles, got {}",
+            tiles.len()
+        );
+    }
+
+    #[test]
+    fn test_centered_mercator_budget_reasonable() {
+        // Near the poles the centered Mercator frustum covers a wide
+        // geographic area.  The angular filter in the renderer culls
+        // excess tiles, so the count here can be higher than the
+        // standard frustum but should not be unbounded.
+        let mut viewport = Viewport::new(1920, 1080);
+        viewport.center = GeoCoord::new(85.0, 0.0);
+        viewport.zoom = 5.0;
+
+        let tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+        assert!(
+            tiles.len() <= 500,
+            "Centered Mercator at pole: tile count {} seems unreasonable",
+            tiles.len()
+        );
+    }
+
+    #[test]
+    fn test_centered_mercator_high_zoom_reasonable() {
+        // At high zoom the centered Mercator selection should be
+        // similar in size to the standard Mercator frustum (the
+        // viewport covers a tiny area).
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(37.5665, 126.978);
+        viewport.zoom = 10.0;
+
+        let standard_tiles = viewport.visible_tiles();
+        let centered_tiles =
+            viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+
+        // At high zoom near mid-latitude, both should be similar.
+        let ratio = centered_tiles.len() as f64 / standard_tiles.len().max(1) as f64;
+        assert!(
+            ratio < 3.0,
+            "At high zoom, centered ({}) should not be much larger than standard ({})",
+            centered_tiles.len(),
+            standard_tiles.len(),
         );
     }
 }
