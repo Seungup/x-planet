@@ -352,6 +352,10 @@ fn register_touch_events(
                     GestureAction::MultiTouch(mt) => {
                         if let Some((delta, cx, cy)) = mt.zoom {
                             app.engine.zoom_at(delta, cx, cy);
+                            // Sync animation target so tick() doesn't fight
+                            // the pinch zoom by reverting to the old target.
+                            app.anim.zoom_target = app.engine.viewport.zoom;
+                            app.anim.zoom_anchor = Some((cx, cy));
                         }
                         if let Some(deg) = mt.rotate {
                             app.engine.rotate(deg);
