@@ -29,6 +29,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
+            ~/.cargo/bin
             ~/.cargo/registry
             ~/.cargo/git
             target
@@ -36,7 +37,7 @@ jobs:
           restore-keys: wasm-
 
       - name: Install trunk
-        run: cargo install trunk --locked
+        run: command -v trunk || cargo install trunk --locked
 
       - name: Build WASM
         run: |
