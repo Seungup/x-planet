@@ -50,6 +50,24 @@ pub struct WebApp {
 
     // Max concurrent tile loads
     max_concurrent: usize,
+
+    // ── Animation state ──
+    /// Target zoom level (accumulated from scroll/keyboard, animated toward).
+    pub zoom_target: f64,
+    /// Screen-space anchor for zoom-toward-cursor. `None` = zoom at center.
+    pub zoom_anchor: Option<(f64, f64)>,
+    /// Current pan velocity in screen pixels/sec (for inertia).
+    pub pan_velocity: (f64, f64),
+    /// Recent drag samples: (position, timestamp_ms) for velocity estimation.
+    pub drag_samples: Vec<((f64, f64), f64)>,
+    /// Timestamp (ms) of last left-click for double-click detection.
+    pub last_click_time_ms: Option<f64>,
+    /// Position of last left-click for double-click detection.
+    pub last_click_pos: Option<(f64, f64)>,
+    /// Previous frame timestamp (ms) for dt calculation.
+    pub last_frame_ms: Option<f64>,
+    /// Last known mouse position (for zoom anchor fallback).
+    pub last_mouse_pos: Option<(f64, f64)>,
 }
 
 impl WebApp {
@@ -70,6 +88,7 @@ impl WebApp {
         let width = canvas.width();
         let height = canvas.height();
 
+        let initial_zoom = engine.viewport.zoom;
         Self {
             gpu,
             engine,
@@ -84,6 +103,14 @@ impl WebApp {
             pending_coords: HashSet::new(),
             completed_queue: Rc::new(RefCell::new(Vec::new())),
             max_concurrent: 6,
+            zoom_target: initial_zoom,
+            zoom_anchor: None,
+            pan_velocity: (0.0, 0.0),
+            drag_samples: Vec::new(),
+            last_click_time_ms: None,
+            last_click_pos: None,
+            last_frame_ms: None,
+            last_mouse_pos: None,
         }
     }
 
@@ -100,7 +127,10 @@ impl WebApp {
         request_animation_frame(g.borrow().as_ref().unwrap());
     }
 
-    fn render_frame(&mut self, _timestamp_ms: f64) {
+    fn render_frame(&mut self, timestamp_ms: f64) {
+        // ── 0. Tick animations (smooth zoom, inertia pan) ──
+        self.tick_animations(timestamp_ms);
+
         // ── 1. Handle resize ──
         self.check_resize();
 
@@ -235,6 +265,76 @@ impl WebApp {
                 }
             });
         }
+    }
+    // ── Animation methods ──
+
+    fn tick_animations(&mut self, timestamp_ms: f64) {
+        let dt = match self.last_frame_ms {
+            Some(prev) => ((timestamp_ms - prev) / 1000.0).min(0.1), // cap at 100ms
+            None => {
+                self.last_frame_ms = Some(timestamp_ms);
+                return;
+            }
+        };
+        self.last_frame_ms = Some(timestamp_ms);
+
+        // Smooth zoom: exponential decay toward target
+        let current = self.engine.viewport.zoom;
+        let target = self
+            .zoom_target
+            .clamp(self.engine.camera.min_zoom, self.engine.camera.max_zoom);
+        let diff = target - current;
+        if diff.abs() > 0.001 {
+            let new_zoom = current + diff * (1.0 - (-12.0 * dt).exp());
+            let delta = new_zoom - current;
+            match self.zoom_anchor {
+                Some((mx, my)) => self.engine.zoom_at(delta, mx, my),
+                None => self.engine.zoom(delta),
+            }
+        } else if (current - target).abs() > 1e-9 {
+            self.engine.viewport.zoom = target;
+            self.engine.request_redraw();
+        }
+
+        // Inertia pan: friction-based velocity decay
+        let (vx, vy) = self.pan_velocity;
+        let speed = (vx * vx + vy * vy).sqrt();
+        if speed > 1.0 {
+            self.engine.pan(vx * dt, -(vy * dt));
+            let friction = (-6.0 * dt).exp();
+            self.pan_velocity = (vx * friction, vy * friction);
+        } else {
+            self.pan_velocity = (0.0, 0.0);
+        }
+    }
+
+    /// Record a drag position sample for velocity estimation.
+    pub fn record_drag(&mut self, pos: (f64, f64), timestamp_ms: f64) {
+        // Keep only the last 100ms of samples.
+        self.drag_samples
+            .retain(|(_, t)| timestamp_ms - t < 100.0);
+        self.drag_samples.push((pos, timestamp_ms));
+    }
+
+    /// Compute pan velocity from recent drag samples (called on mouse-up).
+    pub fn compute_release_velocity(&mut self, timestamp_ms: f64) {
+        self.drag_samples
+            .retain(|(_, t)| timestamp_ms - t < 100.0);
+        if self.drag_samples.len() < 2 {
+            self.pan_velocity = (0.0, 0.0);
+            return;
+        }
+        let first = &self.drag_samples[0];
+        let last = &self.drag_samples[self.drag_samples.len() - 1];
+        let dt = (last.1 - first.1) / 1000.0; // seconds
+        if dt < 0.001 {
+            self.pan_velocity = (0.0, 0.0);
+            return;
+        }
+        let vx = (last.0 .0 - first.0 .0) / dt;
+        let vy = (last.0 .1 - first.0 .1) / dt;
+        self.pan_velocity = (vx, vy);
+        self.drag_samples.clear();
     }
 }
 
