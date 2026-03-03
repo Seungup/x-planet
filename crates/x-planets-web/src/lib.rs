@@ -1,43 +1,85 @@
 //! x-planets-web: Web/WASM platform backend.
 //!
 //! Provides browser-based implementations for canvas rendering,
-//! fetch API tile loading, and IndexedDB caching.
+//! fetch API tile loading, and touch/mouse input handling.
 //!
 //! This crate is compiled to WebAssembly and exposed to JavaScript
 //! via wasm-bindgen.
 
 #[cfg(target_arch = "wasm32")]
+mod app;
+#[cfg(target_arch = "wasm32")]
+mod input;
+
+#[cfg(target_arch = "wasm32")]
 mod web_impl {
     use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
 
-    /// Initialize the WASM module.
+    use crate::app::WebApp;
+
+    /// Initialize the WASM module, then launch the map.
     #[wasm_bindgen(start)]
     pub fn wasm_init() {
         console_error_panic_hook::set_once();
         console_log::init_with_level(log::Level::Info).unwrap();
         log::info!("x-planets WASM module initialized");
+
+        wasm_bindgen_futures::spawn_local(async {
+            if let Err(e) = run().await {
+                log::error!("Fatal: {:?}", e);
+            }
+        });
     }
 
-    /// Create and run the map engine on a canvas element.
-    #[wasm_bindgen]
-    pub async fn create_map(canvas_id: &str) -> Result<(), JsValue> {
-        log::info!("Creating map on canvas: {}", canvas_id);
-
+    async fn run() -> Result<(), JsValue> {
         let window = web_sys::window().ok_or("No window")?;
         let document = window.document().ok_or("No document")?;
         let canvas = document
-            .get_element_by_id(canvas_id)
+            .get_element_by_id("x-planets-canvas")
             .ok_or("Canvas not found")?
             .dyn_into::<web_sys::HtmlCanvasElement>()?;
 
-        let width = canvas.client_width() as u32;
-        let height = canvas.client_height() as u32;
+        // ── DPR-aware canvas sizing ──
+        let dpr = window.device_pixel_ratio();
+        let css_w = canvas.client_width() as f64;
+        let css_h = canvas.client_height() as f64;
+        let width = (css_w * dpr).max(1.0) as u32;
+        let height = (css_h * dpr).max(1.0) as u32;
+        canvas.set_width(width);
+        canvas.set_height(height);
 
-        log::info!("Canvas size: {}x{}", width, height);
+        log::info!("Canvas: {}x{} (DPR: {:.1})", width, height, dpr);
 
-        // TODO: Initialize wgpu surface from canvas
-        // TODO: Create MapEngine and start render loop
+        // ── GPU ──
+        let surface_target = wgpu::SurfaceTarget::Canvas(canvas.clone());
+        let gpu = x_planets_gpu::GpuContext::new_with_window(surface_target, width, height)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("GPU init failed: {}", e)))?;
 
+        log::info!("GPU: {}", gpu.adapter_info().name);
+
+        // ── MapEngine (default config = OSM base layer) ──
+        let config = x_planets_core::engine::MapConfig::default();
+        let engine = x_planets_core::MapEngine::new(config, width, height);
+
+        // ── TileRenderer ──
+        let renderer = x_planets_core::TileRenderer::new(&gpu);
+
+        // ── TextureManager ──
+        let tex_manager = x_planets_gpu::TextureManager::new(&gpu.device);
+
+        // ── WebApp ──
+        let app = WebApp::new(gpu, engine, renderer, tex_manager, canvas.clone(), dpr);
+        let app = std::rc::Rc::new(std::cell::RefCell::new(app));
+
+        // ── Input events ──
+        crate::input::register_events(&canvas, std::rc::Rc::clone(&app));
+
+        // ── Start render loop ──
+        WebApp::start_render_loop(std::rc::Rc::clone(&app));
+
+        log::info!("x-planets web started!");
         Ok(())
     }
 }
@@ -55,9 +97,6 @@ mod web_tile_source {
     use x_planets_tiles::{LoadError, TileSource};
 
     /// Web-based tile source using the browser Fetch API.
-    ///
-    /// Fetches tile images via `window.fetch()` and returns raw bytes.
-    /// Designed for single-threaded wasm32 execution.
     pub struct WebTileSource {
         url_template: String,
         tms: bool,
@@ -71,6 +110,7 @@ mod web_tile_source {
             }
         }
 
+        #[allow(dead_code)]
         pub fn with_tms(mut self, tms: bool) -> Self {
             self.tms = tms;
             self
