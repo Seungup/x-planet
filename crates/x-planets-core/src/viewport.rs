@@ -214,6 +214,179 @@ impl Viewport {
         self.quadtree_lod(base_z)
     }
 
+    /// Projection-aware visible tile selection.
+    ///
+    /// For Globe mode, computes tile zoom from the orbital camera altitude
+    /// and selects tiles visible from the sphere surface.  For Mercator and
+    /// other modes, delegates to the standard Mercator-based frustum.
+    pub fn visible_tiles_for_mode(&self, mode: x_planets_math::ProjectionMode) -> Vec<VisibleTile> {
+        match mode {
+            x_planets_math::ProjectionMode::Globe => self.visible_tiles_globe(),
+            _ => self.visible_tiles(),
+        }
+    }
+
+    /// Globe-mode visible tile selection.
+    ///
+    /// Uses the orbital camera geometry (altitude above unit sphere) to
+    /// determine the visible spherical cap, then converts it to Mercator
+    /// tile coordinates for tile fetching.
+    fn visible_tiles_globe(&self) -> Vec<VisibleTile> {
+        // Camera altitude in unit-sphere radii.
+        let unit_altitude =
+            (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(self.zoom);
+
+        // Angular radius of the visible cap from the camera.
+        // sin(half_angle) = R / (R + h) = 1 / (1 + unit_altitude)
+        let half_angle = (1.0 / (unit_altitude + 1.0)).asin();
+
+        // Compute effective zoom from angular extent:
+        // At zoom z, each tile covers 360/2^z degrees of longitude.
+        // The visible cap diameter in degrees ≈ 2 * half_angle_degrees.
+        // We want tiles where tile_angular_size ≈ viewport_angular_size / (viewport_pixels / 256).
+        let visible_deg = half_angle.to_degrees() * 2.0;
+        let tiles_needed = (self.height as f64 / 256.0).max(1.0);
+        let tile_size_deg = visible_deg / tiles_needed;
+        // 360 / 2^z = tile_size_deg → z = log2(360 / tile_size_deg)
+        let globe_zoom = (360.0 / tile_size_deg).log2()
+            .round()
+            .clamp(0.0, 22.0) as u8;
+
+        // Visible bounding box in geographic coordinates.
+        let half_deg = half_angle.to_degrees().min(89.0);
+        let lat = self.center.lat;
+        let lon = self.center.lon;
+
+        let lat_min = (lat - half_deg).max(-85.05);
+        let lat_max = (lat + half_deg).min(85.05);
+        // Longitude span scales by cos(lat) at the equator edge
+        let cos_lat = lat.to_radians().cos().max(0.05);
+        let lon_span = (half_deg / cos_lat).min(180.0);
+        let lon_min = lon - lon_span;
+        let lon_max = lon + lon_span;
+
+        // Convert to Mercator and build a Frustum2D.
+        let sw = x_planets_math::geo_to_mercator(&GeoCoord::new(lat_min, lon_min));
+        let ne = x_planets_math::geo_to_mercator(&GeoCoord::new(lat_max, lon_max));
+
+        let bbox = BoundingBox::new(
+            GeoCoord::new(lat_min, lon_min.clamp(-180.0, 180.0)),
+            GeoCoord::new(lat_max, lon_max.clamp(-180.0, 180.0)),
+        );
+        let frustum = Frustum2D::with_merc_bounds(bbox, sw, ne);
+
+        if globe_zoom == 0 {
+            return frustum.visible_tiles(0);
+        }
+
+        // Use the quadtree LOD algorithm with globe-derived zoom.
+        self.quadtree_lod_with_frustum(globe_zoom, &frustum)
+    }
+
+    /// Quadtree LOD with a custom frustum (used by globe-mode visible tiles).
+    fn quadtree_lod_with_frustum(&self, base_z: u8, frustum: &Frustum2D) -> Vec<VisibleTile> {
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+
+        const TILE_BUDGET: usize = 150;
+
+        let center_merc = geo_to_mercator(&self.center);
+        let pitch_rad = self.pitch.to_radians();
+        let sin_p = pitch_rad.sin();
+        let scale = 2.0_f64.powf(-self.zoom);
+        let fov_half_tan = (std::f64::consts::FRAC_PI_3 * 0.5).tan();
+        let cam_h = scale / fov_half_tan;
+
+        let bearing_rad = self.bearing.to_radians();
+        let sin_b = bearing_rad.sin();
+        let cos_b = bearing_rad.cos();
+
+        let max_drop = ((self.pitch / 15.0).ceil() as u8).min(4);
+        let min_z = base_z.saturating_sub(max_drop);
+
+        let ideal_zoom_at = |mx: f64, my: f64| -> u8 {
+            if self.pitch < 5.0 {
+                return base_z;
+            }
+            let dx = mx - center_merc.x;
+            let dy = my - center_merc.y;
+            let d_fwd = dx * sin_b - dy * cos_b;
+
+            if d_fwd > 0.0 && sin_p > 0.01 {
+                let perspective = cam_h / (cam_h + d_fwd * sin_p);
+                (self.zoom + perspective.log2())
+                    .round()
+                    .clamp(min_z as f64, base_z as f64) as u8
+            } else {
+                base_z
+            }
+        };
+
+        #[derive(Debug)]
+        struct Candidate {
+            tile: VisibleTile,
+            priority: f64,
+        }
+        impl PartialEq for Candidate {
+            fn eq(&self, other: &Self) -> bool {
+                self.priority == other.priority
+            }
+        }
+        impl Eq for Candidate {}
+        impl PartialOrd for Candidate {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Candidate {
+            fn cmp(&self, other: &Self) -> Ordering {
+                self.priority
+                    .partial_cmp(&other.priority)
+                    .unwrap_or(Ordering::Equal)
+            }
+        }
+
+        let mut heap = BinaryHeap::<Candidate>::new();
+        let mut result = Vec::<VisibleTile>::new();
+
+        for vt in frustum.visible_tiles(min_z) {
+            let tc = vt.display_mercator_center();
+            let dist = (tc - center_merc).length();
+            heap.push(Candidate {
+                tile: vt,
+                priority: 1.0 / (dist + 1e-10),
+            });
+        }
+
+        while let Some(candidate) = heap.pop() {
+            let vt = candidate.tile;
+            let tc = vt.display_mercator_center();
+            let ideal_z = ideal_zoom_at(tc.x, tc.y);
+
+            let should_subdivide = vt.coord.z < ideal_z
+                && vt.coord.z < base_z
+                && (result.len() + heap.len() + 4) <= TILE_BUDGET;
+
+            if should_subdivide {
+                for child in vt.children() {
+                    if frustum.is_visible_tile(&child) {
+                        let cc = child.display_mercator_center();
+                        let dist = (cc - center_merc).length();
+                        heap.push(Candidate {
+                            tile: child,
+                            priority: 1.0 / (dist + 1e-10),
+                        });
+                    }
+                }
+            } else {
+                result.push(vt);
+            }
+        }
+
+        result.sort_by_key(|vt| vt.coord.z);
+        result
+    }
+
     /// Quadtree-based LOD tile selection (gap-free, priority-ordered, budgeted).
     fn quadtree_lod(&self, base_z: u8) -> Vec<VisibleTile> {
         use std::cmp::Ordering;
@@ -635,6 +808,10 @@ impl CameraController {
     ///
     /// Converts pixel deltas directly to geographic degree changes,
     /// bypassing Mercator to avoid polar amplification.
+    ///
+    /// The sensitivity is derived from the perspective FOV and camera
+    /// altitude so that dragging across the full viewport height sweeps
+    /// exactly the visible angular extent of the sphere surface.
     pub fn pan_globe(&self, viewport: &mut Viewport, dx: f64, dy: f64) {
         // Visible angular extent of the sphere surface from the camera.
         // arccos(R/(R+h)) gives the angular radius of the visible cap
@@ -645,24 +822,28 @@ impl CameraController {
         let visible_half = (1.0 / (unit_altitude + 1.0)).acos();
         let visible_deg = visible_half.to_degrees() * 2.0;
 
-        let deg_per_px_y = visible_deg / viewport.height as f64 * self.pan_speed;
-        let deg_per_px_x = deg_per_px_y; // longitude scaled by cos(lat) below
+        // Degrees per pixel — no extra pan_speed multiplier; the acos-based
+        // derivation already gives 1:1 feel (finger-under-cursor tracking).
+        let deg_per_px = visible_deg / viewport.height as f64;
 
         let bearing_rad = viewport.bearing.to_radians();
         let sin_b = bearing_rad.sin();
         let cos_b = bearing_rad.cos();
 
-        let dx_deg = dx * deg_per_px_x;
-        let dy_deg = dy * deg_per_px_y;
+        let dx_deg = dx * deg_per_px;
+        let dy_deg = dy * deg_per_px;
 
         // Rotate by bearing.  Signs match the Mercator `pan()` convention:
         // dy > 0 (screen up, already negated by caller) → center moves south,
         // dx > 0 (screen right) → center moves west.
         let dlat = sin_b * dx_deg - cos_b * dy_deg;
-        let dlon = -(cos_b * dx_deg + sin_b * dy_deg)
-            / viewport.center.lat.to_radians().cos().max(0.01); // scale by cos(lat)
 
-        viewport.center.lat = (viewport.center.lat + dlat).clamp(-90.0, 90.0);
+        // Scale longitude by cos(lat), with a safe floor to prevent
+        // singularity at the poles while still allowing polar navigation.
+        let cos_lat = viewport.center.lat.to_radians().cos().max(0.05);
+        let dlon = -(cos_b * dx_deg + sin_b * dy_deg) / cos_lat;
+
+        viewport.center.lat = (viewport.center.lat + dlat).clamp(-89.9, 89.9);
         viewport.center.lon = ((viewport.center.lon + dlon) + 180.0).rem_euclid(360.0) - 180.0;
     }
 
@@ -701,8 +882,9 @@ impl CameraController {
         let sin_b = bearing_rad.sin();
         let cos_b = bearing_rad.cos();
 
+        let cos_lat = viewport.center.lat.to_radians().cos().max(0.05);
         let cursor_lon_off = (dx_norm * cos_b - dy_norm * sin_b) * half_angle_old * 2.0
-            / viewport.center.lat.to_radians().cos().max(0.01);
+            / cos_lat;
         let cursor_lat_off = -(dx_norm * sin_b + dy_norm * cos_b) * half_angle_old * 2.0;
 
         self.zoom(viewport, delta);
@@ -711,15 +893,16 @@ impl CameraController {
             (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(viewport.zoom);
         let half_angle_new = (1.0 / (unit_altitude_new + 1.0)).acos().to_degrees();
 
+        let cos_lat = viewport.center.lat.to_radians().cos().max(0.05);
         let new_cursor_lon_off = (dx_norm * cos_b - dy_norm * sin_b) * half_angle_new * 2.0
-            / viewport.center.lat.to_radians().cos().max(0.01);
+            / cos_lat;
         let new_cursor_lat_off = -(dx_norm * sin_b + dy_norm * cos_b) * half_angle_new * 2.0;
 
         // Shift center so cursor geographic point stays fixed
         let dlat = cursor_lat_off - new_cursor_lat_off;
         let dlon = cursor_lon_off - new_cursor_lon_off;
 
-        viewport.center.lat = (viewport.center.lat + dlat).clamp(-90.0, 90.0);
+        viewport.center.lat = (viewport.center.lat + dlat).clamp(-89.9, 89.9);
         viewport.center.lon = ((viewport.center.lon + dlon) + 180.0).rem_euclid(360.0) - 180.0;
     }
 

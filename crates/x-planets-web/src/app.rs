@@ -168,7 +168,8 @@ impl WebApp {
         self.upload_completed_tiles(now_secs);
 
         // ── 3. Request missing tiles ──
-        let visible = self.engine.viewport.visible_tiles();
+        let proj_mode = self.resolve_projection_mode();
+        let visible = self.engine.viewport.visible_tiles_for_mode(proj_mode);
         self.request_missing_tiles(&visible);
 
         // ── 4. Build render data with crossfade ──
