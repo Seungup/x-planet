@@ -1,64 +1,22 @@
 //! Build `RenderLayerData` and `TerrainLayerData` for each visible layer,
 //! including cross-fade overlay logic.
 //!
-//! These are free functions (not methods) to avoid borrow conflicts: the
-//! caller destructures `NativeApp` fields and passes immutable references.
+//! Uses shared crossfade functions from `x_planets_core::interaction` to avoid
+//! duplicating fade logic between native and web.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use x_planets_core::engine::LayerKind;
+use x_planets_core::interaction::{
+    build_crossfade_overlay, compute_crossfade, compute_fade_overrides,
+};
 use x_planets_core::render::RenderLayerData;
 use x_planets_core::{MapEngine, TerrainLayerData, TerrainTileData};
 use x_planets_math::TileCoord;
 
-use crate::animation::{AnimationState, FADE_DURATION};
+use crate::animation::AnimationState;
 use crate::tile_source::NativeLayerState;
-
-/// Compute cross-fade tiles: identify tiles transitioning parent → child.
-///
-/// During the fade-in period, exclude child tiles from the `available` set
-/// so `resolve_fallbacks` picks the parent texture as the base. Returns
-/// the modified available set and a list of `(coord, fade_t)` pairs for
-/// the overlay pass.
-fn compute_crossfade(
-    visible: &[TileCoord],
-    available: &HashSet<TileCoord>,
-    anim: &AnimationState,
-    now: Instant,
-) -> (HashSet<TileCoord>, Vec<(TileCoord, f32)>) {
-    let mut available_for_base = available.clone();
-    let mut crossfade_tiles: Vec<(TileCoord, f32)> = Vec::new();
-
-    for &coord in visible {
-        if !available.contains(&coord) { continue; }
-        if let Some(&start) = anim.tile_fade_start.get(&coord) {
-            let elapsed = now.duration_since(start).as_secs_f64();
-            if elapsed < FADE_DURATION {
-                let has_parent = {
-                    let mut c = coord.parent();
-                    let mut found = false;
-                    while let Some(p) = c {
-                        if available.contains(&p) {
-                            found = true;
-                            break;
-                        }
-                        c = p.parent();
-                    }
-                    found
-                };
-                if has_parent {
-                    available_for_base.remove(&coord);
-                    let fade_t = ((elapsed / FADE_DURATION) as f32)
-                        .clamp(1.0 / 60.0, 1.0);
-                    crossfade_tiles.push((coord, fade_t));
-                }
-            }
-        }
-    }
-
-    (available_for_base, crossfade_tiles)
-}
 
 /// Build render data for all visible layers.
 ///
@@ -79,8 +37,6 @@ pub(super) fn build_all_layers<'a>(
     let mut terrain_overlay_layers: Vec<TerrainLayerData> = Vec::new();
 
     // Collect raster layer names that are used as imagery for terrain layers.
-    // These will be skipped in the flat raster render pass — they're already
-    // draped onto the 3D terrain mesh.
     let terrain_imagery_names: HashSet<&str> = engine
         .visible_layers()
         .filter_map(|l| match &l.config.kind {
@@ -93,8 +49,6 @@ pub(super) fn build_all_layers<'a>(
         if let Some(ls) = layer_states.iter().find(|s| s.name == layer.config.name) {
             match &layer.config.kind {
                 LayerKind::Raster => {
-                    // Skip raster layers that serve as terrain imagery —
-                    // they're already draped onto the 3D terrain mesh.
                     if terrain_imagery_names.contains(layer.config.name.as_str()) {
                         continue;
                     }
@@ -110,7 +64,6 @@ pub(super) fn build_all_layers<'a>(
                     // 3D Tiles layers are handled separately.
                 }
                 LayerKind::Terrain { imagery_layer, .. } => {
-                    // Find companion imagery layer's texture views
                     let imagery_ls = layer_states.iter().find(|s| s.name == *imagery_layer);
 
                     if imagery_ls.is_none() {
@@ -146,43 +99,28 @@ fn build_raster_layer<'a>(
 ) -> (RenderLayerData<'a>, Option<RenderLayerData<'a>>) {
     let available: HashSet<TileCoord> = ls.tile_textures.keys().copied().collect();
 
-    // Build texture view map
     let texture_views: HashMap<TileCoord, &wgpu::TextureView> = ls
         .tile_textures
         .iter()
         .map(|(k, v)| (*k, &v.view))
         .collect();
 
+    // Use shared crossfade computation (convert Instant → elapsed f64)
     let (available_for_base, crossfade_tiles) =
-        compute_crossfade(visible, &available, anim, now);
+        compute_crossfade(visible, &available, |coord| {
+            anim.tile_fade_elapsed(coord, now)
+        });
 
     let renderable =
         x_planets_core::pipeline::resolve_fallbacks(visible, &available_for_base);
 
-    // Opacity overrides: only for tiles with NO parent
-    // coverage (first-time appearance, fade from zero).
-    let mut tile_opacity_overrides = HashMap::new();
-    for rt in &renderable {
-        if rt.texture_coord != rt.coord {
-            continue; // using parent fallback → full opacity
-        }
-        if let Some(&start) = anim.tile_fade_start.get(&rt.coord) {
-            let elapsed = now.duration_since(start).as_secs_f64();
-            if elapsed < FADE_DURATION {
-                // No parent coverage → fade from near-zero
-                let t = ((elapsed / FADE_DURATION) as f32)
-                    .clamp(1.0 / 60.0, 1.0);
-                tile_opacity_overrides.insert(
-                    rt.coord,
-                    layer.config.opacity * t,
-                );
-            }
-        }
-    }
+    // Use shared fade override computation
+    let tile_opacity_overrides = compute_fade_overrides(
+        &renderable,
+        layer.config.opacity,
+        |coord| anim.tile_fade_elapsed(coord, now),
+    );
 
-    // Base layer: parent fallbacks for crossfading tiles,
-    // own textures for tiles that finished fading or have
-    // no parent coverage.
     let base = RenderLayerData {
         name: &layer.config.name,
         opacity: layer.config.opacity,
@@ -191,26 +129,10 @@ fn build_raster_layer<'a>(
         tile_opacity_overrides,
     };
 
-    // Cross-fade overlay: child tiles fading in over parent.
-    // Rendered as a separate layer — each layer gets its own
-    // render pass with cleared depth, so the overlay composites
-    // correctly via alpha blending.
+    // Use shared overlay builder
     let overlay = if !crossfade_tiles.is_empty() {
-        let mut overlay_tiles = Vec::new();
-        let mut overlay_opacity = HashMap::new();
-        for &(coord, fade_t) in &crossfade_tiles {
-            overlay_tiles.push(
-                x_planets_core::pipeline::RenderableTile {
-                    coord,
-                    texture_coord: coord,
-                    uv_rect: [0.0, 0.0, 1.0, 1.0],
-                },
-            );
-            overlay_opacity.insert(
-                coord,
-                layer.config.opacity * fade_t,
-            );
-        }
+        let (overlay_tiles, overlay_opacity) =
+            build_crossfade_overlay(&crossfade_tiles, layer.config.opacity);
         Some(RenderLayerData {
             name: "crossfade-overlay",
             opacity: layer.config.opacity,
@@ -236,22 +158,23 @@ fn build_terrain_layer<'a>(
 ) -> (TerrainLayerData<'a>, Option<TerrainLayerData<'a>>) {
     let available: HashSet<TileCoord> = imagery_ls.tile_textures.keys().copied().collect();
 
-    // Imagery texture views from companion layer
     let imagery_views: HashMap<TileCoord, &wgpu::TextureView> = imagery_ls
         .tile_textures
         .iter()
         .map(|(k, v)| (*k, &v.view))
         .collect();
 
+    // Use shared crossfade computation
     let (available_for_base, crossfade_tiles) =
-        compute_crossfade(visible, &available, anim, now);
+        compute_crossfade(visible, &available, |coord| {
+            anim.tile_fade_elapsed(coord, now)
+        });
 
     let renderable = x_planets_core::pipeline::resolve_fallbacks(
         visible, &available_for_base,
     );
 
-    // Elevation data with parent fallback.
-    // Include coords for both base and overlay tiles.
+    // Elevation data with parent fallback
     let mut elevation_data: HashMap<TileCoord, (&TerrainTileData, TileCoord)> = HashMap::new();
     let all_needed: HashSet<TileCoord> = renderable
         .iter()
@@ -262,11 +185,6 @@ fn build_terrain_layer<'a>(
         let mut c = Some(coord);
         while let Some(candidate) = c {
             if let Some(data) = terrain_ls.terrain_data.peek(&candidate) {
-                // Accept any elevation data including parent
-                // PrebuiltMesh tiles.  When a parent QM mesh is
-                // used for a child coord the renderer generates a
-                // flat placeholder so the imagery is visible
-                // immediately during the parent-first loading phase.
                 elevation_data.insert(coord, (data, candidate));
                 break;
             }
@@ -274,8 +192,6 @@ fn build_terrain_layer<'a>(
         }
     }
 
-    // Base terrain layer (parent fallback imagery for
-    // crossfading tiles, own imagery for stable tiles).
     let base = TerrainLayerData {
         name: &layer.config.name,
         opacity: layer.config.opacity,
@@ -285,29 +201,9 @@ fn build_terrain_layer<'a>(
         tile_opacity_overrides: HashMap::new(),
     };
 
-    // Cross-fade overlay: child imagery fading in.
-    // Must be rendered in a SEPARATE render_terrain_layered
-    // call because the mesh cache shares uniform buffers
-    // per coord — a single call would overwrite the base
-    // pass uniforms before submission.
     let overlay = if !crossfade_tiles.is_empty() {
-        let overlay_tiles: Vec<_> = crossfade_tiles
-            .iter()
-            .map(|&(coord, _)| {
-                x_planets_core::pipeline::RenderableTile {
-                    coord,
-                    texture_coord: coord,
-                    uv_rect: [0.0, 0.0, 1.0, 1.0],
-                }
-            })
-            .collect();
-        let mut overlay_opacity = HashMap::new();
-        for &(coord, fade_t) in &crossfade_tiles {
-            overlay_opacity.insert(
-                coord,
-                layer.config.opacity * fade_t,
-            );
-        }
+        let (overlay_tiles, overlay_opacity) =
+            build_crossfade_overlay(&crossfade_tiles, layer.config.opacity);
         let overlay_elev: HashMap<TileCoord, (&TerrainTileData, TileCoord)> =
             crossfade_tiles
                 .iter()

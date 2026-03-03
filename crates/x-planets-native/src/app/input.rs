@@ -1,9 +1,16 @@
 //! Input event handling: keyboard, mouse, cursor, and scroll wheel.
+//!
+//! Uses shared constants from `x_planets_core::interaction`.
 
 use std::time::Instant;
 
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};
 use winit::keyboard::{KeyCode, PhysicalKey};
+
+use x_planets_core::interaction::{
+    DOUBLE_CLICK_DIST, DOUBLE_CLICK_TIME, KEYBOARD_ROTATE, PAN_AMOUNT, PITCH_SENSITIVITY,
+    ROTATE_SENSITIVITY, ZOOM_STEP,
+};
 
 use super::NativeApp;
 
@@ -11,37 +18,34 @@ impl NativeApp {
     pub(super) fn handle_keyboard_input(&mut self, event: winit::event::KeyEvent) {
         if event.state == ElementState::Pressed {
             if let Some(engine) = &mut self.engine {
-                let pan_amount = 50.0;
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::ArrowLeft) => {
-                        engine.pan(-pan_amount, 0.0);
+                        engine.pan(-PAN_AMOUNT, 0.0);
                     }
                     PhysicalKey::Code(KeyCode::ArrowRight) => {
-                        engine.pan(pan_amount, 0.0);
+                        engine.pan(PAN_AMOUNT, 0.0);
                     }
                     PhysicalKey::Code(KeyCode::ArrowUp) => {
-                        engine.pan(0.0, -pan_amount);
+                        engine.pan(0.0, -PAN_AMOUNT);
                     }
                     PhysicalKey::Code(KeyCode::ArrowDown) => {
-                        engine.pan(0.0, pan_amount);
+                        engine.pan(0.0, PAN_AMOUNT);
                     }
-                    // +/-: smooth animated zoom (target ±0.5)
                     PhysicalKey::Code(KeyCode::Equal)
                     | PhysicalKey::Code(KeyCode::NumpadAdd) => {
-                        self.anim.zoom_target += 0.5;
+                        self.anim.zoom_target += ZOOM_STEP;
                         self.anim.zoom_anchor = None;
                     }
                     PhysicalKey::Code(KeyCode::Minus)
                     | PhysicalKey::Code(KeyCode::NumpadSubtract) => {
-                        self.anim.zoom_target -= 0.5;
+                        self.anim.zoom_target -= ZOOM_STEP;
                         self.anim.zoom_anchor = None;
                     }
-                    // Q/E: rotate counter-clockwise / clockwise
                     PhysicalKey::Code(KeyCode::KeyQ) => {
-                        engine.rotate(-10.0);
+                        engine.rotate(-KEYBOARD_ROTATE);
                     }
                     PhysicalKey::Code(KeyCode::KeyE) => {
-                        engine.rotate(10.0);
+                        engine.rotate(KEYBOARD_ROTATE);
                     }
                     PhysicalKey::Code(KeyCode::Home) => {
                         engine.viewport.center =
@@ -71,14 +75,15 @@ impl NativeApp {
                     let is_double_click = self
                         .anim
                         .last_click_time
-                        .map(|t| now.duration_since(t).as_millis() < 300)
+                        .map(|t| now.duration_since(t).as_secs_f64() < DOUBLE_CLICK_TIME)
                         .unwrap_or(false)
                         && self
                             .anim
                             .last_click_pos
                             .map(|(lx, ly)| {
                                 let (cx, cy) = current_pos;
-                                ((cx - lx).powi(2) + (cy - ly).powi(2)).sqrt() < 10.0
+                                ((cx - lx).powi(2) + (cy - ly).powi(2)).sqrt()
+                                    < DOUBLE_CLICK_DIST
                             })
                             .unwrap_or(false);
 
@@ -147,8 +152,8 @@ impl NativeApp {
                 let dx = pos.0 - last.0;
                 let dy = pos.1 - last.1;
                 if let Some(engine) = &mut self.engine {
-                    engine.pitch(-dy * 0.3); // drag up = more tilt
-                    engine.rotate(dx * 0.3); // drag right = clockwise
+                    engine.pitch(-dy * PITCH_SENSITIVITY);
+                    engine.rotate(dx * ROTATE_SENSITIVITY);
                 }
                 self.window.as_ref().unwrap().request_redraw();
             }
@@ -160,7 +165,7 @@ impl NativeApp {
             if let Some(last_x) = self.last_rotate_x {
                 let dx = pos.0 - last_x;
                 if let Some(engine) = &mut self.engine {
-                    engine.rotate(dx * 0.3);
+                    engine.rotate(dx * ROTATE_SENSITIVITY);
                 }
                 self.window.as_ref().unwrap().request_redraw();
             }
