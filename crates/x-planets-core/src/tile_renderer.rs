@@ -19,6 +19,7 @@ use x_planets_math::{TileCoord, ViewportUniforms};
 use crate::pipeline::{
     build_globe_tile_mesh, build_polar_caps, tile_uniforms_for_globe,
     build_centered_tile_mesh, tile_uniforms_for_centered,
+    tile_passes_angular_filter,
     RenderableTile,
 };
 use crate::render::{GlobeTileVertex, RenderLayerData};
@@ -687,15 +688,6 @@ impl TileRenderer {
                 // The oblique Mercator has a singularity at ~90° from the
                 // center; skip tiles whose angular distance exceeds 80° to
                 // prevent extreme distortion (the V-shape artifact).
-                let center_sphere = x_planets_math::geo_to_unit_sphere(center_lat_rad, center_lon_rad);
-                // At low zoom the viewport can see most of the world — relax the
-                // singularity guard to 89°.  At higher zoom the visible extent is
-                // small so 85° is generous while still avoiding the Mercator
-                // singularity at exactly 90°.  The winding check in
-                // tile_centered_mesh is the real singularity safeguard.
-                let max_angular_deg: f64 = if viewport.zoom < 3.0 { 89.0 } else { 85.0 };
-                let cos_threshold = max_angular_deg.to_radians().cos();
-
                 let renderable_tiles: Vec<&RenderableTile> = layer
                     .tiles
                     .iter()
@@ -703,15 +695,12 @@ impl TileRenderer {
                         if !layer.texture_views.contains_key(&rt.texture_coord) {
                             return false;
                         }
-                        // Angular distance check: compute tile center on unit sphere
-                        let n = rt.coord.extent() as f64;
-                        let mx = (rt.display_x as f64 + 0.5) / n;
-                        let my = (rt.coord.y as f64 + 0.5) / n;
-                        let lon_rad = (mx * 2.0 - 1.0) * std::f64::consts::PI;
-                        let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
-                        let tile_sphere = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
-                        let cos_angle = center_sphere.dot(tile_sphere);
-                        cos_angle > cos_threshold
+                        tile_passes_angular_filter(
+                            rt,
+                            center_lat_rad,
+                            center_lon_rad,
+                            viewport.zoom,
+                        )
                     })
                     .collect();
 
