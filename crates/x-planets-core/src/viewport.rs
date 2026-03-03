@@ -434,7 +434,11 @@ impl Viewport {
         let far = (unit_altitude + 2.0) * 3.0; // far enough to see whole sphere
         let proj = glam::DMat4::perspective_rh(fov_y, aspect, near.max(0.0001), far);
 
-        proj * view
+        // Flip Y: in the globe coordinate system, the camera's view maps
+        // north to +clip_y, but the rendering convention requires the
+        // opposite sign to display north at the top of the screen.
+        let flip_y = glam::DMat4::from_diagonal(glam::DVec4::new(1.0, -1.0, 1.0, 1.0));
+        flip_y * proj * view
     }
 
     /// Compute GPU uniforms for this viewport.

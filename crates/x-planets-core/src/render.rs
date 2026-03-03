@@ -337,14 +337,33 @@ pub fn tile_centered_mesh(
         }
     }
 
-    // Triangle indices (standard grid, no back-face culling needed for 2D)
+    // Triangle indices — skip triangles whose winding has been inverted
+    // by the oblique Mercator projection (happens near the antipodal point
+    // of the projection center where the Mercator singularity flips geometry).
     for j in 0..subdiv {
         for i in 0..subdiv {
             let tl = j * seg + i;
             let tr = j * seg + i + 1;
             let bl = (j + 1) * seg + i;
             let br = (j + 1) * seg + i + 1;
-            indices.extend_from_slice(&[tl, tr, bl, bl, tr, br]);
+
+            let p_tl = &vertices[tl as usize].position;
+            let p_tr = &vertices[tr as usize].position;
+            let p_bl = &vertices[bl as usize].position;
+            let p_br = &vertices[br as usize].position;
+
+            // 2D cross product: positive = CCW (normal winding), negative = CW (flipped)
+            let cross1 = (p_tr[0] - p_tl[0]) * (p_bl[1] - p_tl[1])
+                - (p_tr[1] - p_tl[1]) * (p_bl[0] - p_tl[0]);
+            if cross1 > 0.0 {
+                indices.extend_from_slice(&[tl, tr, bl]);
+            }
+
+            let cross2 = (p_tr[0] - p_bl[0]) * (p_br[1] - p_bl[1])
+                - (p_tr[1] - p_bl[1]) * (p_br[0] - p_bl[0]);
+            if cross2 > 0.0 {
+                indices.extend_from_slice(&[bl, tr, br]);
+            }
         }
     }
 

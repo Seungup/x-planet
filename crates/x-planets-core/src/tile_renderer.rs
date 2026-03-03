@@ -154,6 +154,11 @@ impl TileRenderer {
                         compilation_options: Default::default(),
                     }),
                     primitive: wgpu::PrimitiveState {
+                        // The globe VP applies flip_y which reverses screen-space
+                        // winding.  Set front_face to Cw so that the original
+                        // CCW-from-outside mesh winding (now CW on screen) is
+                        // treated as front-facing, and the far side is culled.
+                        front_face: wgpu::FrontFace::Cw,
                         cull_mode: Some(wgpu::Face::Back),
                         ..Default::default()
                     },
