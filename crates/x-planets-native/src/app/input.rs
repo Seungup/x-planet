@@ -17,19 +17,20 @@ use super::NativeApp;
 impl NativeApp {
     pub(super) fn handle_keyboard_input(&mut self, event: winit::event::KeyEvent) {
         if event.state == ElementState::Pressed {
+            let mode = self.resolve_projection_mode();
             if let Some(engine) = &mut self.engine {
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::ArrowLeft) => {
-                        engine.pan(-PAN_AMOUNT, 0.0);
+                        engine.pan_for_mode(-PAN_AMOUNT, 0.0, mode);
                     }
                     PhysicalKey::Code(KeyCode::ArrowRight) => {
-                        engine.pan(PAN_AMOUNT, 0.0);
+                        engine.pan_for_mode(PAN_AMOUNT, 0.0, mode);
                     }
                     PhysicalKey::Code(KeyCode::ArrowUp) => {
-                        engine.pan(0.0, -PAN_AMOUNT);
+                        engine.pan_for_mode(0.0, -PAN_AMOUNT, mode);
                     }
                     PhysicalKey::Code(KeyCode::ArrowDown) => {
-                        engine.pan(0.0, PAN_AMOUNT);
+                        engine.pan_for_mode(0.0, PAN_AMOUNT, mode);
                     }
                     PhysicalKey::Code(KeyCode::Equal)
                     | PhysicalKey::Code(KeyCode::NumpadAdd) => {
@@ -151,8 +152,9 @@ impl NativeApp {
             if let Some(last) = self.last_mouse_pos {
                 let dx = pos.0 - last.0;
                 let dy = pos.1 - last.1;
+                let mode = self.resolve_projection_mode();
                 if let Some(engine) = &mut self.engine {
-                    engine.pan(dx, -dy);
+                    engine.pan_for_mode(dx, -dy, mode);
                 }
                 self.window.as_ref().unwrap().request_redraw();
             }

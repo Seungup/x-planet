@@ -343,8 +343,11 @@ impl Viewport {
             return self.to_globe_view_proj_f64();
         }
         let center = match mode {
-            x_planets_math::ProjectionMode::Mercator
-            | x_planets_math::ProjectionMode::Globe => geo_to_mercator(&self.center),
+            x_planets_math::ProjectionMode::Mercator => {
+                // Centered (oblique) Mercator: viewport center → (0.5, 0.5)
+                glam::DVec2::new(0.5, 0.5)
+            }
+            x_planets_math::ProjectionMode::Globe => geo_to_mercator(&self.center),
             x_planets_math::ProjectionMode::Equirectangular => {
                 x_planets_math::geo_to_equirectangular(&self.center)
             }
@@ -571,6 +574,28 @@ impl CameraController {
         screen_x: f64,
         screen_y: f64,
     ) {
+        self.zoom_at_for_mode(
+            viewport,
+            delta,
+            screen_x,
+            screen_y,
+            x_planets_math::ProjectionMode::Mercator,
+        );
+    }
+
+    /// Zoom toward a specific screen point, projection-aware.
+    pub fn zoom_at_for_mode(
+        &self,
+        viewport: &mut Viewport,
+        delta: f64,
+        screen_x: f64,
+        screen_y: f64,
+        mode: x_planets_math::ProjectionMode,
+    ) {
+        if mode == x_planets_math::ProjectionMode::Globe {
+            return self.zoom_at_globe(viewport, delta, screen_x, screen_y);
+        }
+
         let old_scale = 2.0_f64.powf(-viewport.zoom);
 
         self.zoom(viewport, delta);
@@ -602,6 +627,98 @@ impl CameraController {
         center_merc.x = (center_merc.x + merc_dx).rem_euclid(1.0);
         center_merc.y = (center_merc.y + merc_dy).clamp(0.0, 1.0);
         viewport.center = mercator_to_geo(center_merc);
+    }
+
+    // ── Globe-specific camera methods ──
+
+    /// Pan the viewport in globe mode using angular deltas.
+    ///
+    /// Converts pixel deltas directly to geographic degree changes,
+    /// bypassing Mercator to avoid polar amplification.
+    pub fn pan_globe(&self, viewport: &mut Viewport, dx: f64, dy: f64) {
+        // Visible angular extent on sphere surface (approximate).
+        // At zoom z the camera sees roughly the same angular extent as
+        // 360 / 2^z degrees of longitude.  We use the FOV and altitude
+        // to derive a more accurate rate.
+        let unit_altitude =
+            (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(viewport.zoom);
+        // Half-angle subtended from camera to sphere edge
+        let half_angle = (1.0 / (unit_altitude + 1.0)).asin();
+        let visible_deg = half_angle.to_degrees() * 2.0;
+
+        let deg_per_px_y = visible_deg / viewport.height as f64 * self.pan_speed;
+        let deg_per_px_x = deg_per_px_y; // longitude scaled by cos(lat) below
+
+        let bearing_rad = viewport.bearing.to_radians();
+        let sin_b = bearing_rad.sin();
+        let cos_b = bearing_rad.cos();
+
+        let dx_deg = dx * deg_per_px_x;
+        let dy_deg = dy * deg_per_px_y;
+
+        // Rotate by bearing, then negate (drag opposite to center movement)
+        let dlat = cos_b * dy_deg - sin_b * dx_deg;
+        let dlon = -(cos_b * dx_deg + sin_b * dy_deg)
+            / viewport.center.lat.to_radians().cos().max(0.01); // scale by cos(lat)
+
+        viewport.center.lat = (viewport.center.lat + dlat).clamp(-90.0, 90.0);
+        viewport.center.lon = ((viewport.center.lon + dlon) + 180.0).rem_euclid(360.0) - 180.0;
+    }
+
+    /// Zoom toward a screen point in globe mode.
+    pub fn zoom_at_globe(
+        &self,
+        viewport: &mut Viewport,
+        delta: f64,
+        screen_x: f64,
+        screen_y: f64,
+    ) {
+        // Compute angular offset of cursor from center before zoom
+        let unit_altitude =
+            (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(viewport.zoom);
+        let half_angle_old = (1.0 / (unit_altitude + 1.0)).asin().to_degrees();
+
+        let dx_norm = (screen_x - viewport.width as f64 * 0.5) / viewport.height as f64;
+        let dy_norm = (screen_y - viewport.height as f64 * 0.5) / viewport.height as f64;
+
+        let bearing_rad = viewport.bearing.to_radians();
+        let sin_b = bearing_rad.sin();
+        let cos_b = bearing_rad.cos();
+
+        let cursor_lon_off = (dx_norm * cos_b - dy_norm * sin_b) * half_angle_old * 2.0
+            / viewport.center.lat.to_radians().cos().max(0.01);
+        let cursor_lat_off = -(dx_norm * sin_b + dy_norm * cos_b) * half_angle_old * 2.0;
+
+        self.zoom(viewport, delta);
+
+        let unit_altitude_new =
+            (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(viewport.zoom);
+        let half_angle_new = (1.0 / (unit_altitude_new + 1.0)).asin().to_degrees();
+
+        let new_cursor_lon_off = (dx_norm * cos_b - dy_norm * sin_b) * half_angle_new * 2.0
+            / viewport.center.lat.to_radians().cos().max(0.01);
+        let new_cursor_lat_off = -(dx_norm * sin_b + dy_norm * cos_b) * half_angle_new * 2.0;
+
+        // Shift center so cursor geographic point stays fixed
+        let dlat = cursor_lat_off - new_cursor_lat_off;
+        let dlon = cursor_lon_off - new_cursor_lon_off;
+
+        viewport.center.lat = (viewport.center.lat + dlat).clamp(-90.0, 90.0);
+        viewport.center.lon = ((viewport.center.lon + dlon) + 180.0).rem_euclid(360.0) - 180.0;
+    }
+
+    /// Pan with projection-mode awareness.
+    pub fn pan_for_mode(
+        &self,
+        viewport: &mut Viewport,
+        dx: f64,
+        dy: f64,
+        mode: x_planets_math::ProjectionMode,
+    ) {
+        match mode {
+            x_planets_math::ProjectionMode::Globe => self.pan_globe(viewport, dx, dy),
+            _ => self.pan(viewport, dx, dy),
+        }
     }
 }
 

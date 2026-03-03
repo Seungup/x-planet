@@ -128,6 +128,18 @@ struct NativeApp {
     last_rotate_x: Option<f64>,
 }
 
+impl NativeApp {
+    fn resolve_projection_mode(&self) -> x_planets_math::ProjectionMode {
+        match self.engine.as_ref() {
+            Some(engine) => match engine.active_projection.as_str() {
+                "Equirectangular" => x_planets_math::ProjectionMode::Globe,
+                _ => x_planets_math::ProjectionMode::Mercator,
+            },
+            None => x_planets_math::ProjectionMode::Mercator,
+        }
+    }
+}
+
 impl ApplicationHandler for NativeApp {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if self.window.is_some() {
@@ -265,9 +277,10 @@ impl NativeApp {
 
         // ── 2. Tick animations (needs mutable engine) ──
         {
+            let mode = self.resolve_projection_mode();
             let engine = self.engine.as_mut().unwrap();
-            self.anim.tick_zoom(engine, dt);
-            self.anim.tick_pan(engine, dt);
+            self.anim.tick_zoom_for_mode(engine, dt, mode);
+            self.anim.tick_pan_for_mode(engine, dt, mode);
         }
         self.anim.gc_fades(now);
 

@@ -203,6 +203,12 @@ impl MapEngine {
         self.needs_redraw = true;
     }
 
+    /// Pan the map by pixel delta, projection-aware.
+    pub fn pan_for_mode(&mut self, dx: f64, dy: f64, mode: x_planets_math::ProjectionMode) {
+        self.camera.pan_for_mode(&mut self.viewport, dx, dy, mode);
+        self.needs_redraw = true;
+    }
+
     /// Zoom the map at its center.
     pub fn zoom(&mut self, delta: f64) {
         self.camera.zoom(&mut self.viewport, delta);
@@ -212,6 +218,19 @@ impl MapEngine {
     /// Zoom toward a specific screen point (zoom-to-pointer).
     pub fn zoom_at(&mut self, delta: f64, screen_x: f64, screen_y: f64) {
         self.camera.zoom_at(&mut self.viewport, delta, screen_x, screen_y);
+        self.needs_redraw = true;
+    }
+
+    /// Zoom toward a screen point, projection-aware.
+    pub fn zoom_at_for_mode(
+        &mut self,
+        delta: f64,
+        screen_x: f64,
+        screen_y: f64,
+        mode: x_planets_math::ProjectionMode,
+    ) {
+        self.camera
+            .zoom_at_for_mode(&mut self.viewport, delta, screen_x, screen_y, mode);
         self.needs_redraw = true;
     }
 

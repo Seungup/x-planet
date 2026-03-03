@@ -119,6 +119,16 @@ impl AnimationController {
 
     /// Advance smooth zoom and inertia pan. Call once per frame with `dt` in seconds.
     pub fn tick(&mut self, engine: &mut MapEngine, dt: f64) {
+        self.tick_with_mode(engine, dt, x_planets_math::ProjectionMode::Mercator);
+    }
+
+    /// Advance smooth zoom and inertia pan, projection-aware.
+    pub fn tick_with_mode(
+        &mut self,
+        engine: &mut MapEngine,
+        dt: f64,
+        mode: x_planets_math::ProjectionMode,
+    ) {
         // ── Smooth zoom ──
         let current = engine.viewport.zoom;
         let target = self
@@ -129,7 +139,7 @@ impl AnimationController {
             let new_zoom = exp_decay(current, target, ZOOM_ANIM_SPEED, dt);
             let delta = new_zoom - current;
             match self.zoom_anchor {
-                Some((mx, my)) => engine.zoom_at(delta, mx, my),
+                Some((mx, my)) => engine.zoom_at_for_mode(delta, mx, my, mode),
                 None => engine.zoom(delta),
             }
         } else if (current - target).abs() > 1e-9 {
@@ -141,7 +151,7 @@ impl AnimationController {
         let (vx, vy) = self.pan_velocity;
         let speed = (vx * vx + vy * vy).sqrt();
         if speed > INERTIA_MIN_SPEED {
-            engine.pan(vx * dt, -(vy * dt));
+            engine.pan_for_mode(vx * dt, -(vy * dt), mode);
             let friction = (-INERTIA_FRICTION * dt).exp();
             self.pan_velocity = (vx * friction, vy * friction);
         } else {
