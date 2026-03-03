@@ -472,10 +472,12 @@ fn register_touch_events(
                                 + (end_pos.1 - start_pos.1).powi(2))
                             .sqrt();
                             if duration < TAP_MAX_DURATION && dist < TAP_MAX_DISTANCE {
-                                let phys = (start_pos.0 * dpr, start_pos.1 * dpr);
-                                if app.anim.check_double_click(phys, now) {
+                                // Use CSS pixels for distance check (matches mouse),
+                                // physical pixels only for the zoom anchor.
+                                if app.anim.check_double_click(start_pos, now) {
                                     app.anim.zoom_target += 1.0;
-                                    app.anim.zoom_anchor = Some(phys);
+                                    app.anim.zoom_anchor =
+                                        Some((start_pos.0 * dpr, start_pos.1 * dpr));
                                 }
                             }
                         }

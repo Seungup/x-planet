@@ -108,6 +108,14 @@ impl WebApp {
         }
     }
 
+    /// Resolve the active projection name to a `ProjectionMode` enum.
+    fn resolve_projection_mode(&self) -> x_planets_math::ProjectionMode {
+        match self.engine.active_projection.as_str() {
+            "Equirectangular" => x_planets_math::ProjectionMode::Equirectangular,
+            _ => x_planets_math::ProjectionMode::Mercator,
+        }
+    }
+
     /// Cycle to the next projection and return its name.
     pub fn cycle_projection(&mut self) -> String {
         let mut names: Vec<String> = self
@@ -280,8 +288,9 @@ impl WebApp {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let mode = self.resolve_projection_mode();
         self.renderer
-            .render_frame_layered(&self.gpu, &view, &self.engine.viewport, &layers);
+            .render_frame_layered_projected(&self.gpu, &view, &self.engine.viewport, &layers, mode);
 
         frame.present();
 

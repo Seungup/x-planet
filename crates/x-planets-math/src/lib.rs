@@ -357,6 +357,43 @@ pub fn mercator_to_geo(pos: DVec2) -> GeoCoord {
     GeoCoord::new(lat_rad.to_degrees(), lon)
 }
 
+/// Convert a Mercator normalized y [0,1] to latitude in radians.
+pub fn mercator_y_to_lat_rad(y: f64) -> f64 {
+    (PI * (1.0 - 2.0 * y)).sinh().atan()
+}
+
+/// Convert a Mercator normalized y [0,1] to Equirectangular normalized y [0,1].
+///
+/// Equirectangular y is linear in latitude: `y_eq = 0.5 - lat_deg / 180`.
+pub fn mercator_y_to_equirectangular_y(y: f64) -> f64 {
+    let lat_rad = mercator_y_to_lat_rad(y);
+    0.5 - lat_rad.to_degrees() / 180.0
+}
+
+/// Convert latitude/longitude to Equirectangular normalized coordinates (0..1).
+///
+/// X is identical to Mercator. Y is linear in latitude.
+pub fn geo_to_equirectangular(coord: &GeoCoord) -> DVec2 {
+    DVec2::new(
+        (coord.lon + 180.0) / 360.0,
+        0.5 - coord.lat / 180.0,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Projection mode
+// ---------------------------------------------------------------------------
+
+/// Which map projection to use for tile positioning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProjectionMode {
+    /// Web Mercator (conformal, area-distorting at poles).
+    #[default]
+    Mercator,
+    /// Equirectangular / Plate Carée (linear lat/lon mapping).
+    Equirectangular,
+}
+
 // ---------------------------------------------------------------------------
 // Convex Polygon 2D (for precise frustum culling)
 // ---------------------------------------------------------------------------

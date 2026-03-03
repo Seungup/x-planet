@@ -16,7 +16,7 @@
 use x_planets_gpu::GpuContext;
 use x_planets_math::{TileCoord, ViewportUniforms};
 
-use crate::pipeline::{build_tile_mesh, tile_uniforms_for_visible, RenderableTile};
+use crate::pipeline::{build_tile_mesh_projected, tile_uniforms_for_visible_projected, RenderableTile};
 use crate::render::{RenderLayerData, TileVertex};
 use crate::viewport::Viewport;
 use std::collections::HashMap;
@@ -264,8 +264,9 @@ impl TileRenderer {
         texture_view: &wgpu::TextureView,
         opacity: f32,
         vp_f64: &glam::DMat4,
+        mode: x_planets_math::ProjectionMode,
     ) -> PreparedTile {
-        let uniforms = tile_uniforms_for_visible(rt, opacity, vp_f64);
+        let uniforms = tile_uniforms_for_visible_projected(rt, opacity, vp_f64, mode);
         let buffer = gpu.create_uniform_buffer("tile-uniforms", &uniforms);
 
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -328,6 +329,24 @@ impl TileRenderer {
         viewport: &Viewport,
         layers: &[RenderLayerData],
     ) {
+        self.render_frame_layered_projected(
+            gpu,
+            target,
+            viewport,
+            layers,
+            x_planets_math::ProjectionMode::Mercator,
+        );
+    }
+
+    /// Like [`render_frame_layered`] but uses the given projection for tile positioning.
+    pub fn render_frame_layered_projected(
+        &self,
+        gpu: &GpuContext,
+        target: &wgpu::TextureView,
+        viewport: &Viewport,
+        layers: &[RenderLayerData],
+        mode: x_planets_math::ProjectionMode,
+    ) {
         if layers.is_empty() {
             // No raster layers to draw, but we still need to clear the surface
             // so subsequent passes (terrain, 3D tiles) compositing with
@@ -371,7 +390,7 @@ impl TileRenderer {
         gpu.update_buffer(&self.viewport_buffer, &uniforms);
 
         // Compute f64 VP for per-tile MVP (eliminates high-zoom jitter)
-        let vp_f64 = viewport.to_view_proj_f64();
+        let vp_f64 = viewport.to_view_proj_f64_projected(mode);
 
         let mut encoder = gpu
             .device
@@ -410,7 +429,7 @@ impl TileRenderer {
 
             // 2. Build batched vertex/index mesh for this layer (RTE positions)
             let coords: Vec<TileCoord> = layer.tiles.iter().map(|t| t.coord).collect();
-            let (vertices, indices) = build_tile_mesh(&coords);
+            let (vertices, indices) = build_tile_mesh_projected(&coords, mode);
 
             if vertices.is_empty() {
                 continue;
@@ -436,7 +455,7 @@ impl TileRenderer {
                             .get(&rt.coord)
                             .copied()
                             .unwrap_or(layer.opacity);
-                        self.prepare_tile(gpu, rt, tex_view, tile_opacity, &vp_f64)
+                        self.prepare_tile(gpu, rt, tex_view, tile_opacity, &vp_f64, mode)
                     })
                 })
                 .collect();
