@@ -465,6 +465,19 @@ impl Viewport {
             }
         }
 
+        // Hard cap: if the initial tile set already exceeds the budget
+        // (e.g. min_z == base_z with a large frustum), keep only the
+        // tiles closest to the viewport center to prevent texture/cache
+        // exhaustion.
+        if result.len() > TILE_BUDGET {
+            result.sort_by(|a, b| {
+                let da = (a.display_mercator_center() - center_merc).length();
+                let db = (b.display_mercator_center() - center_merc).length();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            result.truncate(TILE_BUDGET);
+        }
+
         result.sort_by_key(|vt| vt.coord.z);
         result
     }
@@ -1082,8 +1095,8 @@ mod tests {
 
         let tiles = viewport.visible_tiles();
         assert!(
-            tiles.len() <= 200, // Allow some slack above TILE_BUDGET=150
-            "Too many tiles: {} (budget should cap this)",
+            tiles.len() <= 150,
+            "Too many tiles: {} (budget hard cap is 150)",
             tiles.len()
         );
     }
@@ -1689,8 +1702,8 @@ mod tests {
         let tiles =
             viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
         assert!(
-            tiles.len() <= 200,
-            "Globe mode: too many tiles {} (budget should cap)",
+            tiles.len() <= 150,
+            "Globe mode: too many tiles {} (budget hard cap is 150)",
             tiles.len()
         );
     }
@@ -1812,8 +1825,8 @@ mod tests {
         let tiles =
             viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
         assert!(
-            tiles.len() <= 500,
-            "Centered Mercator at pole: tile count {} seems unreasonable",
+            tiles.len() <= 150,
+            "Centered Mercator at pole: tile count {} exceeds budget 150",
             tiles.len()
         );
     }
@@ -2058,5 +2071,104 @@ mod tests {
             (globe_vp.center.lon - eq_vp.center.lon).abs() < 1e-6,
             "Equirectangular zoom center lon must match Globe",
         );
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Regression: tile budget hard cap
+    // ───────────────────────────────────────────────────────────────
+
+    /// The quadtree LOD must never return more than TILE_BUDGET tiles,
+    /// regardless of viewport size, zoom level, or pitch.
+    /// This prevents texture/cache exhaustion that causes black tiles.
+    #[test]
+    fn test_globe_tile_count_within_budget_all_zooms() {
+        for height in [480, 720, 1080, 1440, 2160] {
+            let width = height * 16 / 9;
+            for zoom in 0..=15 {
+                let mut vp = Viewport::new(width, height);
+                vp.center = GeoCoord::new(0.0, 0.0);
+                vp.zoom = zoom as f64;
+                let tiles = vp
+                    .visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+                assert!(
+                    tiles.len() <= 150,
+                    "Globe tiles at {width}x{height} zoom={zoom}: {} > 150",
+                    tiles.len(),
+                );
+            }
+        }
+    }
+
+    /// Same budget test for Mercator mode.
+    #[test]
+    fn test_mercator_tile_count_within_budget_all_zooms() {
+        for height in [480, 720, 1080, 1440, 2160] {
+            let width = height * 16 / 9;
+            for zoom in 0..=15 {
+                let mut vp = Viewport::new(width, height);
+                vp.center = GeoCoord::new(0.0, 0.0);
+                vp.zoom = zoom as f64;
+                let tiles = vp
+                    .visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+                assert!(
+                    tiles.len() <= 150,
+                    "Mercator tiles at {width}x{height} zoom={zoom}: {} > 150",
+                    tiles.len(),
+                );
+            }
+        }
+    }
+
+    /// Pitched views should also respect the budget.
+    #[test]
+    fn test_pitched_tile_count_within_budget() {
+        for pitch in [30.0, 45.0, 60.0] {
+            for zoom in [3.0, 5.0, 8.0, 12.0] {
+                let mut vp = Viewport::new(1920, 1080);
+                vp.center = GeoCoord::new(37.5665, 126.978);
+                vp.zoom = zoom;
+                vp.pitch = pitch;
+                let globe = vp
+                    .visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+                let merc = vp
+                    .visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+                assert!(
+                    globe.len() <= 150,
+                    "Globe tiles at pitch={pitch} zoom={zoom}: {} > 150",
+                    globe.len(),
+                );
+                assert!(
+                    merc.len() <= 150,
+                    "Mercator tiles at pitch={pitch} zoom={zoom}: {} > 150",
+                    merc.len(),
+                );
+            }
+        }
+    }
+
+    /// Polar centers at various zoom levels should respect the budget.
+    #[test]
+    fn test_polar_tile_count_within_budget() {
+        for lat in [80.0, 85.0, -80.0, -85.0] {
+            for zoom in [0.0, 3.0, 5.0, 8.0] {
+                let mut vp = Viewport::new(1920, 1080);
+                vp.center = GeoCoord::new(lat, 0.0);
+                vp.zoom = zoom;
+                let globe = vp
+                    .visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+                let merc = vp
+                    .visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+                assert!(
+                    globe.len() <= 150,
+                    "Globe tiles at lat={lat} zoom={zoom}: {} > 150",
+                    globe.len(),
+                );
+                assert!(
+                    merc.len() <= 150,
+                    "Mercator tiles at lat={lat} zoom={zoom}: {} > 150",
+                    merc.len(),
+                );
+            }
+        }
     }
 }
