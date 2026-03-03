@@ -59,12 +59,20 @@ impl GpuContext {
             .await
             .ok_or(GpuError::AdapterNotFound)?;
 
+        // Use conservative limits on WASM (WebGL2 fallback compat),
+        // bumped to the adapter's actual resolution capabilities.
+        #[cfg(target_arch = "wasm32")]
+        let required_limits = wgpu::Limits::downlevel_webgl2_defaults()
+            .using_resolution(adapter.limits());
+        #[cfg(not(target_arch = "wasm32"))]
+        let required_limits = wgpu::Limits::default();
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("x-planets-device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits,
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
