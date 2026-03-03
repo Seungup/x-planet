@@ -226,7 +226,7 @@ impl ApplicationHandler for App {
 impl App {
     fn rebuild_and_redraw(&mut self) {
         if let Some(gpu) = &mut self.gpu {
-            let tiles = visible_tiles(&self.viewport);
+            let tiles: Vec<TileCoord> = visible_tiles(&self.viewport).iter().map(|vt| vt.coord).collect();
 
             // Compute which tiles are cached
             let cached_set: HashSet<TileCoord> = tiles
@@ -278,7 +278,7 @@ impl App {
 
     fn simulate_tile_load(&mut self) {
         // Simulate: load the highest-priority uncached tiles
-        let tiles = visible_tiles(&self.viewport);
+        let tiles: Vec<TileCoord> = visible_tiles(&self.viewport).iter().map(|vt| vt.coord).collect();
         let cached_set: HashSet<TileCoord> = tiles
             .iter()
             .filter(|t| self.tile_cache.get(t).is_some())
@@ -428,7 +428,7 @@ async fn init_gpu(window: Arc<Window>, viewport: &Viewport) -> GpuState {
     });
 
     // Initial tiles
-    let tiles = visible_tiles(viewport);
+    let tiles: Vec<TileCoord> = visible_tiles(viewport).iter().map(|vt| vt.coord).collect();
     let (vertices, indices) = build_tile_mesh(&tiles);
 
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

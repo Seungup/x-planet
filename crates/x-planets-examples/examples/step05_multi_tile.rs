@@ -219,7 +219,7 @@ impl ApplicationHandler for App {
 }
 
 fn rebuild_tiles(gpu: &mut GpuState, viewport: &Viewport) {
-    let tiles = visible_tiles(viewport);
+    let tiles: Vec<TileCoord> = visible_tiles(viewport).iter().map(|vt| vt.coord).collect();
     if tiles.is_empty() {
         gpu.visible_tiles = tiles;
         return;
@@ -383,7 +383,7 @@ async fn init_gpu(window: Arc<Window>, viewport: &Viewport) -> GpuState {
     });
 
     // ── Initial tile geometry ───────────────────────────────────
-    let tiles = visible_tiles(viewport);
+    let tiles: Vec<TileCoord> = visible_tiles(viewport).iter().map(|vt| vt.coord).collect();
     let (vertices, indices) = build_tile_mesh(&tiles);
 
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

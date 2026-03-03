@@ -2,7 +2,7 @@
 
 use x_planets_math::{
     geo_to_mercator, mercator_to_geo, BoundingBox, ConvexPolygon2D, Frustum2D, GeoCoord,
-    TileCoord, ViewportUniforms,
+    ViewportUniforms, VisibleTile,
 };
 
 /// The viewport represents the visible area of the map.
@@ -45,13 +45,16 @@ impl Viewport {
     /// rays to the z=0 ground plane so the AABB genuinely covers the full
     /// camera view.  For top-down north-up views, a fast analytic path is used.
     pub fn visible_bounds(&self) -> BoundingBox {
-        self.compute_frustum_geometry().0
+        let (bbox, _, _, _) = self.compute_frustum_geometry();
+        bbox
     }
 
-    /// Compute frustum geometry: returns (BoundingBox, Option<ConvexPolygon2D>).
+    /// Compute frustum geometry: returns (BoundingBox, Option<ConvexPolygon2D>, merc_sw, merc_ne).
     ///
     /// The polygon is `None` for top-down north-up views (where AABB is tight).
-    fn compute_frustum_geometry(&self) -> (BoundingBox, Option<ConvexPolygon2D>) {
+    /// `merc_sw` / `merc_ne` are raw Mercator bounds where X may extend
+    /// beyond [0, 1] for viewports crossing the antimeridian.
+    fn compute_frustum_geometry(&self) -> (BoundingBox, Option<ConvexPolygon2D>, glam::DVec2, glam::DVec2) {
         let center_merc = geo_to_mercator(&self.center);
         let scale = 2.0_f64.powf(-self.zoom);
         let aspect = self.width as f64 / self.height as f64;
@@ -60,15 +63,19 @@ impl Viewport {
         if self.pitch < 1.0 && self.bearing.abs() < 1.0 {
             let half_h = scale * 1.1;
             let half_w = scale * aspect * 1.1;
+            // X is NOT clamped — allows viewport to extend beyond [0,1] for
+            // antimeridian wrapping.  Y is clamped (no vertical wrap in Mercator).
             let sw = glam::DVec2::new(
-                (center_merc.x - half_w).clamp(0.0, 1.0),
+                center_merc.x - half_w,
                 (center_merc.y + half_h).clamp(0.0, 1.0),
             );
             let ne = glam::DVec2::new(
-                (center_merc.x + half_w).clamp(0.0, 1.0),
+                center_merc.x + half_w,
                 (center_merc.y - half_h).clamp(0.0, 1.0),
             );
-            return (BoundingBox::new(mercator_to_geo(sw), mercator_to_geo(ne)), None);
+            let sw_geo = mercator_to_geo(glam::DVec2::new(sw.x.clamp(0.0, 1.0), sw.y));
+            let ne_geo = mercator_to_geo(glam::DVec2::new(ne.x.clamp(0.0, 1.0), ne.y));
+            return (BoundingBox::new(sw_geo, ne_geo), None, sw, ne);
         }
 
         // ── Perspective frustum ray → ground-plane intersection ──
@@ -137,8 +144,10 @@ impl Viewport {
                     (cx, cy)
                 }
             };
+            // X is NOT clamped — allows viewport to extend beyond [0,1] for
+            // antimeridian wrapping.  Y is clamped (no vertical wrap in Mercator).
             ground_points.push(glam::DVec2::new(
-                gx.clamp(0.0, 1.0),
+                gx,
                 gy.clamp(0.0, 1.0),
             ));
             min_x = min_x.min(gx);
@@ -147,25 +156,29 @@ impl Viewport {
             max_y = max_y.max(gy);
         }
 
-        // 5 % safety margin then clamp to Mercator [0, 1].
+        // 5 % safety margin.  X is NOT clamped; Y is clamped to [0, 1].
         let mx = (max_x - min_x) * 0.05;
         let my = (max_y - min_y) * 0.05;
-        min_x = (min_x - mx).clamp(0.0, 1.0);
-        max_x = (max_x + mx).clamp(0.0, 1.0);
+        min_x -= mx;
+        max_x += mx;
         min_y = (min_y - my).clamp(0.0, 1.0);
         max_y = (max_y + my).clamp(0.0, 1.0);
 
-        // Mercator Y: smaller = north, larger = south.
+        // Raw Mercator bounds (X can be outside [0,1])
+        let merc_sw = glam::DVec2::new(min_x, max_y);
+        let merc_ne = glam::DVec2::new(max_x, min_y);
+
+        // BoundingBox (for backward compat) uses clamped X for GeoCoord conversion
         let bbox = BoundingBox::new(
-            mercator_to_geo(glam::DVec2::new(min_x, max_y)),
-            mercator_to_geo(glam::DVec2::new(max_x, min_y)),
+            mercator_to_geo(glam::DVec2::new(min_x.clamp(0.0, 1.0), max_y)),
+            mercator_to_geo(glam::DVec2::new(max_x.clamp(0.0, 1.0), min_y)),
         );
 
         // Build convex polygon from ground-plane hit points (with margin).
         // Add margin points to the polygon as well for safety.
         let polygon = ConvexPolygon2D::from_points(&ground_points);
 
-        (bbox, polygon)
+        (bbox, polygon, merc_sw, merc_ne)
     }
 
     /// Get the frustum for tile culling.
@@ -173,10 +186,10 @@ impl Viewport {
     /// For pitched/rotated views, includes a convex polygon for precise
     /// culling that avoids wasting tile budget on off-screen tiles.
     pub fn frustum(&self) -> Frustum2D {
-        let (bounds, polygon) = self.compute_frustum_geometry();
+        let (bounds, polygon, merc_sw, merc_ne) = self.compute_frustum_geometry();
         match polygon {
-            Some(poly) => Frustum2D::with_polygon(bounds, poly),
-            None => Frustum2D::new(bounds),
+            Some(poly) => Frustum2D::with_merc_bounds_and_polygon(bounds, merc_sw, merc_ne, poly),
+            None => Frustum2D::with_merc_bounds(bounds, merc_sw, merc_ne),
         }
     }
 
@@ -193,7 +206,7 @@ impl Viewport {
     /// directly into the result at their current (coarse) level.
     ///
     /// Returns tiles sorted by ascending zoom (coarser first → finer last).
-    pub fn visible_tiles(&self) -> Vec<TileCoord> {
+    pub fn visible_tiles(&self) -> Vec<VisibleTile> {
         let base_z = self.tile_zoom();
         if base_z == 0 {
             return self.frustum().visible_tiles(0);
@@ -202,7 +215,7 @@ impl Viewport {
     }
 
     /// Quadtree-based LOD tile selection (gap-free, priority-ordered, budgeted).
-    fn quadtree_lod(&self, base_z: u8) -> Vec<TileCoord> {
+    fn quadtree_lod(&self, base_z: u8) -> Vec<VisibleTile> {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
@@ -244,7 +257,7 @@ impl Viewport {
         // ── Priority: closer tiles are more important (max-heap) ──
         #[derive(Debug)]
         struct Candidate {
-            coord: TileCoord,
+            tile: VisibleTile,
             priority: f64, // higher = more important
         }
         impl PartialEq for Candidate {
@@ -268,49 +281,49 @@ impl Viewport {
 
         let frustum = self.frustum();
         let mut heap = BinaryHeap::<Candidate>::new();
-        let mut result = Vec::<TileCoord>::new();
+        let mut result = Vec::<VisibleTile>::new();
 
         // Seed: visible tiles at min_z (coarse, guaranteed small set).
-        for tile in frustum.visible_tiles(min_z) {
-            let tc = tile.mercator_center();
+        for vt in frustum.visible_tiles(min_z) {
+            let tc = vt.display_mercator_center();
             let dist = (tc - center_merc).length();
             heap.push(Candidate {
-                coord: tile,
+                tile: vt,
                 priority: 1.0 / (dist + 1e-10),
             });
         }
 
         // ── Quadtree traversal ──
         while let Some(candidate) = heap.pop() {
-            let tile = candidate.coord;
-            let tc = tile.mercator_center();
+            let vt = candidate.tile;
+            let tc = vt.display_mercator_center();
             let ideal_z = ideal_zoom_at(tc.x, tc.y);
 
             // Should we subdivide this tile?
-            let should_subdivide = tile.z < ideal_z
-                && tile.z < base_z
+            let should_subdivide = vt.coord.z < ideal_z
+                && vt.coord.z < base_z
                 && (result.len() + heap.len() + 4) <= TILE_BUDGET;
 
             if should_subdivide {
                 // Push 4 children — visible ones only.
-                for child in tile.children() {
-                    if frustum.is_tile_visible(&child) {
-                        let cc = child.mercator_center();
+                for child in vt.children() {
+                    if frustum.is_visible_tile(&child) {
+                        let cc = child.display_mercator_center();
                         let dist = (cc - center_merc).length();
                         heap.push(Candidate {
-                            coord: child,
+                            tile: child,
                             priority: 1.0 / (dist + 1e-10),
                         });
                     }
                 }
             } else {
                 // Keep at current zoom level.
-                result.push(tile);
+                result.push(vt);
             }
         }
 
         // Sort: coarser first (background), finer last (foreground).
-        result.sort_by_key(|t| t.z);
+        result.sort_by_key(|vt| vt.coord.z);
         result
     }
 
@@ -457,7 +470,8 @@ impl CameraController {
         let merc_dy = -(sin_b * dx_n - cos_b * dy_n);
 
         let mut center_merc = geo_to_mercator(&viewport.center);
-        center_merc.x = (center_merc.x + merc_dx).clamp(0.0, 1.0);
+        // X wraps around the antimeridian; Y stays clamped (no vertical wrap).
+        center_merc.x = (center_merc.x + merc_dx).rem_euclid(1.0);
         center_merc.y = (center_merc.y + merc_dy).clamp(0.0, 1.0);
 
         viewport.center = mercator_to_geo(center_merc);
@@ -516,7 +530,8 @@ impl CameraController {
         let merc_dy = (dx_norm * aspect * sin_b + dy_norm * cos_b) * scale_diff;
 
         let mut center_merc = geo_to_mercator(&viewport.center);
-        center_merc.x = (center_merc.x + merc_dx).clamp(0.0, 1.0);
+        // X wraps around the antimeridian; Y stays clamped.
+        center_merc.x = (center_merc.x + merc_dx).rem_euclid(1.0);
         center_merc.y = (center_merc.y + merc_dy).clamp(0.0, 1.0);
         viewport.center = mercator_to_geo(center_merc);
     }
@@ -531,6 +546,7 @@ impl Default for CameraController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use x_planets_math::TileCoord;
 
     #[test]
     fn test_viewport_visible_tiles() {
@@ -597,7 +613,7 @@ mod tests {
 
         // Should contain tiles at multiple zoom levels.
         let zoom_levels: std::collections::HashSet<u8> =
-            tiles.iter().map(|t| t.z).collect();
+            tiles.iter().map(|t| t.coord.z).collect();
         assert!(
             zoom_levels.len() >= 2,
             "Expected multi-level LOD, got levels: {:?}",
@@ -615,7 +631,7 @@ mod tests {
         let tiles = viewport.visible_tiles();
         // Tiles should be sorted by zoom level (coarse first).
         for pair in tiles.windows(2) {
-            assert!(pair[0].z <= pair[1].z, "Tiles not sorted by zoom level");
+            assert!(pair[0].coord.z <= pair[1].coord.z, "Tiles not sorted by zoom level");
         }
     }
 
@@ -628,7 +644,7 @@ mod tests {
 
         let tiles = viewport.visible_tiles();
         let zoom_levels: std::collections::HashSet<u8> =
-            tiles.iter().map(|t| t.z).collect();
+            tiles.iter().map(|t| t.coord.z).collect();
         assert_eq!(zoom_levels.len(), 1, "pitch=0 should use single zoom level");
         assert!(zoom_levels.contains(&5));
     }
@@ -664,12 +680,12 @@ mod tests {
         let base_z = viewport.tile_zoom();
         let tiles = viewport.visible_tiles();
         let result_set: std::collections::HashSet<TileCoord> =
-            tiles.iter().copied().collect();
+            tiles.iter().map(|vt| vt.coord).collect();
 
         let frustum = viewport.frustum();
-        for base_tile in frustum.visible_tiles(base_z) {
+        for base_vt in frustum.visible_tiles(base_z) {
             // Walk up from base_tile; at least one ancestor must be in result_set.
-            let mut cur = base_tile;
+            let mut cur = base_vt.coord;
             let mut found = false;
             loop {
                 if result_set.contains(&cur) {
@@ -683,8 +699,8 @@ mod tests {
             }
             assert!(
                 found,
-                "Base tile {} has no covering tile in LOD result",
-                base_tile
+                "Base tile {:?} has no covering tile in LOD result",
+                base_vt.coord
             );
         }
     }
@@ -718,7 +734,7 @@ mod tests {
         let base_z = viewport.tile_zoom();
         let tiles = viewport.visible_tiles();
         // Find tiles that are at the base zoom level (finest).
-        let fine_tiles: Vec<&TileCoord> = tiles.iter().filter(|t| t.z == base_z).collect();
+        let fine_tiles: Vec<_> = tiles.iter().filter(|t| t.coord.z == base_z).collect();
         assert!(
             !fine_tiles.is_empty(),
             "Should have at least some tiles at the base zoom level {}",
@@ -740,7 +756,7 @@ mod tests {
 
         // Should still be sorted coarse-first.
         for pair in tiles.windows(2) {
-            assert!(pair[0].z <= pair[1].z);
+            assert!(pair[0].coord.z <= pair[1].coord.z);
         }
     }
 

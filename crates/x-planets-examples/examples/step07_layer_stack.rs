@@ -253,7 +253,7 @@ impl ApplicationHandler for App {
 impl App {
     fn rebuild_and_redraw(&mut self) {
         if let Some(gpu) = &mut self.gpu {
-            let tiles = visible_tiles(&self.viewport);
+            let tiles: Vec<TileCoord> = visible_tiles(&self.viewport).iter().map(|vt| vt.coord).collect();
             if !tiles.is_empty() {
                 let (vertices, indices) = build_tile_mesh(&tiles);
                 gpu.vertex_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -392,7 +392,7 @@ async fn init_gpu(window: Arc<Window>, viewport: &Viewport) -> GpuState {
         cache: None,
     });
 
-    let tiles = visible_tiles(viewport);
+    let tiles: Vec<TileCoord> = visible_tiles(viewport).iter().map(|vt| vt.coord).collect();
     let (vertices, indices) = build_tile_mesh(&tiles);
 
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

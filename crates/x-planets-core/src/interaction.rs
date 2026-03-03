@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use x_planets_math::TileCoord;
+use x_planets_math::{TileCoord, VisibleTile};
 
 use crate::engine::MapEngine;
 use crate::pipeline::RenderableTile;
@@ -239,18 +239,22 @@ impl AnimationController {
 ///
 /// `tile_fade_elapsed_fn` returns the elapsed seconds since a tile was loaded,
 /// or `None` if the tile is not being tracked for fade-in.
+/// Crossfade tile entry with display_x for antimeridian wrapping.
+pub type CrossfadeTile = (TileCoord, f32, i64);
+
 pub fn compute_crossfade<F>(
-    visible: &[TileCoord],
+    visible: &[VisibleTile],
     available: &HashSet<TileCoord>,
     tile_fade_elapsed_fn: F,
-) -> (HashSet<TileCoord>, Vec<(TileCoord, f32)>)
+) -> (HashSet<TileCoord>, Vec<CrossfadeTile>)
 where
     F: Fn(&TileCoord) -> Option<f64>,
 {
     let mut available_for_base = available.clone();
-    let mut crossfade_tiles: Vec<(TileCoord, f32)> = Vec::new();
+    let mut crossfade_tiles: Vec<CrossfadeTile> = Vec::new();
 
-    for &coord in visible {
+    for vt in visible {
+        let coord = vt.coord;
         if !available.contains(&coord) {
             continue;
         }
@@ -271,7 +275,7 @@ where
                 if has_parent {
                     available_for_base.remove(&coord);
                     let fade_t = ((elapsed / FADE_DURATION) as f32).clamp(1.0 / 60.0, 1.0);
-                    crossfade_tiles.push((coord, fade_t));
+                    crossfade_tiles.push((coord, fade_t, vt.display_x));
                 }
             }
         }
@@ -309,16 +313,17 @@ where
 /// Build crossfade overlay [`RenderableTile`]s and their opacity overrides
 /// from the crossfade tile list.
 pub fn build_crossfade_overlay(
-    crossfade_tiles: &[(TileCoord, f32)],
+    crossfade_tiles: &[CrossfadeTile],
     layer_opacity: f32,
 ) -> (Vec<RenderableTile>, HashMap<TileCoord, f32>) {
     let mut tiles = Vec::with_capacity(crossfade_tiles.len());
     let mut opacity_map = HashMap::with_capacity(crossfade_tiles.len());
-    for &(coord, fade_t) in crossfade_tiles {
+    for &(coord, fade_t, display_x) in crossfade_tiles {
         tiles.push(RenderableTile {
             coord,
             texture_coord: coord,
             uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x,
         });
         opacity_map.insert(coord, layer_opacity * fade_t);
     }
@@ -642,7 +647,7 @@ mod tests {
     fn test_crossfade_with_parent() {
         let parent = TileCoord::new(1, 0, 0);
         let child = TileCoord::new(2, 0, 0);
-        let visible = vec![child];
+        let visible = vec![VisibleTile::canonical(child)];
         let available: HashSet<TileCoord> = [parent, child].into_iter().collect();
 
         // Child is mid-fade (0.15s elapsed)
@@ -667,7 +672,7 @@ mod tests {
     #[test]
     fn test_crossfade_without_parent() {
         let child = TileCoord::new(2, 0, 0);
-        let visible = vec![child];
+        let visible = vec![VisibleTile::canonical(child)];
         let available: HashSet<TileCoord> = [child].into_iter().collect();
 
         let (base_available, crossfade) =

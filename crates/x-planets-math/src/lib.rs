@@ -176,6 +176,65 @@ impl std::fmt::Display for TileCoord {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Visible Tile (canonical coord + unwrapped display X for antimeridian)
+// ---------------------------------------------------------------------------
+
+/// A tile visible in the viewport with unwrapped display coordinate.
+///
+/// `coord` uses canonical x in `[0, 2^z)` — for cache, fetch, and texture lookup.
+/// `display_x` is the unwrapped x position in tile units — used for MVP computation
+/// so tiles render at the correct screen position across the antimeridian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisibleTile {
+    pub coord: TileCoord,
+    pub display_x: i64,
+}
+
+impl VisibleTile {
+    /// Create a VisibleTile with no wrapping offset (display_x == coord.x).
+    pub fn canonical(coord: TileCoord) -> Self {
+        Self {
+            display_x: coord.x as i64,
+            coord,
+        }
+    }
+
+    /// Mercator center using the unwrapped display_x for correct screen placement.
+    pub fn display_mercator_center(&self) -> DVec2 {
+        let n = self.coord.extent() as f64;
+        DVec2::new(
+            (self.display_x as f64 + 0.5) / n,
+            (self.coord.y as f64 + 0.5) / n,
+        )
+    }
+
+    /// Return the four children tiles, propagating the display_x offset.
+    pub fn children(&self) -> [VisibleTile; 4] {
+        let z = self.coord.z + 1;
+        let n = (1u32 << z) as i64;
+        let dx = self.display_x * 2;
+        [
+            VisibleTile {
+                coord: TileCoord::new(z, (dx).rem_euclid(n) as u32, self.coord.y * 2),
+                display_x: dx,
+            },
+            VisibleTile {
+                coord: TileCoord::new(z, (dx + 1).rem_euclid(n) as u32, self.coord.y * 2),
+                display_x: dx + 1,
+            },
+            VisibleTile {
+                coord: TileCoord::new(z, (dx).rem_euclid(n) as u32, self.coord.y * 2 + 1),
+                display_x: dx,
+            },
+            VisibleTile {
+                coord: TileCoord::new(z, (dx + 1).rem_euclid(n) as u32, self.coord.y * 2 + 1),
+                display_x: dx + 1,
+            },
+        ]
+    }
+}
+
 fn tile_y_to_lat(y: f64, n: f64) -> f64 {
     let lat_rad = (PI * (1.0 - 2.0 * y / n)).sinh().atan();
     lat_rad.to_degrees()
@@ -486,9 +545,15 @@ fn convex_hull_ccw(points: &[DVec2]) -> Vec<DVec2> {
 ///
 /// Contains both an AABB (for fast grid enumeration) and an optional
 /// convex polygon (for precise culling when camera is rotated/pitched).
+///
+/// `merc_sw` / `merc_ne` store raw Mercator bounds where X may extend
+/// beyond `[0, 1]` for viewports crossing the antimeridian.
 #[derive(Debug, Clone)]
 pub struct Frustum2D {
     pub bounds: BoundingBox,
+    /// Raw Mercator bounds (X can be < 0 or > 1 for antimeridian wrapping).
+    pub merc_sw: DVec2,
+    pub merc_ne: DVec2,
     /// Precise frustum polygon in Mercator space.  `None` for top-down
     /// north-up views where the AABB is already tight.
     pub polygon: Option<ConvexPolygon2D>,
@@ -496,21 +561,78 @@ pub struct Frustum2D {
 
 impl Frustum2D {
     pub fn new(bounds: BoundingBox) -> Self {
+        let sw = geo_to_mercator(&bounds.south_west);
+        let ne = geo_to_mercator(&bounds.north_east);
         Self {
             bounds,
+            merc_sw: sw,
+            merc_ne: ne,
             polygon: None,
+        }
+    }
+
+    /// Create a frustum with raw Mercator bounds (X may be outside [0,1]).
+    pub fn with_merc_bounds(bounds: BoundingBox, merc_sw: DVec2, merc_ne: DVec2) -> Self {
+        Self {
+            bounds,
+            merc_sw,
+            merc_ne,
+            polygon: None,
+        }
+    }
+
+    /// Create a frustum with raw Mercator bounds and a precise polygon for culling.
+    pub fn with_merc_bounds_and_polygon(
+        bounds: BoundingBox,
+        merc_sw: DVec2,
+        merc_ne: DVec2,
+        polygon: ConvexPolygon2D,
+    ) -> Self {
+        Self {
+            bounds,
+            merc_sw,
+            merc_ne,
+            polygon: Some(polygon),
         }
     }
 
     /// Create a frustum with a precise polygon for culling.
     pub fn with_polygon(bounds: BoundingBox, polygon: ConvexPolygon2D) -> Self {
+        let sw = geo_to_mercator(&bounds.south_west);
+        let ne = geo_to_mercator(&bounds.north_east);
         Self {
             bounds,
+            merc_sw: sw,
+            merc_ne: ne,
             polygon: Some(polygon),
         }
     }
 
-    /// Test whether a tile is visible within this frustum.
+    /// Test whether a visible tile (with display_x) is within this frustum.
+    ///
+    /// Uses AABB check against raw Mercator bounds (supports antimeridian wrapping),
+    /// then precise polygon SAT test if available.
+    pub fn is_visible_tile(&self, vt: &VisibleTile) -> bool {
+        let n = vt.coord.extent() as f64;
+        let tmin = DVec2::new(vt.display_x as f64 / n, vt.coord.y as f64 / n);
+        let tmax = DVec2::new((vt.display_x + 1) as f64 / n, (vt.coord.y + 1) as f64 / n);
+
+        // AABB check against raw Mercator bounds (X may be outside [0,1])
+        if tmax.x < self.merc_sw.x || tmin.x > self.merc_ne.x
+            || tmax.y < self.merc_ne.y || tmin.y > self.merc_sw.y
+        {
+            return false;
+        }
+
+        // Precise polygon check if available.
+        if let Some(ref poly) = self.polygon {
+            return poly.intersects_aabb(tmin, tmax);
+        }
+
+        true
+    }
+
+    /// Test whether a tile (canonical coordinates) is visible.
     ///
     /// Uses AABB pre-filter, then precise polygon SAT test if available.
     pub fn is_tile_visible(&self, tile: &TileCoord) -> bool {
@@ -530,30 +652,35 @@ impl Frustum2D {
         true
     }
 
-    /// Get all visible tiles at a given zoom level.
-    pub fn visible_tiles(&self, zoom: u8) -> Vec<TileCoord> {
+    /// Get all visible tiles at a given zoom level, with antimeridian wrapping.
+    ///
+    /// Returns `VisibleTile` with `display_x` that may be negative or >= 2^z.
+    /// The canonical `coord.x` is always wrapped to `[0, 2^z)`.
+    pub fn visible_tiles(&self, zoom: u8) -> Vec<VisibleTile> {
         let n = 1u32 << zoom;
-        let sw = geo_to_mercator(&self.bounds.south_west);
-        let ne = geo_to_mercator(&self.bounds.north_east);
+        let n_f = n as f64;
+        let n_i = n as i64;
 
-        let x_min = (sw.x * n as f64).floor().max(0.0) as u32;
-        let x_max = (ne.x * n as f64).ceil().min(n as f64) as u32;
-        let y_min = (ne.y * n as f64).floor().max(0.0) as u32;
-        let y_max = (sw.y * n as f64).ceil().min(n as f64) as u32;
+        // Use raw Mercator bounds (X can extend beyond [0, 1])
+        let x_min = (self.merc_sw.x * n_f).floor() as i64;
+        let x_max = (self.merc_ne.x * n_f).ceil() as i64;
+        let y_min = (self.merc_ne.y * n_f).floor().max(0.0) as u32;
+        let y_max = (self.merc_sw.y * n_f).ceil().min(n_f) as u32;
 
         let mut tiles = Vec::new();
-        for x in x_min..x_max {
+        for display_x in x_min..x_max {
+            let canonical_x = display_x.rem_euclid(n_i) as u32;
             for y in y_min..y_max {
-                let tile = TileCoord::new(zoom, x, y);
-                // Apply polygon filter if available.
+                let coord = TileCoord::new(zoom, canonical_x, y);
+                // Apply polygon filter using display coordinates.
                 if let Some(ref poly) = self.polygon {
-                    let tmin = tile.mercator_min();
-                    let tmax = tile.mercator_max();
+                    let tmin = DVec2::new(display_x as f64 / n_f, y as f64 / n_f);
+                    let tmax = DVec2::new((display_x + 1) as f64 / n_f, (y + 1) as f64 / n_f);
                     if !poly.intersects_aabb(tmin, tmax) {
                         continue;
                     }
                 }
-                tiles.push(tile);
+                tiles.push(VisibleTile { coord, display_x });
             }
         }
         tiles
@@ -638,7 +765,7 @@ mod tests {
         assert!(!tiles.is_empty());
         // All returned tiles should intersect the frustum bounds
         for t in &tiles {
-            assert!(frustum.is_tile_visible(t));
+            assert!(frustum.is_tile_visible(&t.coord));
         }
     }
 
