@@ -556,7 +556,8 @@ impl TileRenderer {
             };
             let depth_load = wgpu::LoadOp::Clear(1.0);
 
-            let is_globe = mode == x_planets_math::ProjectionMode::Globe;
+            let is_globe = mode == x_planets_math::ProjectionMode::Globe
+                || mode == x_planets_math::ProjectionMode::Equirectangular;
 
             if is_globe {
                 // ── Globe path: tessellated sphere mesh ──
