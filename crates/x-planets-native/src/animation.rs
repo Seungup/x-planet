@@ -90,7 +90,7 @@ impl AnimationState {
         let delta = new_zoom - current;
         match self.zoom_anchor {
             Some((mx, my)) => engine.zoom_at_for_mode(delta, mx, my, mode),
-            None => engine.zoom(delta),
+            None => engine.zoom_for_mode(delta, mode),
         }
     }
 

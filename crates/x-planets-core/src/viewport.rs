@@ -712,7 +712,12 @@ impl Viewport {
         let target = glam::DVec3::new(cx, cy, 0.0);
 
         let view = glam::DMat4::look_at_rh(eye, target, up);
-        let proj = glam::DMat4::perspective_rh(fov_y, aspect, cam_h * 0.005, cam_h * 10.0);
+        // Adaptive near/far: tighten the ratio at low zoom to preserve
+        // depth-buffer precision and prevent jitter.  At zoom 0 cam_h ≈ 1.73;
+        // the old 0.005/10.0 gave a 2000:1 ratio which caused heavy shaking.
+        let near = cam_h * 0.1;
+        let far = cam_h * 4.0;
+        let proj = glam::DMat4::perspective_rh(fov_y, aspect, near, far);
 
         let flip_x = glam::DMat4::from_diagonal(glam::DVec4::new(-1.0, 1.0, 1.0, 1.0));
         flip_x * proj * view
@@ -812,7 +817,9 @@ impl Viewport {
         let target = glam::Vec3::new(cx, cy, 0.0);
 
         let view = glam::Mat4::look_at_rh(eye, target, up);
-        let proj = glam::Mat4::perspective_rh(fov_y, aspect, cam_h * 0.005, cam_h * 10.0);
+        let near = cam_h * 0.1;
+        let far = cam_h * 4.0;
+        let proj = glam::Mat4::perspective_rh(fov_y, aspect, near, far);
 
         // look_at_rh with up=(sin_b,-cos_b,0) makes camera_right = world(-cos_b,-sin_b,0),
         // which flips X when bearing=0. Correct with a -X scale so world east → screen right.
@@ -889,6 +896,25 @@ impl CameraController {
             .clamp(self.min_zoom, self.max_zoom);
     }
 
+    /// Zoom with projection-aware minimum.
+    ///
+    /// Centered (oblique) Mercator has a singularity at ~90° from the
+    /// projection center, so zooming out beyond ~2 leaves large gaps.
+    /// This enforces a higher minimum zoom for Mercator mode.
+    pub fn zoom_for_mode(
+        &self,
+        viewport: &mut Viewport,
+        delta: f64,
+        mode: x_planets_math::ProjectionMode,
+    ) {
+        let effective_min = match mode {
+            x_planets_math::ProjectionMode::Mercator => self.min_zoom.max(2.0),
+            _ => self.min_zoom,
+        };
+        viewport.zoom = (viewport.zoom + delta * self.zoom_speed)
+            .clamp(effective_min, self.max_zoom);
+    }
+
     /// Set absolute pitch angle (clamped to 0–60 degrees).
     pub fn set_pitch(&self, viewport: &mut Viewport, degrees: f64) {
         viewport.pitch = degrees.clamp(0.0, 60.0);
@@ -933,7 +959,7 @@ impl CameraController {
 
         let old_scale = 2.0_f64.powf(-viewport.zoom);
 
-        self.zoom(viewport, delta);
+        self.zoom_for_mode(viewport, delta, mode);
 
         let new_scale = 2.0_f64.powf(-viewport.zoom);
         let scale_diff = old_scale - new_scale;
