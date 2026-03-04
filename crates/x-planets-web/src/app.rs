@@ -174,32 +174,26 @@ impl WebApp {
 
         // ── 4. Build render data with crossfade ──
         let available: HashSet<TileCoord> = self.tile_textures.keys().copied().collect();
-        // Use canonical coords for set operations
-        let visible_set: HashSet<TileCoord> = visible.iter().map(|vt| vt.coord).collect();
 
-        // 4a. Register fade for tiles that just became visible+available
-        //     (handles cached tiles re-entering view and zoom-out transitions).
-        let visible_available: HashSet<TileCoord> = visible.iter()
-            .filter(|vt| available.contains(&vt.coord))
-            .map(|vt| vt.coord)
-            .collect();
-        for &coord in &visible_available {
-            if !self.prev_visible_available.contains(&coord) {
-                if self.anim.tile_fade_elapsed(&coord, now_secs).is_none() {
-                    self.anim.register_tile_loaded(coord, now_secs);
-                }
+        // 4a-4b. Shared tile visibility tracking: register fade for tiles
+        // newly entering viewport and track departing tiles for fade-out.
+        {
+            let prev = std::mem::take(&mut self.prev_visible_available);
+            let mut to_register: Vec<TileCoord> = Vec::new();
+            let new_prev = x_planets_core::interaction::update_tile_visibility(
+                &visible,
+                &available,
+                &prev,
+                |coord| self.anim.tile_fade_elapsed(coord, now_secs),
+                |coord| to_register.push(coord),
+                &mut self.departing_tiles,
+                now_secs,
+            );
+            for coord in to_register {
+                self.anim.register_tile_loaded(coord, now_secs);
             }
+            self.prev_visible_available = new_prev;
         }
-
-        // 4b. Track departing tiles (were visible+available, now gone) for
-        //     zoom-out fade-out overlay.
-        for &coord in &self.prev_visible_available {
-            if !visible_set.contains(&coord) {
-                self.departing_tiles.entry(coord).or_insert(now_secs);
-            }
-        }
-        self.departing_tiles.retain(|_, start| now_secs - *start < FADE_DURATION);
-        self.prev_visible_available = visible_available;
 
         let texture_views: HashMap<TileCoord, &wgpu::TextureView> = self
             .tile_textures

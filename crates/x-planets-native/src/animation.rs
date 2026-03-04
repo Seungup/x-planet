@@ -4,7 +4,7 @@
 //! Native uses `std::time::Instant` for timing; the shared module uses `f64`
 //! timestamps — conversion happens at call boundaries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use x_planets_core::interaction::{
@@ -29,9 +29,20 @@ pub(crate) struct AnimationState {
     // ── Tile fade-in ──
     pub tile_fade_start: HashMap<TileCoord, Instant>,
 
+    // ── Tile visibility tracking ──
+    /// Tiles that were visible+available last frame (for shared
+    /// `update_tile_visibility` in core).
+    pub prev_visible_available: HashSet<TileCoord>,
+    /// Tiles that departed the visible set (for zoom-out fade-out).
+    pub departing_tiles: HashMap<TileCoord, f64>,
+
     // ── Double-click detection ──
     pub last_click_time: Option<Instant>,
     pub last_click_pos: Option<(f64, f64)>,
+
+    // ── Reference epoch for f64 timestamps ──
+    /// Used to convert `Instant` to f64 seconds for shared core functions.
+    start_time: Instant,
 }
 
 impl AnimationState {
@@ -42,8 +53,11 @@ impl AnimationState {
             pan_velocity: (0.0, 0.0),
             last_drag_positions: Vec::new(),
             tile_fade_start: HashMap::new(),
+            prev_visible_available: HashSet::new(),
+            departing_tiles: HashMap::new(),
             last_click_time: None,
             last_click_pos: None,
+            start_time: Instant::now(),
         }
     }
 
@@ -138,5 +152,11 @@ impl AnimationState {
         self.tile_fade_start
             .get(coord)
             .map(|&start| now.duration_since(start).as_secs_f64())
+    }
+
+    /// Convert an `Instant` to f64 seconds since app start, for shared core
+    /// functions that use f64 timestamps.
+    pub fn to_secs_f64(&self, instant: Instant) -> f64 {
+        instant.duration_since(self.start_time).as_secs_f64()
     }
 }
