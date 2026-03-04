@@ -271,3 +271,73 @@ pub fn validate_wgsl(source: &str) -> Result<(), String> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_wgsl_valid_shader() {
+        let shader = r#"
+            @vertex
+            fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+                return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+            }
+
+            @fragment
+            fn fs_main() -> @location(0) vec4<f32> {
+                return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+            }
+        "#;
+        assert!(validate_wgsl(shader).is_ok());
+    }
+
+    #[test]
+    fn test_validate_wgsl_syntax_error() {
+        let shader = "fn broken( { return; }";
+        let result = validate_wgsl(shader);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Parse error"));
+    }
+
+    #[test]
+    fn test_validate_wgsl_empty_shader() {
+        // An empty shader is valid (no entry points, but parseable).
+        assert!(validate_wgsl("").is_ok());
+    }
+
+    #[test]
+    fn test_validate_wgsl_semantic_error() {
+        // Referencing an undefined variable is a semantic error.
+        let shader = r#"
+            @fragment
+            fn fs_main() -> @location(0) vec4<f32> {
+                return undefined_var;
+            }
+        "#;
+        let result = validate_wgsl(shader);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_shipped_shaders_all_valid() {
+        // Validate all WGSL shaders shipped with the project.
+        let shaders = [
+            ("mercator", include_str!("../../../shaders/projections/mercator.wgsl")),
+            ("equirectangular", include_str!("../../../shaders/projections/equirectangular.wgsl")),
+            ("raster_tile", include_str!("../../../shaders/rendering/raster_tile.wgsl")),
+            ("raster_tile_globe", include_str!("../../../shaders/rendering/raster_tile_globe.wgsl")),
+            ("terrain_tile", include_str!("../../../shaders/rendering/terrain_tile.wgsl")),
+            ("model3d", include_str!("../../../shaders/rendering/model3d.wgsl")),
+        ];
+        for (name, source) in &shaders {
+            let result = validate_wgsl(source);
+            assert!(
+                result.is_ok(),
+                "Shader '{}' failed validation: {}",
+                name,
+                result.unwrap_err()
+            );
+        }
+    }
+}

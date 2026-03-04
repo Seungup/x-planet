@@ -188,4 +188,88 @@ mod tests {
         let items: Vec<(&TileCoord, &&str)> = cache.iter().collect();
         assert_eq!(items.len(), 2);
     }
+
+    #[test]
+    fn test_cache_remove() {
+        let mut cache = TileCache::new(10);
+        let c1 = TileCoord::new(1, 0, 0);
+        cache.insert(c1, "a");
+        assert!(cache.contains(&c1));
+
+        let removed = cache.remove(&c1);
+        assert_eq!(removed, Some("a"));
+        assert!(!cache.contains(&c1));
+        assert_eq!(cache.len(), 0);
+
+        // Remove non-existent returns None
+        assert!(cache.remove(&c1).is_none());
+    }
+
+    #[test]
+    fn test_cache_contains() {
+        let mut cache = TileCache::new(10);
+        let c1 = TileCoord::new(1, 0, 0);
+        let c2 = TileCoord::new(1, 1, 0);
+
+        assert!(!cache.contains(&c1));
+        cache.insert(c1, "a");
+        assert!(cache.contains(&c1));
+        assert!(!cache.contains(&c2));
+    }
+
+    #[test]
+    fn test_cache_len_and_is_empty() {
+        let mut cache = TileCache::new(10);
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+
+        cache.insert(TileCoord::new(0, 0, 0), 1);
+        assert!(!cache.is_empty());
+        assert_eq!(cache.len(), 1);
+
+        cache.insert(TileCoord::new(1, 0, 0), 2);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_cache_duplicate_insert_updates_value() {
+        let mut cache = TileCache::new(10);
+        let coord = TileCoord::new(1, 0, 0);
+        cache.insert(coord, "old");
+        cache.insert(coord, "new");
+
+        assert_eq!(cache.len(), 1); // No duplicate
+        assert_eq!(cache.get(&coord), Some(&"new")); // Updated value
+    }
+
+    #[test]
+    fn test_cache_capacity_one() {
+        let mut cache = TileCache::new(1);
+        let c1 = TileCoord::new(1, 0, 0);
+        let c2 = TileCoord::new(1, 1, 0);
+
+        cache.insert(c1, "a");
+        assert_eq!(cache.len(), 1);
+
+        cache.insert(c2, "b");
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.contains(&c1)); // Evicted
+        assert!(cache.contains(&c2));
+    }
+
+    #[test]
+    fn test_cache_get_nonexistent() {
+        let mut cache: TileCache<&str> = TileCache::new(10);
+        assert!(cache.get(&TileCoord::new(0, 0, 0)).is_none());
+    }
+
+    #[test]
+    fn test_cache_clear_then_get() {
+        let mut cache = TileCache::new(10);
+        let coord = TileCoord::new(0, 0, 0);
+        cache.insert(coord, 42);
+        cache.clear();
+        assert!(cache.get(&coord).is_none());
+        assert!(cache.is_empty());
+    }
 }
