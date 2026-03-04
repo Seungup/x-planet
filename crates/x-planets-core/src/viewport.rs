@@ -356,8 +356,8 @@ impl Viewport {
         let lat = self.center.lat;
         let lon = self.center.lon;
 
-        let lat_min = (lat - half_deg).max(-85.05);
-        let lat_max = (lat + half_deg).min(85.05);
+        let lat_min = (lat - half_deg).max(-89.9);
+        let lat_max = (lat + half_deg).min(89.9);
         // Longitude span scales by cos(lat) at the equator edge
         let cos_lat = lat.to_radians().cos().max(0.05);
         let lon_span = (half_deg / cos_lat).min(180.0);
