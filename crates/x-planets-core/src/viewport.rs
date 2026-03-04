@@ -337,22 +337,22 @@ impl Viewport {
     /// tile coordinates for tile fetching.
     fn visible_tiles_globe(&self) -> Vec<VisibleTile> {
         let unit_altitude = globe_unit_altitude(self.zoom);
+        let cap_half = (1.0 / (unit_altitude + 1.0)).acos();
 
-        // Use the FOV-aware half-angle so tile resolution matches
-        // what the camera actually renders on screen.
-        let half_angle = globe_visible_half_angle(unit_altitude);
-
-        // Compute effective zoom from angular extent.
-        let visible_deg = half_angle.to_degrees() * 2.0;
+        // For tile zoom selection, use a wider effective FOV (3× the
+        // camera's actual 60° FOV).  The pure camera FOV underestimates
+        // the usable area on the curved sphere surface, producing tiles
+        // ~2 levels finer than viewport.zoom.  The 3× factor brings
+        // globe_zoom ≈ viewport.zoom, which avoids excessive detail.
+        let tile_fov_half =
+            unit_altitude * (std::f64::consts::FRAC_PI_3 * 0.5).tan() * 3.0;
+        let tile_half = cap_half.min(tile_fov_half);
+        let visible_deg = tile_half.to_degrees() * 2.0;
         let tiles_needed = (self.height as f64 / 256.0).max(1.0);
         let tile_size_deg = visible_deg / tiles_needed;
         let globe_zoom = (360.0 / tile_size_deg).log2()
             .round()
             .clamp(0.0, 22.0) as u8;
-
-        // Visible bounding box — use the full cap for culling so we don't
-        // clip tiles at the edges of the perspective view.
-        let cap_half = (1.0 / (unit_altitude + 1.0)).acos();
         let half_deg = cap_half.to_degrees().min(89.0);
         let lat = self.center.lat;
         let lon = self.center.lon;
