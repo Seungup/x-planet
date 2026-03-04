@@ -432,14 +432,18 @@ impl Viewport {
 
         let ideal_zoom_at = |mx: f64, my: f64| -> u8 {
             if globe {
-                // Combined distance + foreshortening LOD on the unit sphere.
-                // factor = cos(θ) × h / d, where:
+                // Screen-space size LOD on the unit sphere.
+                // factor = sqrt(cos(θ)) × h / d, where:
                 //   θ = central angle from nadir to tile
                 //   h = camera altitude above unit sphere
                 //   d = camera-to-tile distance (law of cosines)
-                // cos(θ) captures surface foreshortening (oblique viewing),
-                // h/d captures the increased distance.  Together they give
-                // a realistic screen-space size estimate for each tile.
+                // h/d captures the reduced apparent size at distance.
+                // sqrt(cos(θ)) captures foreshortening: a tile at angle θ
+                // is compressed by cos(θ) in the radial direction but not
+                // tangentially, so the geometric mean of the two dimensions
+                // is sqrt(cos(θ)).  Using cos(θ) directly over-penalises
+                // tiles near the visible edge, producing an abrupt LOD
+                // boundary in the middle of the view.
                 let tile_geo = mercator_to_geo(glam::DVec2::new(mx, my));
                 let dlat = tile_geo.lat.to_radians() - center_lat_rad;
                 let dlon = tile_geo.lon.to_radians() - center_lon_rad;
@@ -450,7 +454,7 @@ impl Viewport {
                 let theta = 2.0 * a.sqrt().asin(); // central angle
                 let cos_theta = theta.cos();
                 let d = (globe_r2 - globe_2rh * cos_theta).sqrt().max(globe_h);
-                let factor = (cos_theta * globe_h / d).max(0.01);
+                let factor = (cos_theta.sqrt() * globe_h / d).max(0.01);
                 let zoom_adjust = factor.log2(); // ≤ 0
                 // Use floor instead of round for hysteresis: tiles only drop
                 // a zoom level when the adjustment crosses a full integer
@@ -505,6 +509,26 @@ impl Viewport {
         let mut heap = BinaryHeap::<Candidate>::new();
         let mut result = Vec::<VisibleTile>::new();
 
+        // In globe mode, compute priority using angular (great-circle)
+        // distance instead of Mercator distance.  Mercator stretches
+        // high-latitude tiles, biasing the priority queue so that tiles
+        // toward the equator are processed first, exhausting the tile
+        // budget before high-latitude tiles get subdivided.
+        let tile_priority = |tc: glam::DVec2| -> f64 {
+            if globe {
+                let g = mercator_to_geo(tc);
+                let dlat = g.lat.to_radians() - center_lat_rad;
+                let dlon = g.lon.to_radians() - center_lon_rad;
+                let a = (dlat * 0.5).sin().powi(2)
+                    + cos_center_lat * g.lat.to_radians().cos() * (dlon * 0.5).sin().powi(2);
+                let theta = 2.0 * a.sqrt().asin();
+                1.0 / (theta + 1e-10)
+            } else {
+                let dist = (tc - center_merc).length();
+                1.0 / (dist + 1e-10)
+            }
+        };
+
         // In globe mode, start from z=0 so the quadtree can naturally
         // build the LOD gradient: tiles near the camera get subdivided to
         // base_z, while distant tiles stay coarse.  Starting from min_z
@@ -513,10 +537,9 @@ impl Viewport {
         let seed_z = if globe { 0 } else { min_z };
         for vt in frustum.visible_tiles(seed_z) {
             let tc = vt.display_mercator_center();
-            let dist = (tc - center_merc).length();
             heap.push(Candidate {
                 tile: vt,
-                priority: 1.0 / (dist + 1e-10),
+                priority: tile_priority(tc),
             });
         }
 
@@ -553,10 +576,9 @@ impl Viewport {
                 for child in vt.children() {
                     if frustum.is_visible_tile(&child) {
                         let cc = child.display_mercator_center();
-                        let dist = (cc - center_merc).length();
                         heap.push(Candidate {
                             tile: child,
-                            priority: 1.0 / (dist + 1e-10),
+                            priority: tile_priority(cc),
                         });
                     }
                 }
