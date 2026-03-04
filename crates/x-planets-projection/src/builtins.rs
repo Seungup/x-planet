@@ -1,4 +1,4 @@
-//! Built-in projection implementations: Mercator and Equirectangular.
+//! Built-in projection implementations: Mercator and Globe.
 
 use crate::ProjectionPlugin;
 use glam::DVec3;
@@ -74,17 +74,18 @@ fn project(world_pos: vec3<f32>) -> vec3<f32> {
 "#;
 
 // ---------------------------------------------------------------------------
-// Equirectangular (Plate Carrée, EPSG:4326)
+// Globe (3D sphere rendering)
 // ---------------------------------------------------------------------------
 
-/// Equirectangular / Plate Carrée projection (EPSG:4326).
+/// Globe projection — renders tiles on a 3D sphere (like Google Earth).
 ///
-/// Direct mapping of latitude/longitude to a rectangular grid.
-pub struct Equirectangular;
+/// Internally uses equirectangular math for CPU-side coordinate mapping,
+/// but renders via the Globe pipeline (orbital camera, spherical mesh).
+pub struct Globe;
 
-impl ProjectionPlugin for Equirectangular {
+impl ProjectionPlugin for Globe {
     fn name(&self) -> &str {
-        "Equirectangular"
+        "Globe"
     }
 
     fn epsg_code(&self) -> Option<&str> {
@@ -158,16 +159,16 @@ mod tests {
     }
 
     #[test]
-    fn test_equirectangular_origin() {
-        let proj = Equirectangular;
+    fn test_globe_origin() {
+        let proj = Globe;
         let result = proj.project_cpu(DVec3::new(0.0, 0.0, 0.0));
         assert!((result.x - 0.5).abs() < 1e-10);
         assert!((result.y - 0.5).abs() < 1e-10);
     }
 
     #[test]
-    fn test_equirectangular_roundtrip() {
-        let proj = Equirectangular;
+    fn test_globe_roundtrip() {
+        let proj = Globe;
         let original = DVec3::new(35.6762, 139.6503, 0.0); // Tokyo
         let projected = proj.project_cpu(original);
         let recovered = proj.unproject_cpu(projected);
@@ -185,8 +186,8 @@ mod tests {
     }
 
     #[test]
-    fn test_equirectangular_rendering_mode() {
-        let proj = Equirectangular;
+    fn test_globe_rendering_mode() {
+        let proj = Globe;
         assert_eq!(
             proj.rendering_mode(),
             x_planets_math::ProjectionMode::Globe,

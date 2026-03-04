@@ -67,8 +67,8 @@ fn main() {
     );
 
     // Switch projection
-    if engine.set_projection("Equirectangular") {
-        log::info!("Switched to Equirectangular projection");
+    if engine.set_projection("Globe") {
+        log::info!("Switched to Globe projection");
     }
 
     log::info!("Layers: {}", engine.layer_count());

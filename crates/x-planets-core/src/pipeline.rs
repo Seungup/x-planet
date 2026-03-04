@@ -197,15 +197,7 @@ pub fn tile_uniforms_for_visible_projected(
     // Tile center — x is the same for both projections, y depends on mode.
     let cx = (rt.display_x as f64 + 0.5) / n_f64;
     let cy = match mode {
-        x_planets_math::ProjectionMode::Mercator
-        | x_planets_math::ProjectionMode::Globe => (rt.coord.y as f64 + 0.5) / n_f64,
-        x_planets_math::ProjectionMode::Equirectangular => {
-            let y_top_m = rt.coord.y as f64 / n_f64;
-            let y_bot_m = (rt.coord.y + 1) as f64 / n_f64;
-            let y_top_eq = x_planets_math::mercator_y_to_equirectangular_y(y_top_m);
-            let y_bot_eq = x_planets_math::mercator_y_to_equirectangular_y(y_bot_m);
-            (y_top_eq + y_bot_eq) / 2.0
-        }
+        _ => (rt.coord.y as f64 + 0.5) / n_f64,
     };
 
     let model = glam::DMat4::from_translation(glam::DVec3::new(cx, cy, 0.0));
@@ -405,78 +397,6 @@ pub fn tile_uniforms_for_centered(
         centered_tile_center(&rt.coord, rt.display_x, center_lat_rad, center_lon_rad);
     let model =
         glam::DMat4::from_translation(glam::DVec3::new(tile_center_2d.x, tile_center_2d.y, 0.0));
-    let mvp_f64 = *vp_f64 * model;
-    let mvp_f32 = mvp_f64.as_mat4();
-
-    TileUniforms {
-        mvp: mvp_f32.to_cols_array(),
-        bounds: [min_x, min_y, max_x, max_y],
-        meta: [rt.coord.z as f32, opacity, 0.0, 0.0],
-        uv_rect: rt.uv_rect,
-    }
-}
-
-// ───────────────────────────────────────────────────────────────────
-// Equirectangular tile mesh + uniforms
-// ───────────────────────────────────────────────────────────────────
-
-/// Compute tile center in Equirectangular [0,1]² space.
-pub fn equirectangular_tile_center(coord: &TileCoord, display_x: i64) -> glam::DVec2 {
-    let n = coord.extent() as f64;
-    let mx = (display_x as f64 + 0.5) / n;
-    let my = (coord.y as f64 + 0.5) / n;
-    let lon_deg = mx * 360.0 - 180.0;
-    let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
-    let lat_deg = lat_rad.to_degrees();
-    glam::DVec2::new(
-        (lon_deg + 180.0) / 360.0,
-        (90.0 - lat_deg) / 180.0,
-    )
-}
-
-/// Build tessellated Equirectangular meshes for a batch of tiles.
-///
-/// Returns combined vertex/index buffers and per-tile index counts,
-/// following the same pattern as `build_globe_tile_mesh` and
-/// `build_centered_tile_mesh`.
-pub fn build_equirectangular_tile_mesh(
-    tiles: &[RenderableTile],
-) -> (Vec<GlobeTileVertex>, Vec<u32>, Vec<u32>) {
-    let mut all_verts = Vec::new();
-    let mut all_idxs = Vec::new();
-    let mut tile_idx_counts = Vec::new();
-
-    for rt in tiles {
-        let tile_center_eq = equirectangular_tile_center(&rt.coord, rt.display_x);
-        let base_vertex = all_verts.len() as u32;
-        let (verts, idxs) =
-            crate::render::tile_equirectangular_mesh(&rt.coord, tile_center_eq);
-        all_verts.extend(verts);
-        all_idxs.extend(idxs.iter().map(|i| i + base_vertex));
-        tile_idx_counts.push(idxs.len() as u32);
-    }
-
-    (all_verts, all_idxs, tile_idx_counts)
-}
-
-/// Compute per-tile uniforms for Equirectangular rendering.
-pub fn tile_uniforms_for_equirectangular(
-    rt: &RenderableTile,
-    opacity: f32,
-    vp_f64: &glam::DMat4,
-) -> TileUniforms {
-    let n = rt.coord.extent() as f32;
-    let min_x = rt.display_x as f32 / n;
-    let min_y = rt.coord.y as f32 / n;
-    let max_x = (rt.display_x + 1) as f32 / n;
-    let max_y = (rt.coord.y + 1) as f32 / n;
-
-    let tile_center_eq = equirectangular_tile_center(&rt.coord, rt.display_x);
-    let model = glam::DMat4::from_translation(glam::DVec3::new(
-        tile_center_eq.x,
-        tile_center_eq.y,
-        0.0,
-    ));
     let mvp_f64 = *vp_f64 * model;
     let mvp_f32 = mvp_f64.as_mat4();
 
@@ -1568,7 +1488,7 @@ impl std::fmt::Display for FrameSummary {
 mod tests {
     use super::*;
     use x_planets_math::GeoCoord;
-    use x_planets_projection::{Equirectangular, Mercator};
+    use x_planets_projection::{Globe, Mercator};
 
     // ── Stage 1 ────────────────────────────────────────────────
 
@@ -1811,14 +1731,14 @@ mod tests {
     }
 
     #[test]
-    fn test_equirectangular_roundtrip_1000_points() {
-        let proj = Equirectangular;
+    fn test_globe_roundtrip_1000_points() {
+        let proj = Globe;
         let points = generate_test_grid(20, 50);
 
         let max_err = verify_projection_roundtrip(&proj, &points);
         assert!(
             max_err < 1e-10,
-            "Equirectangular roundtrip max error: {:.2e} (should be < 1e-10)",
+            "Globe roundtrip max error: {:.2e} (should be < 1e-10)",
             max_err
         );
     }

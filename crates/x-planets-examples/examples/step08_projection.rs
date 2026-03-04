@@ -3,7 +3,7 @@
 //! Karpathy: "Always have a CPU reference. Compare. Measure error."
 //!
 //! Goal: Demonstrate runtime projection switching between Mercator and
-//!       Equirectangular. The CPU computes reference positions, the GPU
+//!       Globe. The CPU computes reference positions, the GPU
 //!       applies the projection in the vertex shader. We overlay a
 //!       verification grid that shows the CPU-projected positions.
 //!
@@ -36,7 +36,7 @@ use x_planets_core::pipeline::{
 };
 use x_planets_core::viewport::{CameraController, Viewport};
 use x_planets_math::{GeoCoord, TileCoord, TileUniforms};
-use x_planets_projection::{Equirectangular, Mercator, ProjectionPlugin};
+use x_planets_projection::{Globe, Mercator, ProjectionPlugin};
 
 const SHADER: &str = r#"
 struct ViewportUniforms {
@@ -72,7 +72,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
     // Both projections work in normalized 0..1 space.
     // The view_proj matrix handles the camera transform.
-    // For Equirectangular, we could remap positions here,
+    // For Globe, we could remap positions here,
     // but for now both use the same Mercator tile positions
     // (the projection difference is shown via the verification grid).
     out.clip_pos = tile.mvp * vec4<f32>(in.position, 0.0, 1.0);
@@ -101,7 +101,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Mercator: blue tint
         tint = vec3<f32>(0.7, 0.8, 1.0);
     } else {
-        // Equirectangular: green tint
+        // Globe: green tint
         tint = vec3<f32>(0.7, 1.0, 0.8);
     }
     let color = base * tint;
@@ -138,7 +138,7 @@ fn sinh(x: f32) -> f32 {
 
 enum ActiveProjection {
     Mercator,
-    Equirectangular,
+    Globe,
 }
 
 struct App {
@@ -170,14 +170,14 @@ impl App {
     fn current_plugin(&self) -> Box<dyn ProjectionPlugin> {
         match self.active_projection {
             ActiveProjection::Mercator => Box::new(Mercator),
-            ActiveProjection::Equirectangular => Box::new(Equirectangular),
+            ActiveProjection::Globe => Box::new(Globe),
         }
     }
 
     fn projection_id(&self) -> f32 {
         match self.active_projection {
             ActiveProjection::Mercator => 0.0,
-            ActiveProjection::Equirectangular => 1.0,
+            ActiveProjection::Globe => 1.0,
         }
     }
 
@@ -185,7 +185,7 @@ impl App {
         let plugin = self.current_plugin();
         let name = match self.active_projection {
             ActiveProjection::Mercator => "Mercator",
-            ActiveProjection::Equirectangular => "Equirectangular",
+            ActiveProjection::Globe => "Globe",
         };
 
         // Generate test grid
@@ -310,12 +310,12 @@ impl ApplicationHandler for App {
                         // Switch projection
                         PhysicalKey::Code(KeyCode::KeyP) => {
                             self.active_projection = match self.active_projection {
-                                ActiveProjection::Mercator => ActiveProjection::Equirectangular,
-                                ActiveProjection::Equirectangular => ActiveProjection::Mercator,
+                                ActiveProjection::Mercator => ActiveProjection::Globe,
+                                ActiveProjection::Globe => ActiveProjection::Mercator,
                             };
                             let name = match self.active_projection {
                                 ActiveProjection::Mercator => "Mercator",
-                                ActiveProjection::Equirectangular => "Equirectangular",
+                                ActiveProjection::Globe => "Globe",
                             };
                             println!("  Switched to: {}", name);
                             self.verify_projection();
@@ -483,7 +483,7 @@ async fn init_gpu(window: Arc<Window>, viewport: &Viewport) -> GpuState {
     });
 
     println!("✓ Projection switching pipeline ready");
-    println!("  Press [P] to toggle Mercator / Equirectangular");
+    println!("  Press [P] to toggle Mercator / Globe");
 
     GpuState {
         surface,

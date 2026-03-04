@@ -21,7 +21,7 @@ impl ProjectionRegistry {
 
         // Register built-in projections
         registry.register(Arc::new(crate::builtins::Mercator));
-        registry.register(Arc::new(crate::builtins::Equirectangular));
+        registry.register(Arc::new(crate::builtins::Globe));
 
         registry
     }
@@ -160,7 +160,7 @@ mod tests {
     fn test_registry_builtins() {
         let registry = ProjectionRegistry::new();
         assert!(registry.get("Web Mercator").is_some());
-        assert!(registry.get("Equirectangular").is_some());
+        assert!(registry.get("Globe").is_some());
         assert_eq!(registry.len(), 2);
     }
 
@@ -189,7 +189,7 @@ mod tests {
             x_planets_math::ProjectionMode::Mercator,
         );
         assert_eq!(
-            registry.rendering_mode_for("Equirectangular"),
+            registry.rendering_mode_for("Globe"),
             x_planets_math::ProjectionMode::Globe,
         );
     }
