@@ -797,9 +797,12 @@ impl CameraController {
         let visible_half = (1.0 / (unit_altitude + 1.0)).acos();
         let visible_deg = visible_half.to_degrees() * 2.0;
 
-        // Degrees per pixel — no extra pan_speed multiplier; the acos-based
-        // derivation already gives 1:1 feel (finger-under-cursor tracking).
-        let deg_per_px = visible_deg / viewport.height as f64;
+        // Degrees per pixel with perspective correction.  The acos-based
+        // visible_deg is the full angular cap diameter, but perspective
+        // foreshortening means the screen center (where the user typically
+        // drags) covers fewer degrees per pixel than the average.  A factor
+        // of 0.5 closely matches 1:1 finger-under-cursor tracking.
+        let deg_per_px = visible_deg / viewport.height as f64 * 0.5;
 
         let bearing_rad = viewport.bearing.to_radians();
         let sin_b = bearing_rad.sin();
