@@ -826,6 +826,15 @@ impl Viewport {
         let flip_x = glam::Mat4::from_diagonal(glam::Vec4::new(-1.0, 1.0, 1.0, 1.0));
         let view_proj = (flip_x * proj * view).to_cols_array();
 
+        // Small-circle clipping center on unit sphere.
+        let clip_center = x_planets_math::geo_to_unit_sphere(
+            self.center.lat.to_radians(),
+            self.center.lon.to_radians(),
+        );
+        // Clip angle: 85° from center — covers nearly a full hemisphere
+        // while avoiding the oblique Mercator singularity at 90°.
+        let cos_clip_angle = 85.0_f64.to_radians().cos() as f32;
+
         ViewportUniforms {
             view_proj,
             resolution: [
@@ -835,6 +844,12 @@ impl Viewport {
                 1.0 / self.height as f32,
             ],
             camera: [cx, cy, self.zoom as f32, self.pitch as f32],
+            clip_sphere: [
+                clip_center.x as f32,
+                clip_center.y as f32,
+                clip_center.z as f32,
+                cos_clip_angle,
+            ],
         }
     }
 }

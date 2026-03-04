@@ -1,18 +1,21 @@
-// Globe Raster Tile Rendering Shader
+// Globe / Centered-Mercator Raster Tile Rendering Shader
 //
-// Renders textured tile patches on a 3D unit-sphere surface.
-// Vertex shader: transforms RTE 3D sphere positions through per-tile MVP.
-// Fragment shader: samples the tile texture with bilinear filtering.
+// Renders textured tile patches on a 3D unit-sphere surface or as
+// oblique Mercator flat tiles.  Includes small-circle clipping: the
+// fragment shader discards pixels beyond a configurable angular distance
+// from the viewport center, producing a clean circular boundary.
 //
 // Uses the same uniform layout as raster_tile.wgsl (TileUniforms).
-// Only difference: vertex position is vec3 (3D on sphere) instead of vec2.
+// Vertex position is vec3 (3D on sphere or 2D with z=0 for centered).
+// sphere_pos carries the original unit-sphere position for clipping.
 
 // --- Uniforms ---
 
 struct ViewportUniforms {
     view_proj: mat4x4<f32>,
     resolution: vec4<f32>,   // (width, height, 1/width, 1/height)
-    camera: vec4<f32>,       // (center_x, center_y, zoom, _pad)
+    camera: vec4<f32>,       // (center_x, center_y, zoom, pitch)
+    clip_sphere: vec4<f32>,  // (center_x, center_y, center_z, cos_clip_angle)
 };
 
 struct TileUniforms {
@@ -39,11 +42,13 @@ var tile_sampler: sampler;
 struct VertexInput {
     @location(0) position: vec3<f32>,    // RTE: relative to tile center on unit sphere
     @location(1) tex_coord: vec2<f32>,   // Texture coordinate (0..1)
+    @location(2) sphere_pos: vec3<f32>,  // Original position on unit sphere
 };
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) tex_coord: vec2<f32>,
+    @location(1) sphere_pos: vec3<f32>,  // Interpolated for fragment clipping
 };
 
 @vertex
@@ -60,6 +65,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.clip_position.z = output.clip_position.z - depth_bias * output.clip_position.w;
 
     output.tex_coord = input.tex_coord;
+    output.sphere_pos = input.sphere_pos;
 
     return output;
 }
@@ -68,6 +74,14 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    // Small-circle clipping: discard fragments beyond the clip angle
+    // from the viewport center on the unit sphere.
+    // clip_sphere.xyz = center direction, clip_sphere.w = cos(clip_angle).
+    let cos_angle = dot(normalize(input.sphere_pos), viewport.clip_sphere.xyz);
+    if cos_angle < viewport.clip_sphere.w {
+        discard;
+    }
+
     // Remap tex_coord from [0,1] to the UV sub-rect.
     let uv = mix(tile.uv_rect.xy, tile.uv_rect.zw, input.tex_coord);
     let color = textureSample(tile_texture, tile_sampler, uv);

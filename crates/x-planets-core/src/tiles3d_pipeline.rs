@@ -250,6 +250,7 @@ pub fn build_tiles3d_uniforms(viewport: &Viewport) -> (x_planets_math::ViewportU
             1.0 / viewport.height as f32,
         ],
         camera: [0.0, 0.0, viewport.zoom as f32, 0.0],
+        clip_sphere: [0.0, 0.0, 1.0, -1.0], // no clipping (cos(-1) = all pass)
     };
 
     (uniforms, camera_ecef)

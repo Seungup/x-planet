@@ -289,6 +289,7 @@ impl Model3dRenderer {
             view_proj: [0.0; 16],
             resolution: [0.0; 4],
             camera: [0.0; 4],
+            clip_sphere: [0.0; 4],
         };
         let viewport_buffer =
             gpu.create_uniform_buffer("model3d-viewport-uniforms", &viewport_uniforms);
