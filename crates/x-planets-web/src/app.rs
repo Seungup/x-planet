@@ -296,7 +296,16 @@ impl WebApp {
 
         frame.present();
 
-        // ── 6. LRU bump visible tiles (use canonical coords) ──
+        // ── 6. LRU bump visible tiles + base tiles ──
+        // Always bump base tiles (z=0, z=1) to prevent LRU eviction.
+        for z in 0..=1u8 {
+            let n = 1u32 << z;
+            for y in 0..n {
+                for x in 0..n {
+                    let _ = self.tile_textures.get(&TileCoord::new(z, x, y));
+                }
+            }
+        }
         for vt in &visible {
             let _ = self.tile_textures.get(&vt.coord);
         }
@@ -347,17 +356,36 @@ impl WebApp {
         // Use canonical coords for cache/pending lookups
         let visible_set: HashSet<TileCoord> = visible.iter().map(|vt| vt.coord).collect();
 
-        // Free pending slots for tiles no longer visible.  The in-flight
-        // fetches can't be cancelled, but freeing the slot lets new
-        // (now-visible) tiles start loading immediately.
-        self.pending_coords.retain(|c| visible_set.contains(c));
+        // Free pending slots for tiles no longer visible (keep base tiles).
+        // The in-flight fetches can't be cancelled, but freeing the slot
+        // lets new (now-visible) tiles start loading immediately.
+        self.pending_coords.retain(|c| c.z <= 1 || visible_set.contains(c));
 
         let camera_center = x_planets_math::geo_to_mercator(&self.engine.viewport.center);
+
+        // ── Base tile loading ──
+        // Always eagerly load z=0 and z=1 tiles (5 total) so that
+        // resolve_fallbacks() always finds a cached ancestor.
+        let mut missing: Vec<(TileCoord, f64)> = Vec::new();
+        for z in 0..=1u8 {
+            let n = 1u32 << z;
+            for y in 0..n {
+                for x in 0..n {
+                    let coord = TileCoord::new(z, x, y);
+                    if !self.tile_textures.contains(&coord)
+                        && !self.pending_coords.contains(&coord)
+                    {
+                        // Highest priority (distance 0)
+                        missing.push((coord, 0.0));
+                    }
+                }
+            }
+        }
 
         // Deduplicate by canonical coord (same tile may appear in multiple
         // wrapped positions) and sort by display distance (closest first).
         let mut seen = HashSet::new();
-        let mut missing: Vec<(TileCoord, f64)> = visible
+        let mut visible_missing: Vec<(TileCoord, f64)> = visible
             .iter()
             .filter(|vt| {
                 !self.tile_textures.contains(&vt.coord)
@@ -370,7 +398,8 @@ impl WebApp {
                 (vt.coord, dist)
             })
             .collect();
-        missing.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        visible_missing.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        missing.extend(visible_missing);
 
         // Respect max concurrent
         let slots = self.max_concurrent.saturating_sub(self.pending_coords.len());

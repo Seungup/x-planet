@@ -252,7 +252,20 @@ pub fn tile_globe_mesh(
 
             // Mercator → lat/lon (radians)
             let lon_rad = (mx * 2.0 - 1.0) * PI;
-            let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+            let mut lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+
+            // Stretch edge tiles toward the poles to fill the ±85°–±89° gap.
+            // Only the outermost vertex row of the first/last tile row is
+            // moved.  UV coordinates stay unchanged so texture stretches
+            // naturally.  The polar cap mesh covers the remaining ±89°–±90°.
+            const POLAR_STRETCH_LAT: f64 = 89.0 * (PI / 180.0);
+            let n_tiles = coord.extent();
+            if coord.y == 0 && j == 0 {
+                lat_rad = POLAR_STRETCH_LAT;
+            }
+            if coord.y == n_tiles - 1 && j == subdiv {
+                lat_rad = -POLAR_STRETCH_LAT;
+            }
 
             // 3D position on unit sphere
             let pos_3d = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
@@ -461,8 +474,9 @@ const POLAR_CAP_SEGMENTS: u32 = 64;
 pub fn polar_cap_mesh(north: bool) -> (Vec<GlobeTileVertex>, Vec<u32>) {
     use std::f64::consts::PI;
 
-    // Mercator tile boundary latitude (rad)
-    let cap_lat_deg: f64 = if north { 85.05112878 } else { -85.05112878 };
+    // Match the polar stretch latitude used in tile_globe_mesh (89°).
+    // Tiles are stretched to cover ±85.05°–±89°; the cap fills ±89°–±90°.
+    let cap_lat_deg: f64 = if north { 89.0 } else { -89.0 };
     let pole_lat_deg: f64 = if north { 90.0 } else { -90.0 };
     let cap_lat = cap_lat_deg.to_radians();
     let pole_lat = pole_lat_deg.to_radians();
