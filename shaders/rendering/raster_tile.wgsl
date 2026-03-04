@@ -9,7 +9,8 @@
 struct ViewportUniforms {
     view_proj: mat4x4<f32>,
     resolution: vec4<f32>,   // (width, height, 1/width, 1/height)
-    camera: vec4<f32>,       // (center_x, center_y, zoom, _pad)
+    camera: vec4<f32>,       // (center_x, center_y, zoom, pitch)
+    clip_sphere: vec4<f32>,  // (center_x, center_y, center_z, cos_clip_angle)
 };
 
 struct TileUniforms {

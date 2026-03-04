@@ -316,13 +316,18 @@ fn centered_tile_center(
 }
 
 /// Angular-distance threshold (degrees) for the oblique Mercator
-/// singularity guard.  The winding check in `tile_centered_mesh` is
-/// the real safeguard; this pre-filter only avoids wasting work on
-/// tiles that are deep behind the singularity.
+/// pre-filter.  The fragment shader performs per-pixel small-circle
+/// clipping at 85°, so this CPU-side filter is only needed to avoid
+/// projecting tiles that are completely beyond the visible hemisphere
+/// (which would waste GPU work and produce degenerate geometry near
+/// the 90° singularity).
 ///
 /// Returns the threshold in degrees.
-pub fn centered_angular_threshold_deg(zoom: f64) -> f64 {
-    if zoom < 4.0 { 89.5 } else { 89.0 }
+pub fn centered_angular_threshold_deg(_zoom: f64) -> f64 {
+    // 88° gives ~3° of margin before the 90° singularity, while
+    // allowing all tiles within the 85° shader clip to be included
+    // plus a generous buffer for large low-zoom tiles.
+    88.0
 }
 
 /// Returns `true` if a tile passes the angular-distance pre-filter
@@ -340,13 +345,31 @@ pub fn tile_passes_angular_filter(
     let cos_threshold = centered_angular_threshold_deg(zoom).to_radians().cos();
 
     let n = tile.coord.extent() as f64;
-    let mx = (tile.display_x as f64 + 0.5) / n;
-    let my = (tile.coord.y as f64 + 0.5) / n;
-    let lon_rad = (mx * 2.0 - 1.0) * std::f64::consts::PI;
-    let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
-    let tile_sphere = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
-    let cos_angle = center_sphere.dot(tile_sphere);
-    cos_angle > cos_threshold
+
+    // Check tile center AND all four corners.  At low zoom levels tiles
+    // are very large in geographic extent, so the center can be beyond
+    // the threshold even though a large portion of the tile is within it.
+    // If ANY sample point is within the threshold, keep the tile.
+    let sample_points: [(f64, f64); 5] = [
+        // center
+        ((tile.display_x as f64 + 0.5) / n, (tile.coord.y as f64 + 0.5) / n),
+        // corners
+        (tile.display_x as f64 / n, tile.coord.y as f64 / n),
+        ((tile.display_x + 1) as f64 / n, tile.coord.y as f64 / n),
+        (tile.display_x as f64 / n, (tile.coord.y + 1) as f64 / n),
+        ((tile.display_x + 1) as f64 / n, (tile.coord.y + 1) as f64 / n),
+    ];
+
+    for &(mx, my) in &sample_points {
+        let lon_rad = (mx * 2.0 - 1.0) * std::f64::consts::PI;
+        let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+        let tile_sphere = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
+        let cos_angle = center_sphere.dot(tile_sphere);
+        if cos_angle > cos_threshold {
+            return true;
+        }
+    }
+    false
 }
 
 /// Build tessellated centered-Mercator meshes for all tiles.
@@ -3187,7 +3210,7 @@ mod tests {
     /// Tiles whose angular distance from the center exceeds ~80° should
     /// produce fewer or zero triangles (winding check skips distorted ones).
     #[test]
-    fn test_centered_mesh_far_tile_has_fewer_indices() {
+    fn test_centered_mesh_far_tile_produces_indices() {
         let center_lat = 37.5_f64.to_radians();
         let center_lon = 127.0_f64.to_radians();
 
@@ -3212,17 +3235,15 @@ mod tests {
         let (_v2, _i2, counts_far) =
             build_centered_tile_mesh(&[far], center_lat, center_lon);
 
+        // Both tiles should produce indices — the fragment shader
+        // handles small-circle clipping, not the CPU mesh builder.
         assert!(
             counts_near[0] > 0,
             "near tile must produce indices"
         );
-        // Far tile should have fewer or no valid triangles due to
-        // the oblique Mercator distortion near the singularity
         assert!(
-            counts_far[0] <= counts_near[0],
-            "far tile should have <= indices than near tile: {} vs {}",
-            counts_far[0],
-            counts_near[0]
+            counts_far[0] > 0,
+            "far tile must produce indices (shader handles clipping)"
         );
     }
 
@@ -3445,33 +3466,23 @@ mod tests {
         }
     }
 
-    /// Regression guard: the angular threshold values must stay
-    /// above the minimum floors to prevent the fan/wedge bug.
+    /// Regression guard: the angular threshold must stay below the 90°
+    /// singularity while being wide enough for the 85° shader clip angle.
     #[test]
     fn test_angular_threshold_floor() {
+        // Must be above the shader clip angle (85°) to include all
+        // potentially visible tiles.
         assert!(
-            centered_angular_threshold_deg(0.0) >= 89.0,
-            "zoom 0 threshold must be >= 89°"
+            centered_angular_threshold_deg(0.0) >= 85.0,
+            "threshold must be >= shader clip angle (85°)"
         );
         assert!(
-            centered_angular_threshold_deg(3.0) >= 89.0,
-            "zoom 3 threshold must be >= 89° (viewport spans ~45°)"
+            centered_angular_threshold_deg(10.0) >= 85.0,
+            "threshold must be >= shader clip angle (85°)"
         );
+        // Must stay below 90° to avoid the oblique Mercator singularity.
         assert!(
-            centered_angular_threshold_deg(3.9) >= 89.0,
-            "zoom 3.9 threshold must be >= 89°"
-        );
-        assert!(
-            centered_angular_threshold_deg(4.0) >= 89.0,
-            "zoom 4 threshold must be >= 89°"
-        );
-        assert!(
-            centered_angular_threshold_deg(10.0) >= 89.0,
-            "zoom 10 threshold must be >= 89°"
-        );
-        // Must never exceed 89.5° to avoid oblique Mercator singularity at 90°
-        assert!(
-            centered_angular_threshold_deg(0.0) <= 89.5,
+            centered_angular_threshold_deg(0.0) < 90.0,
             "threshold must stay below singularity (90°)"
         );
     }

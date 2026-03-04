@@ -314,6 +314,10 @@ pub struct ViewportUniforms {
     pub resolution: [f32; 4],
     /// Camera center in world coordinates (x, y, zoom, _padding)
     pub camera: [f32; 4],
+    /// Small-circle clipping: (center_x, center_y, center_z, cos_clip_angle)
+    /// on the unit sphere.  The fragment shader discards pixels where
+    /// dot(sphere_pos, clip_center.xyz) < clip_center.w.
+    pub clip_sphere: [f32; 4],
 }
 
 /// Per-tile uniforms uploaded to GPU.

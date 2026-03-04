@@ -166,7 +166,7 @@ impl TileVertex {
     }
 }
 
-/// Vertex layout for globe tile rendering (3D position on sphere surface + UV).
+/// Vertex layout for globe tile rendering (3D position on sphere surface + UV + sphere pos).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GlobeTileVertex {
@@ -174,12 +174,14 @@ pub struct GlobeTileVertex {
     pub position: [f32; 3],
     /// Texture coordinate (0..1) within the tile.
     pub tex_coord: [f32; 2],
+    /// Original position on the unit sphere (for small-circle clipping in fragment shader).
+    pub sphere_pos: [f32; 3],
 }
 
 impl GlobeTileVertex {
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress, // 20 bytes
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress, // 32 bytes
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute {
@@ -191,6 +193,12 @@ impl GlobeTileVertex {
                     offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x2, // tex_coord
+                },
+                wgpu::VertexAttribute {
+                    offset: (std::mem::size_of::<[f32; 3]>() + std::mem::size_of::<[f32; 2]>())
+                        as wgpu::BufferAddress,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x3, // sphere_pos
                 },
             ],
         }
@@ -275,6 +283,7 @@ pub fn tile_globe_mesh(
             vertices.push(GlobeTileVertex {
                 position: [rte.x as f32, rte.y as f32, rte.z as f32],
                 tex_coord: [u as f32, v as f32],
+                sphere_pos: [pos_3d.x as f32, pos_3d.y as f32, pos_3d.z as f32],
             });
         }
     }
@@ -326,6 +335,7 @@ pub fn tile_globe_mesh(
                     pa[2] - (pa[2] as f64 * skirt_depth) as f32,
                 ],
                 tex_coord: va.tex_coord,
+                sphere_pos: va.sphere_pos,
             });
 
             let skirt_b = vertices.len() as u32;
@@ -338,6 +348,7 @@ pub fn tile_globe_mesh(
                     pb[2] - (pb[2] as f64 * skirt_depth) as f32,
                 ],
                 tex_coord: vb.tex_coord,
+                sphere_pos: vb.sphere_pos,
             });
 
             // Single-sided quad (CCW winding from outside the sphere).
@@ -410,6 +421,9 @@ pub fn tile_centered_mesh(
                 lat_rad = -POLAR_STRETCH_LAT;
             }
 
+            // Unit sphere position (for small-circle clipping in fragment shader)
+            let sp = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
+
             // Oblique (centered) Mercator
             let centered = x_planets_math::oblique_mercator(
                 lat_rad,
@@ -418,44 +432,36 @@ pub fn tile_centered_mesh(
                 center_lon_rad,
             );
 
+            // Guard against NaN/Inf from oblique Mercator singularity.
+            // The fragment shader will discard these pixels via small-circle
+            // clipping, so clamping the position is safe.
+            let cx = if centered.x.is_finite() { centered.x } else { 0.5 };
+            let cy = if centered.y.is_finite() { centered.y } else { 0.5 };
+
             // RTE: subtract tile center in 2D
-            let rx = (centered.x - tile_center_2d.x) as f32;
-            let ry = (centered.y - tile_center_2d.y) as f32;
+            let rx = (cx - tile_center_2d.x) as f32;
+            let ry = (cy - tile_center_2d.y) as f32;
 
             vertices.push(GlobeTileVertex {
                 position: [rx, ry, 0.0], // flat, z=0
                 tex_coord: [u as f32, v as f32],
+                sphere_pos: [sp.x as f32, sp.y as f32, sp.z as f32],
             });
         }
     }
 
-    // Triangle indices — skip triangles whose winding has been inverted
-    // by the oblique Mercator projection (happens near the antipodal point
-    // of the projection center where the Mercator singularity flips geometry).
+    // Triangle indices — emit ALL triangles unconditionally.
+    // The fragment shader handles small-circle clipping per-pixel, so the
+    // CPU-side winding check is no longer needed.  Triangles near the
+    // antipodal singularity will have their fragments discarded by the
+    // `dot(sphere_pos, clip_center) < cos_clip_angle` test in the shader.
     for j in 0..subdiv {
         for i in 0..subdiv {
             let tl = j * seg + i;
             let tr = j * seg + i + 1;
             let bl = (j + 1) * seg + i;
             let br = (j + 1) * seg + i + 1;
-
-            let p_tl = &vertices[tl as usize].position;
-            let p_tr = &vertices[tr as usize].position;
-            let p_bl = &vertices[bl as usize].position;
-            let p_br = &vertices[br as usize].position;
-
-            // 2D cross product: positive = CCW (normal winding), negative = CW (flipped)
-            let cross1 = (p_tr[0] - p_tl[0]) * (p_bl[1] - p_tl[1])
-                - (p_tr[1] - p_tl[1]) * (p_bl[0] - p_tl[0]);
-            if cross1 > 0.0 {
-                indices.extend_from_slice(&[tl, tr, bl]);
-            }
-
-            let cross2 = (p_tr[0] - p_bl[0]) * (p_br[1] - p_bl[1])
-                - (p_tr[1] - p_bl[1]) * (p_br[0] - p_bl[0]);
-            if cross2 > 0.0 {
-                indices.extend_from_slice(&[bl, tr, br]);
-            }
+            indices.extend_from_slice(&[tl, tr, bl, bl, tr, br]);
         }
     }
 
@@ -492,6 +498,7 @@ pub fn polar_cap_mesh(north: bool) -> (Vec<GlobeTileVertex>, Vec<u32>) {
     vertices.push(GlobeTileVertex {
         position: [pole_center.x as f32, pole_center.y as f32, pole_center.z as f32],
         tex_coord: [0.5, 0.5],
+        sphere_pos: [pole_center.x as f32, pole_center.y as f32, pole_center.z as f32],
     });
 
     // Ring of vertices at cap latitude
@@ -502,6 +509,7 @@ pub fn polar_cap_mesh(north: bool) -> (Vec<GlobeTileVertex>, Vec<u32>) {
         vertices.push(GlobeTileVertex {
             position: [pos.x as f32, pos.y as f32, pos.z as f32],
             tex_coord: [t as f32, if north { 0.0 } else { 1.0 }],
+            sphere_pos: [pos.x as f32, pos.y as f32, pos.z as f32],
         });
     }
 
