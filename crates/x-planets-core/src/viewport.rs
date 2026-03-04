@@ -307,9 +307,17 @@ impl Viewport {
         // Geographic bounding box covering the spherical cap.
         let lat_min = (lat - visible_deg).max(-89.9);
         let lat_max = (lat + visible_deg).min(89.9);
-        // Longitude span widens at higher latitudes (meridian convergence).
-        let cos_lat = lat.to_radians().cos().max(0.01);
-        let lon_span = (visible_deg / cos_lat).min(180.0);
+        // Longitude span must cover the widest parallel within the cap.
+        // At the equator cos(lat)≈1 so lon_span≈visible_deg; near the
+        // poles cos(lat)→0 so lon_span→180°.  Use the highest-latitude
+        // edge of the cap (worst case for meridian convergence).
+        let worst_lat = if lat_min.abs() > lat_max.abs() {
+            lat_min.to_radians()
+        } else {
+            lat_max.to_radians()
+        };
+        let cos_worst = worst_lat.cos().max(0.01);
+        let lon_span = (visible_deg / cos_worst).min(180.0);
         let lon_min = lon - lon_span;
         let lon_max = lon + lon_span;
 
@@ -326,7 +334,11 @@ impl Viewport {
         if base_z == 0 {
             return frustum.visible_tiles(0);
         }
-        self.quadtree_lod_with_frustum(base_z, &frustum, false)
+        // Use globe-style angular LOD: tiles near the viewport center
+        // get full detail, distant tiles use coarser zoom.  This avoids
+        // the Mercator-distance bias that explodes tile counts at high
+        // latitudes.
+        self.quadtree_lod_with_frustum(base_z, &frustum, true)
     }
 
     /// Globe-mode visible tile selection.
@@ -356,8 +368,8 @@ impl Viewport {
         let lat = self.center.lat;
         let lon = self.center.lon;
 
-        let lat_min = (lat - half_deg).max(-85.05);
-        let lat_max = (lat + half_deg).min(85.05);
+        let lat_min = (lat - half_deg).max(-89.9);
+        let lat_max = (lat + half_deg).min(89.9);
         // Longitude span scales by cos(lat) at the equator edge
         let cos_lat = lat.to_radians().cos().max(0.05);
         let lon_span = (half_deg / cos_lat).min(180.0);
@@ -1652,22 +1664,25 @@ mod tests {
     #[test]
     fn test_visible_tiles_for_mode_mercator_centered() {
         // Centered Mercator selects tiles via angular distance from
-        // the viewport center, which is a superset of (or equal to)
-        // the standard Mercator frustum at mid-latitudes.
+        // the viewport center with globe-style LOD, so distant tiles
+        // may get coarser zoom.  It should still return a reasonable
+        // number of tiles covering the viewport.
         let mut viewport = Viewport::new(800, 600);
         viewport.center = GeoCoord::new(37.5665, 126.978);
         viewport.zoom = 5.0;
 
-        let default_tiles = viewport.visible_tiles();
         let centered_tiles =
             viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
 
-        // Centered selection should include at least as many tiles.
         assert!(
-            centered_tiles.len() >= default_tiles.len(),
-            "centered ({}) should be >= standard ({})",
+            !centered_tiles.is_empty(),
+            "centered should produce tiles",
+        );
+        // At zoom 5, we expect a reasonable tile count.
+        assert!(
+            centered_tiles.len() >= 4,
+            "centered ({}) should have at least 4 tiles",
             centered_tiles.len(),
-            default_tiles.len(),
         );
     }
 
