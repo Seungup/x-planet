@@ -297,17 +297,16 @@ impl Viewport {
         let edge_geo = mercator_to_geo(glam::DVec2::new(0.5, edge_y));
         let viewport_angular_deg = edge_geo.lat.abs();
 
-        // Cap at the oblique Mercator singularity guard threshold
-        // (mirrors pipeline::centered_angular_threshold_deg).
-        let threshold_deg: f64 = if self.zoom < 4.0 { 89.0 } else { 85.0 };
+        // Cap at the oblique Mercator singularity guard threshold.
+        let threshold_deg: f64 = crate::pipeline::centered_angular_threshold_deg(self.zoom);
         let visible_deg = viewport_angular_deg.min(threshold_deg);
 
         let lat = self.center.lat;
         let lon = self.center.lon;
 
         // Geographic bounding box covering the spherical cap.
-        let lat_min = (lat - visible_deg).max(-85.05);
-        let lat_max = (lat + visible_deg).min(85.05);
+        let lat_min = (lat - visible_deg).max(-89.9);
+        let lat_max = (lat + visible_deg).min(89.9);
         // Longitude span widens at higher latitudes (meridian convergence).
         let cos_lat = lat.to_radians().cos().max(0.01);
         let lon_span = (visible_deg / cos_lat).min(180.0);

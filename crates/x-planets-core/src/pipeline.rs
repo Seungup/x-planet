@@ -322,7 +322,7 @@ fn centered_tile_center(
 ///
 /// Returns the threshold in degrees.
 pub fn centered_angular_threshold_deg(zoom: f64) -> f64 {
-    if zoom < 4.0 { 89.0 } else { 85.0 }
+    if zoom < 4.0 { 89.5 } else { 89.0 }
 }
 
 /// Returns `true` if a tile passes the angular-distance pre-filter
@@ -3462,12 +3462,12 @@ mod tests {
             "zoom 3.9 threshold must be >= 89°"
         );
         assert!(
-            centered_angular_threshold_deg(4.0) >= 85.0,
-            "zoom 4 threshold must be >= 85°"
+            centered_angular_threshold_deg(4.0) >= 89.0,
+            "zoom 4 threshold must be >= 89°"
         );
         assert!(
-            centered_angular_threshold_deg(10.0) >= 85.0,
-            "zoom 10 threshold must be >= 85°"
+            centered_angular_threshold_deg(10.0) >= 89.0,
+            "zoom 10 threshold must be >= 89°"
         );
         // Must never exceed 89.5° to avoid oblique Mercator singularity at 90°
         assert!(
