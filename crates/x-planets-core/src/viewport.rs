@@ -379,7 +379,7 @@ impl Viewport {
         let tiles_needed = (self.height as f64 / 256.0).max(1.0);
         let tile_size_deg = visible_deg / tiles_needed;
         let globe_zoom = (360.0 / tile_size_deg).log2()
-            .round()
+            .floor()
             .clamp(0.0, 22.0) as u8;
         let half_deg = cap_half.to_degrees().min(89.0);
         let lat = self.center.lat;
@@ -491,15 +491,15 @@ impl Viewport {
                 let d = (globe_r2 - globe_2rh * cos_theta).sqrt().max(globe_h);
                 let factor = (cos_theta.sqrt() * globe_h / d).max(0.01);
                 let zoom_adjust = factor.log2(); // ≤ 0
-                // Round to nearest integer.  Previous `floor()` caused even
-                // tiles adjacent to the center to drop a zoom level (because
-                // any non-zero θ gives a slightly negative adjustment that
-                // floor immediately rounds down), producing a visible
-                // rectangular boundary.  `round()` keeps tiles at base_z
-                // until the adjustment exceeds −0.5, giving a much wider
-                // ring of full-detail tiles and a smoother LOD gradient.
-                return (base_z as f64 + zoom_adjust)
-                    .round()
+                // Use floor for hysteresis: tiles only drop a zoom level
+                // when the adjustment crosses a full integer boundary.
+                // round() oscillates at the −0.5 boundary during small
+                // camera movements, causing tile flicker.  To compensate
+                // for floor's aggressive rounding (even tiles adjacent to
+                // center drop a level), add a +0.3 bias so tiles stay at
+                // base_z until the adjustment exceeds −0.7.
+                return (base_z as f64 + zoom_adjust + 0.3)
+                    .floor()
                     .clamp(min_z as f64, base_z as f64) as u8;
             }
 
@@ -1048,6 +1048,42 @@ impl CameraController {
     }
 
     /// Pan with projection-mode awareness.
+    /// Pan in centered Mercator mode using angular deltas.
+    ///
+    /// Standard Mercator pan() moves in Mercator coordinates where
+    /// near-pole movement is extremely compressed, making drag feel
+    /// frozen.  Centered Mercator re-projects around the viewport center,
+    /// so angular (degree-based) panning matches the visual.
+    pub fn pan_centered(&self, viewport: &mut Viewport, dx: f64, dy: f64) {
+        // In centered Mercator the viewport maps the oblique Mercator
+        // with the center at (0.5, 0.5).  The scale factor 2^(-zoom)
+        // gives the Mercator-space extent visible; convert that to
+        // angular extent for panning.
+        let scale = 2.0_f64.powf(-viewport.zoom);
+        // The viewport height spans `scale` Mercator units.
+        // At center Y=0.5, 1 Mercator unit ≈ 360/π ≈ 114.6° near equator,
+        // but we need the actual angular extent via inverse Mercator.
+        let edge_y = (0.5 + scale * 0.5).min(0.9999);
+        let edge_geo = mercator_to_geo(glam::DVec2::new(0.5, edge_y));
+        let visible_deg = edge_geo.lat.abs() * 2.0;
+        let deg_per_px = visible_deg / viewport.height as f64;
+
+        let bearing_rad = viewport.bearing.to_radians();
+        let sin_b = bearing_rad.sin();
+        let cos_b = bearing_rad.cos();
+
+        let dx_deg = dx * deg_per_px * self.pan_speed;
+        let dy_deg = dy * deg_per_px * self.pan_speed;
+
+        let dlat = sin_b * dx_deg - cos_b * dy_deg;
+
+        let cos_lat = viewport.center.lat.to_radians().cos().max(0.05);
+        let dlon = -(cos_b * dx_deg + sin_b * dy_deg) / cos_lat;
+
+        viewport.center.lat = (viewport.center.lat + dlat).clamp(-89.9, 89.9);
+        viewport.center.lon = ((viewport.center.lon + dlon) + 180.0).rem_euclid(360.0) - 180.0;
+    }
+
     pub fn pan_for_mode(
         &self,
         viewport: &mut Viewport,
@@ -1059,7 +1095,9 @@ impl CameraController {
             x_planets_math::ProjectionMode::Globe => {
                 self.pan_globe(viewport, dx, dy)
             }
-            _ => self.pan(viewport, dx, dy),
+            x_planets_math::ProjectionMode::Mercator => {
+                self.pan_centered(viewport, dx, dy)
+            }
         }
     }
 }
