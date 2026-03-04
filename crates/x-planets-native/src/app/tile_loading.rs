@@ -42,6 +42,19 @@ impl NativeApp {
             // For over-zoomed tiles (z > max_zoom), the max_zoom ancestor
             // is the deepest tile we can fetch, so include it in the needed set.
             let mut needed_coords: HashSet<TileCoord> = visible_set.clone();
+            // Always include base tiles (z=0, z=1) — they must never be
+            // aborted because they provide global fallback coverage.
+            {
+                let base_max = 1u8.min(ls.max_zoom);
+                for z in ls.min_zoom..=base_max {
+                    let n = 1u32 << z;
+                    for y in 0..n {
+                        for x in 0..n {
+                            needed_coords.insert(TileCoord::new(z, x, y));
+                        }
+                    }
+                }
+            }
             for vt in visible {
                 let coord = vt.coord;
                 // If tile exceeds max_zoom, start the ancestor chain
@@ -131,6 +144,35 @@ impl NativeApp {
                             break; // only nearest ancestor per visible tile
                         }
                         cur = p.parent();
+                    }
+                }
+            }
+
+            // ── Base tile loading ──
+            // Always eagerly load z=0 and z=1 tiles (5 total) so that
+            // resolve_fallbacks() always finds a cached ancestor.
+            // Without this, panning to a new area shows black gaps because
+            // no ancestor texture is available for newly visible tiles.
+            {
+                let base_max = 1u8.min(ls.max_zoom);
+                for z in ls.min_zoom..=base_max {
+                    let n = 1u32 << z;
+                    for y in 0..n {
+                        for x in 0..n {
+                            let coord = TileCoord::new(z, x, y);
+                            if ls.tile_textures.contains(&coord)
+                                || ls.pending_coords.contains(&coord)
+                                || ls.failed_cooldowns.contains_key(&coord)
+                            {
+                                continue;
+                            }
+                            // Highest priority (0.0) — these are tiny and
+                            // critical for fallback coverage.
+                            ls.tile_loader.enqueue(TileRequest {
+                                coord,
+                                priority: 0.0,
+                            });
+                        }
                     }
                 }
             }

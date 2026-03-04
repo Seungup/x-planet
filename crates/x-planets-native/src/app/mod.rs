@@ -319,6 +319,21 @@ impl NativeApp {
         // parent tiles from being evicted while still needed as fallback
         // coverage for unloaded children.
         for ls in &mut self.layer_states {
+            // Always bump base tiles (z=0, z=1) to prevent LRU eviction.
+            // These provide global fallback coverage for all tiles.
+            {
+                let base_max = 1u8.min(ls.max_zoom);
+                for z in ls.min_zoom..=base_max {
+                    let n = 1u32 << z;
+                    for y in 0..n {
+                        for x in 0..n {
+                            let c = x_planets_math::TileCoord::new(z, x, y);
+                            let _ = ls.tile_textures.get(&c);
+                            let _ = ls.terrain_data.get(&c);
+                        }
+                    }
+                }
+            }
             for vt in &visible {
                 let coord = vt.coord;
                 let _ = ls.tile_textures.get(&coord);
