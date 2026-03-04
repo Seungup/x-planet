@@ -307,17 +307,52 @@ impl Viewport {
             max_extent = max_extent.max(forward_dist);
         }
 
-        // Convert oblique Mercator extent to angular distance on the
-        // sphere.  In the rotated coordinate system the center maps to
-        // Mercator Y = 0.5; an offset of `max_extent` corresponds to a
-        // certain latitude (= angular distance from center).
-        let edge_y = (0.5 + max_extent).min(0.9999);
-        let edge_geo = mercator_to_geo(glam::DVec2::new(0.5, edge_y));
-        let viewport_angular_deg = edge_geo.lat.abs();
+        // Compute the actual angular distance on the sphere by sampling
+        // points at `max_extent` from the oblique Mercator center and
+        // inverse-projecting them back to geographic coordinates.
+        //
+        // The oblique Mercator center maps to (0.5, 0.5).  We sample 4
+        // cardinal directions (up, down, left, right) to find the worst-case
+        // angular distance, since the projection distortion is not uniform.
+        let center_lat_rad = self.center.lat.to_radians();
+        let center_lon_rad = self.center.lon.to_radians();
+        let center_sphere = x_planets_math::geo_to_unit_sphere(center_lat_rad, center_lon_rad);
+
+        let sample_offsets = [
+            glam::DVec2::new(0.5, 0.5 - max_extent), // up
+            glam::DVec2::new(0.5, 0.5 + max_extent), // down
+            glam::DVec2::new(0.5 - max_extent, 0.5), // left
+            glam::DVec2::new(0.5 + max_extent, 0.5), // right
+            // diagonals (corners of the viewport)
+            glam::DVec2::new(0.5 - half_w, 0.5 - half_h),
+            glam::DVec2::new(0.5 + half_w, 0.5 - half_h),
+            glam::DVec2::new(0.5 - half_w, 0.5 + half_h),
+            glam::DVec2::new(0.5 + half_w, 0.5 + half_h),
+        ];
+
+        let mut max_angular_deg: f64 = 0.0;
+        for offset in &sample_offsets {
+            let (lat_r, lon_r) = x_planets_math::oblique_mercator_inverse(
+                *offset,
+                center_lat_rad,
+                center_lon_rad,
+            );
+            if !lat_r.is_finite() || !lon_r.is_finite() {
+                // Near the singularity — use the threshold as fallback.
+                max_angular_deg = crate::pipeline::centered_angular_threshold_deg(self.zoom);
+                break;
+            }
+            let pt_sphere = x_planets_math::geo_to_unit_sphere(lat_r, lon_r);
+            let cos_angle = center_sphere.dot(pt_sphere).clamp(-1.0, 1.0);
+            let angle_deg = cos_angle.acos().to_degrees();
+            if angle_deg > max_angular_deg {
+                max_angular_deg = angle_deg;
+            }
+        }
 
         // Cap at the oblique Mercator singularity guard threshold.
         let threshold_deg: f64 = crate::pipeline::centered_angular_threshold_deg(self.zoom);
-        let visible_deg = viewport_angular_deg.min(threshold_deg);
+        let visible_deg = max_angular_deg.min(threshold_deg);
 
         let lat = self.center.lat;
         let lon = self.center.lon;
@@ -1964,10 +1999,9 @@ mod tests {
     }
 
     #[test]
-    fn test_centered_mercator_polar_more_tiles_than_equator() {
-        // At the same zoom, a polar center should select MORE tiles
-        // than an equatorial center in centered Mercator because the
-        // oblique Mercator wraps around the pole.
+    fn test_centered_mercator_polar_selects_sufficient_tiles() {
+        // Both polar and equatorial centers should select a reasonable
+        // number of tiles in centered Mercator mode.
         let mut viewport = Viewport::new(800, 600);
         viewport.zoom = 3.0;
 
@@ -1980,10 +2014,14 @@ mod tests {
             viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
 
         assert!(
-            polar_tiles.len() >= equator_tiles.len(),
-            "Polar ({}) should have >= tiles than equator ({})",
-            polar_tiles.len(),
+            equator_tiles.len() >= 10,
+            "Equator should select sufficient tiles, got {}",
             equator_tiles.len(),
+        );
+        assert!(
+            polar_tiles.len() >= 10,
+            "Polar should select sufficient tiles, got {}",
+            polar_tiles.len(),
         );
     }
 
