@@ -5,16 +5,31 @@ use x_planets_math::{
     ViewportUniforms, VisibleTile,
 };
 
-/// Compute the orbital camera altitude on a unit sphere for globe mode.
+/// Orbital camera altitude on a unit sphere for globe mode.
 ///
-/// The raw orbital model uses `base / 2^zoom`, but `acos(1/(1+h))` compresses
-/// at low altitudes, making `visible_deg ∝ 2^(-zoom/2)` instead of the
-/// `2^(-zoom)` that Mercator (and user expectations) follow.  A smooth
-/// quadratic acceleration `eff = zoom + zoom²/18` corrects this so that
-/// tile resolution and pan sensitivity track viewport zoom at all levels.
+/// At zoom 0 the camera is ~3.14 radii above the surface (sees whole globe).
+/// Each zoom level halves the altitude.
 fn globe_unit_altitude(zoom: f64) -> f64 {
-    let eff = zoom + zoom * zoom / 18.0;
-    (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(eff)
+    (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(zoom)
+}
+
+/// Effective visible half-angle for globe tile selection and interaction.
+///
+/// At low zoom the sphere's **horizon** limits visibility (cap formula).
+/// At high zoom the camera is close to the surface and the surface appears
+/// flat, so the **camera FOV** limits visibility instead.  Taking the
+/// minimum gives the correct visible extent at every zoom level.
+///
+/// Without this, the cap formula overestimates the visible area by up to
+/// 100×+ at high zoom, causing tiles to be selected at far too coarse a
+/// level and pan/zoom-to-point to overshoot dramatically.
+fn globe_visible_half_angle(unit_altitude: f64) -> f64 {
+    // Cap: angular radius from sub-satellite point to horizon on unit sphere.
+    let cap_half = (1.0 / (unit_altitude + 1.0)).acos();
+    // FOV: angular extent on a flat surface at distance `unit_altitude`,
+    // using the same 60° vertical FOV as `to_globe_view_proj_f64`.
+    let fov_half = unit_altitude * (std::f64::consts::FRAC_PI_3 * 0.5).tan();
+    cap_half.min(fov_half)
 }
 
 /// The viewport represents the visible area of the map.
@@ -321,29 +336,24 @@ impl Viewport {
     /// determine the visible spherical cap, then converts it to Mercator
     /// tile coordinates for tile fetching.
     fn visible_tiles_globe(&self) -> Vec<VisibleTile> {
-        // Camera altitude in unit-sphere radii (accelerated for high zoom).
         let unit_altitude = globe_unit_altitude(self.zoom);
 
-        // Angular radius of the visible cap on the sphere surface.
-        // cos(surface_angle) = R / (R + h) = 1 / (1 + unit_altitude)
-        // (acos gives the angle measured on the sphere from the
-        //  sub-satellite point to the horizon; asin would give the
-        //  much smaller camera-to-limb angle.)
-        let half_angle = (1.0 / (unit_altitude + 1.0)).acos();
+        // Use the FOV-aware half-angle so tile resolution matches
+        // what the camera actually renders on screen.
+        let half_angle = globe_visible_half_angle(unit_altitude);
 
-        // Compute effective zoom from angular extent:
-        // At zoom z, each tile covers 360/2^z degrees of longitude.
-        // The visible cap diameter in degrees ≈ 2 * half_angle_degrees.
+        // Compute effective zoom from angular extent.
         let visible_deg = half_angle.to_degrees() * 2.0;
         let tiles_needed = (self.height as f64 / 256.0).max(1.0);
         let tile_size_deg = visible_deg / tiles_needed;
-        // 360 / 2^z = tile_size_deg → z = log2(360 / tile_size_deg)
         let globe_zoom = (360.0 / tile_size_deg).log2()
             .round()
             .clamp(0.0, 22.0) as u8;
 
-        // Visible bounding box in geographic coordinates.
-        let half_deg = half_angle.to_degrees().min(89.0);
+        // Visible bounding box — use the full cap for culling so we don't
+        // clip tiles at the edges of the perspective view.
+        let cap_half = (1.0 / (unit_altitude + 1.0)).acos();
+        let half_deg = cap_half.to_degrees().min(89.0);
         let lat = self.center.lat;
         let lon = self.center.lon;
 
@@ -793,25 +803,15 @@ impl CameraController {
 
     /// Pan the viewport in globe mode using angular deltas.
     ///
-    /// Converts pixel deltas directly to geographic degree changes,
-    /// bypassing Mercator to avoid polar amplification.
-    ///
-    /// The sensitivity is derived from the perspective FOV and camera
-    /// altitude so that dragging across the full viewport height sweeps
-    /// exactly the visible angular extent of the sphere surface.
+    /// Uses the FOV-based visible extent so pan sensitivity matches the
+    /// on-screen tile density.  This gives consistent drag-to-movement
+    /// ratio across all zoom levels, similar to Mercator mode.
     pub fn pan_globe(&self, viewport: &mut Viewport, dx: f64, dy: f64) {
-        // Visible angular extent of the sphere surface from the camera.
-        // Uses accelerated altitude so sensitivity matches Mercator at high zoom.
         let unit_altitude = globe_unit_altitude(viewport.zoom);
-        let visible_half = (1.0 / (unit_altitude + 1.0)).acos();
+        let visible_half = globe_visible_half_angle(unit_altitude);
         let visible_deg = visible_half.to_degrees() * 2.0;
 
-        // Degrees per pixel with perspective correction.  The acos-based
-        // visible_deg is the full angular cap diameter, but perspective
-        // foreshortening means the screen center (where the user typically
-        // drags) covers fewer degrees per pixel than the average.  A factor
-        // of 0.5 closely matches 1:1 finger-under-cursor tracking.
-        let deg_per_px = visible_deg / viewport.height as f64 * 0.5;
+        let deg_per_px = visible_deg / viewport.height as f64;
 
         let bearing_rad = viewport.bearing.to_radians();
         let sin_b = bearing_rad.sin();
@@ -849,9 +849,10 @@ impl CameraController {
         screen_x: f64,
         screen_y: f64,
     ) {
-        // Compute angular offset of cursor from center before zoom.
+        // Compute geographic offset of cursor from center before zoom,
+        // using the FOV-limited visible extent (not the full cap).
         let unit_altitude = globe_unit_altitude(viewport.zoom);
-        let half_angle_old = (1.0 / (unit_altitude + 1.0)).acos().to_degrees();
+        let half_angle_old = globe_visible_half_angle(unit_altitude).to_degrees();
 
         let dx_norm = (screen_x - viewport.width as f64 * 0.5) / viewport.height as f64;
         let dy_norm = (screen_y - viewport.height as f64 * 0.5) / viewport.height as f64;
@@ -868,7 +869,7 @@ impl CameraController {
         self.zoom(viewport, delta);
 
         let unit_altitude_new = globe_unit_altitude(viewport.zoom);
-        let half_angle_new = (1.0 / (unit_altitude_new + 1.0)).acos().to_degrees();
+        let half_angle_new = globe_visible_half_angle(unit_altitude_new).to_degrees();
 
         let cos_lat = viewport.center.lat.to_radians().cos().max(0.05);
         let new_cursor_lon_off = (dx_norm * cos_b - dy_norm * sin_b) * half_angle_new * 2.0
@@ -1583,32 +1584,24 @@ mod tests {
 
     #[test]
     fn test_visible_tiles_globe_center_tile_included() {
-        // The tile containing the viewport center must always be in the result.
+        // Some tile covering the viewport center must always be in the result.
+        // Globe mode may derive a different tile zoom than viewport.tile_zoom(),
+        // so we check that at least one returned tile contains the center point.
         let mut viewport = Viewport::new(800, 600);
         viewport.center = GeoCoord::new(37.5665, 126.978);
         viewport.zoom = 5.0;
 
         let tiles =
             viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
-        let center_tile = TileCoord::from_geo(&viewport.center, viewport.tile_zoom());
 
-        // The center tile (or one of its ancestors) must be in the result.
         let has_center = tiles.iter().any(|vt| {
-            let mut cur = center_tile;
-            loop {
-                if cur == vt.coord {
-                    return true;
-                }
-                match cur.parent() {
-                    Some(p) => cur = p,
-                    None => return false,
-                }
-            }
+            let tc = TileCoord::from_geo(&viewport.center, vt.coord.z);
+            tc == vt.coord
         });
         assert!(
             has_center,
-            "Center tile {:?} (or ancestor) not found in globe visible tiles",
-            center_tile
+            "No tile covering center ({:.4}, {:.4}) found in globe visible tiles ({} tiles)",
+            viewport.center.lat, viewport.center.lon, tiles.len()
         );
     }
 
