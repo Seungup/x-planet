@@ -79,6 +79,7 @@ pub fn run_native(config: MapConfig) -> Result<(), Box<dyn std::error::Error>> {
         last_frame_time: None,
         frame_count: 0,
         fps_update_time: None,
+        prev_visible_set: HashSet::new(),
         // Mouse state
         mouse_pressed: false,
         last_mouse_pos: None,
@@ -117,6 +118,9 @@ struct NativeApp {
     last_frame_time: Option<Instant>,
     frame_count: u32,
     fps_update_time: Option<Instant>,
+    /// Previous frame's visible tile set — used to detect tiles newly entering
+    /// the viewport so we can re-register a fade-in for cached tiles.
+    prev_visible_set: HashSet<TileCoord>,
     // Left-click drag: pan
     mouse_pressed: bool,
     last_mouse_pos: Option<(f64, f64)>,
@@ -313,6 +317,27 @@ impl NativeApp {
 
         self.run_tile_loading(&visible, &visible_set, camera_center, now);
         self.poll_tile_results(now);
+
+        // ── 4b. Re-register fade for cached tiles newly entering viewport ──
+        // When a tile was off-screen (e.g., behind the globe) and comes back
+        // into view, its tile_fade_start may have been GC'd.  Without a new
+        // fade entry, the tile would pop in at full opacity instead of
+        // crossfading smoothly from its parent.
+        for ls in &self.layer_states {
+            for &coord in &visible_set {
+                if self.prev_visible_set.contains(&coord) {
+                    continue; // was visible last frame, no re-fade needed
+                }
+                // Tile is newly visible — if already cached but no active
+                // fade entry, register a new fade start.
+                if ls.tile_textures.contains(&coord)
+                    && !self.anim.tile_fade_start.contains_key(&coord)
+                {
+                    self.anim.tile_fade_start.insert(coord, now);
+                }
+            }
+        }
+        self.prev_visible_set = visible_set.clone();
 
         // ── 5. LRU bump all layers (mutable pass) ──
         // Bump visible tiles AND their fallback ancestors to prevent

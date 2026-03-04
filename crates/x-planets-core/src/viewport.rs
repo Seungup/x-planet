@@ -452,8 +452,12 @@ impl Viewport {
                 let d = (globe_r2 - globe_2rh * cos_theta).sqrt().max(globe_h);
                 let factor = (cos_theta * globe_h / d).max(0.01);
                 let zoom_adjust = factor.log2(); // ≤ 0
+                // Use floor instead of round for hysteresis: tiles only drop
+                // a zoom level when the adjustment crosses a full integer
+                // boundary, preventing oscillation at the 0.5 threshold
+                // during small camera movements (which causes tile flicker).
                 return (base_z as f64 + zoom_adjust)
-                    .round()
+                    .floor()
                     .clamp(min_z as f64, base_z as f64) as u8;
             }
 
