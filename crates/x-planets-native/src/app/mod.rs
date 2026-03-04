@@ -314,6 +314,38 @@ impl NativeApp {
         self.run_tile_loading(&visible, &visible_set, camera_center, now);
         self.poll_tile_results(now);
 
+        // ── 4b. Tile visibility tracking (shared core logic) ──
+        // Register fade-in for cached tiles newly entering viewport and
+        // track departing tiles for zoom-out fade-out.
+        {
+            let mut all_available: HashSet<TileCoord> = HashSet::new();
+            for ls in &self.layer_states {
+                for coord in ls.tile_textures.keys() {
+                    all_available.insert(*coord);
+                }
+            }
+            let now_secs = self.anim.to_secs_f64(now);
+            let prev = std::mem::take(&mut self.anim.prev_visible_available);
+            // Split borrows: fade_start is read by fade_elapsed_fn and
+            // written by register_fade_fn, departing_tiles is separate.
+            let fade_start = &self.anim.tile_fade_start;
+            let departing = &mut self.anim.departing_tiles;
+            let mut to_register: Vec<TileCoord> = Vec::new();
+            let new_prev = x_planets_core::interaction::update_tile_visibility(
+                &visible,
+                &all_available,
+                &prev,
+                |coord| fade_start.get(coord).map(|&s| now.duration_since(s).as_secs_f64()),
+                |coord| to_register.push(coord),
+                departing,
+                now_secs,
+            );
+            for coord in to_register {
+                self.anim.tile_fade_start.insert(coord, now);
+            }
+            self.anim.prev_visible_available = new_prev;
+        }
+
         // ── 5. LRU bump all layers (mutable pass) ──
         // Bump visible tiles AND their fallback ancestors to prevent
         // parent tiles from being evicted while still needed as fallback

@@ -237,6 +237,67 @@ impl AnimationController {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Tile visibility tracking (shared between native and web)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Track tile visibility changes and register fade-in for cached tiles
+/// newly entering the viewport.
+///
+/// Call once per frame after tile uploads, before crossfade computation.
+///
+/// - `visible`: current frame's visible tiles
+/// - `available`: tiles with textures in GPU cache
+/// - `prev_visible_available`: the set returned from the previous frame
+/// - `fade_elapsed_fn`: returns elapsed seconds since tile was loaded, or `None`
+/// - `register_fade_fn`: called with each tile coord that needs a new fade entry
+/// - `departing_tiles`: map of coord → departure timestamp (mutated in place)
+///
+/// Returns the new `visible_available` set to store for next frame.
+pub fn update_tile_visibility<F, R>(
+    visible: &[VisibleTile],
+    available: &HashSet<TileCoord>,
+    prev_visible_available: &HashSet<TileCoord>,
+    fade_elapsed_fn: F,
+    mut register_fade_fn: R,
+    departing_tiles: &mut HashMap<TileCoord, f64>,
+    now_secs: f64,
+) -> HashSet<TileCoord>
+where
+    F: Fn(&TileCoord) -> Option<f64>,
+    R: FnMut(TileCoord),
+{
+    let visible_set: HashSet<TileCoord> = visible.iter().map(|vt| vt.coord).collect();
+
+    let visible_available: HashSet<TileCoord> = visible
+        .iter()
+        .filter(|vt| available.contains(&vt.coord))
+        .map(|vt| vt.coord)
+        .collect();
+
+    // Register fade for cached tiles newly entering viewport (e.g. tiles
+    // coming from behind the globe, or re-entering after being off-screen
+    // long enough for the fade entry to be GC'd).
+    for &coord in &visible_available {
+        if !prev_visible_available.contains(&coord)
+            && fade_elapsed_fn(&coord).is_none()
+        {
+            register_fade_fn(coord);
+        }
+    }
+
+    // Track departing tiles (were visible+available, now gone) for
+    // zoom-out fade-out overlay.
+    for &coord in prev_visible_available {
+        if !visible_set.contains(&coord) {
+            departing_tiles.entry(coord).or_insert(now_secs);
+        }
+    }
+    departing_tiles.retain(|_, start| now_secs - *start < FADE_DURATION);
+
+    visible_available
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Crossfade computation (shared between native and web)
 // ═══════════════════════════════════════════════════════════════════
 
