@@ -5,6 +5,24 @@ use x_planets_math::{
     ViewportUniforms, VisibleTile,
 };
 
+/// LOD mode for quadtree tile selection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TileLodMode {
+    /// Standard flat Mercator: pitch-based perspective LOD, Mercator-distance
+    /// priority, seeds from min_z.
+    Flat,
+    /// Globe: aggressive angular LOD with foreshortening, angular priority,
+    /// seeds from z=0.  Suited for the 3D globe where edge tiles are
+    /// physically foreshortened.
+    Globe,
+    /// Centered Mercator: angular priority and z=0 seeding (like Globe) but
+    /// **no distance-based zoom reduction**.  Centered Mercator projects the
+    /// full spherical cap onto a flat plane, so edge tiles are NOT
+    /// foreshortened — they need full-resolution zoom just like center tiles.
+    /// Only pitch-based LOD is applied (if any).
+    Centered,
+}
+
 /// Orbital camera altitude on a unit sphere for globe mode.
 ///
 /// At zoom 0 the camera is ~3.14 radii above the surface (sees whole globe).
@@ -334,11 +352,10 @@ impl Viewport {
         if base_z == 0 {
             return frustum.visible_tiles(0);
         }
-        // Use globe-style angular LOD: tiles near the viewport center
-        // get full detail, distant tiles use coarser zoom.  This avoids
-        // the Mercator-distance bias that explodes tile counts at high
-        // latitudes.
-        self.quadtree_lod_with_frustum(base_z, &frustum, true)
+        // Use centered mode: angular priority and z=0 seeding (like globe)
+        // but no distance-based zoom reduction — centered Mercator projects
+        // the spherical cap flat, so edge tiles need full resolution.
+        self.quadtree_lod_with_frustum(base_z, &frustum, TileLodMode::Centered)
     }
 
     /// Globe-mode visible tile selection.
@@ -391,20 +408,21 @@ impl Viewport {
         }
 
         // Use the quadtree LOD algorithm with globe-derived zoom.
-        self.quadtree_lod_with_frustum(globe_zoom, &frustum, true)
+        self.quadtree_lod_with_frustum(globe_zoom, &frustum, TileLodMode::Globe)
     }
 
     /// Quadtree LOD with a custom frustum.
     ///
-    /// When `globe` is true, per-tile zoom is determined by angular distance
-    /// from the camera nadir on the sphere surface (tiles near the visible
-    /// edge are foreshortened and get coarser zoom).  When false the classic
-    /// pitch-based perspective LOD is used.
+    /// `mode` controls LOD behaviour:
+    /// - `Globe`: angular distance LOD with foreshortening (for 3D globe)
+    /// - `Centered`: angular priority + z=0 seed but no distance-based zoom
+    ///   reduction (for centered Mercator flat projection)
+    /// - `Flat`: pitch-based perspective LOD with Mercator distance priority
     fn quadtree_lod_with_frustum(
         &self,
         base_z: u8,
         frustum: &Frustum2D,
-        globe: bool,
+        mode: TileLodMode,
     ) -> Vec<VisibleTile> {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
@@ -428,11 +446,11 @@ impl Viewport {
         let globe_r2 = 1.0 + (1.0 + globe_h).powi(2);
         let globe_2rh = 2.0 * (1.0 + globe_h);
         // Globe mode allows up to 3 zoom levels of LOD reduction for
-        // distant/foreshortened tiles.
-        let max_drop = if globe {
-            3_u8
-        } else {
-            ((self.pitch / 15.0).ceil() as u8).min(4)
+        // distant/foreshortened tiles.  Centered Mercator uses pitch-based
+        // drop only (edge tiles are not foreshortened in centered projection).
+        let max_drop = match mode {
+            TileLodMode::Globe => 3_u8,
+            _ => ((self.pitch / 15.0).ceil() as u8).min(4),
         };
         let min_z = base_z.saturating_sub(max_drop);
 
@@ -442,7 +460,7 @@ impl Viewport {
         let cos_center_lat = center_lat_rad.cos();
 
         let ideal_zoom_at = |mx: f64, my: f64| -> u8 {
-            if globe {
+            if mode == TileLodMode::Globe {
                 // Screen-space size LOD on the unit sphere.
                 // factor = sqrt(cos(θ)) × h / d, where:
                 //   θ = central angle from nadir to tile
@@ -523,13 +541,14 @@ impl Viewport {
         let mut heap = BinaryHeap::<Candidate>::new();
         let mut result = Vec::<VisibleTile>::new();
 
-        // In globe mode, compute priority using angular (great-circle)
+        // In globe/centered mode, compute priority using angular (great-circle)
         // distance instead of Mercator distance.  Mercator stretches
         // high-latitude tiles, biasing the priority queue so that tiles
         // toward the equator are processed first, exhausting the tile
         // budget before high-latitude tiles get subdivided.
+        let use_angular = mode != TileLodMode::Flat;
         let tile_priority = |tc: glam::DVec2| -> f64 {
-            if globe {
+            if use_angular {
                 let g = mercator_to_geo(tc);
                 let dlat = g.lat.to_radians() - center_lat_rad;
                 let dlon = g.lon.to_radians() - center_lon_rad;
@@ -543,12 +562,12 @@ impl Viewport {
             }
         };
 
-        // In globe mode, start from z=0 so the quadtree can naturally
-        // build the LOD gradient: tiles near the camera get subdivided to
-        // base_z, while distant tiles stay coarse.  Starting from min_z
-        // would produce seed tiles whose centers are already far from the
-        // camera, preventing subdivision.
-        let seed_z = if globe { 0 } else { min_z };
+        // In globe/centered mode, start from z=0 so the quadtree can
+        // naturally build the LOD gradient: tiles near the camera get
+        // subdivided to base_z, while distant tiles stay coarse.  Starting
+        // from min_z would produce seed tiles whose centers are already far
+        // from the camera, preventing subdivision.
+        let seed_z = if mode != TileLodMode::Flat { 0 } else { min_z };
         for vt in frustum.visible_tiles(seed_z) {
             let tc = vt.display_mercator_center();
             heap.push(Candidate {
@@ -568,7 +587,7 @@ impl Viewport {
             // alone would prevent them from subdividing.  Only the single
             // tile containing the camera nadir is forced; its siblings use
             // the normal distance-based ideal_z.
-            let contains_center = if globe {
+            let contains_center = if mode != TileLodMode::Flat {
                 let n = (1u32 << vt.coord.z) as f64;
                 let tile_min_x = vt.coord.x as f64 / n;
                 let tile_max_x = (vt.coord.x + 1) as f64 / n;
@@ -606,11 +625,31 @@ impl Viewport {
         // tiles closest to the viewport center to prevent texture/cache
         // exhaustion.
         if result.len() > TILE_BUDGET {
-            result.sort_by(|a, b| {
-                let da = (a.display_mercator_center() - center_merc).length();
-                let db = (b.display_mercator_center() - center_merc).length();
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            if use_angular {
+                // Use angular distance for globe/centered modes to avoid
+                // Mercator-distance bias at high latitudes.
+                result.sort_by(|a, b| {
+                    let ang_dist = |tc: glam::DVec2| -> f64 {
+                        let g = mercator_to_geo(tc);
+                        let dlat = g.lat.to_radians() - center_lat_rad;
+                        let dlon = g.lon.to_radians() - center_lon_rad;
+                        let a = (dlat * 0.5).sin().powi(2)
+                            + cos_center_lat
+                                * g.lat.to_radians().cos()
+                                * (dlon * 0.5).sin().powi(2);
+                        2.0 * a.sqrt().asin()
+                    };
+                    let da = ang_dist(a.display_mercator_center());
+                    let db = ang_dist(b.display_mercator_center());
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            } else {
+                result.sort_by(|a, b| {
+                    let da = (a.display_mercator_center() - center_merc).length();
+                    let db = (b.display_mercator_center() - center_merc).length();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
             result.truncate(TILE_BUDGET);
         }
 
@@ -621,7 +660,7 @@ impl Viewport {
     /// Quadtree-based LOD tile selection (gap-free, priority-ordered, budgeted).
     fn quadtree_lod(&self, base_z: u8) -> Vec<VisibleTile> {
         let frustum = self.frustum();
-        self.quadtree_lod_with_frustum(base_z, &frustum, false)
+        self.quadtree_lod_with_frustum(base_z, &frustum, TileLodMode::Flat)
     }
 
     /// Compute the view-projection matrix in f64 for high-precision per-tile MVP.
