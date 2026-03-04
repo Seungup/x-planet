@@ -5,6 +5,18 @@ use x_planets_math::{
     ViewportUniforms, VisibleTile,
 };
 
+/// Compute the orbital camera altitude on a unit sphere for globe mode.
+///
+/// The raw orbital model uses `base / 2^zoom`, but `acos(1/(1+h))` compresses
+/// at low altitudes, making `visible_deg ∝ 2^(-zoom/2)` instead of the
+/// `2^(-zoom)` that Mercator (and user expectations) follow.  A smooth
+/// quadratic acceleration `eff = zoom + zoom²/18` corrects this so that
+/// tile resolution and pan sensitivity track viewport zoom at all levels.
+fn globe_unit_altitude(zoom: f64) -> f64 {
+    let eff = zoom + zoom * zoom / 18.0;
+    (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(eff)
+}
+
 /// The viewport represents the visible area of the map.
 #[derive(Debug, Clone)]
 pub struct Viewport {
@@ -309,9 +321,8 @@ impl Viewport {
     /// determine the visible spherical cap, then converts it to Mercator
     /// tile coordinates for tile fetching.
     fn visible_tiles_globe(&self) -> Vec<VisibleTile> {
-        // Camera altitude in unit-sphere radii.
-        let unit_altitude =
-            (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(self.zoom);
+        // Camera altitude in unit-sphere radii (accelerated for high zoom).
+        let unit_altitude = globe_unit_altitude(self.zoom);
 
         // Angular radius of the visible cap on the sphere surface.
         // cos(surface_angle) = R / (R + h) = 1 / (1 + unit_altitude)
@@ -547,10 +558,8 @@ impl Viewport {
         let surface_point = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
 
         // Camera altitude above sphere surface (unit-sphere radius = 1.0).
-        // At zoom 0, ~3.14 radii above surface → sees whole globe.
-        // Each zoom level halves the altitude.
-        let unit_altitude =
-            (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(self.zoom);
+        // Accelerated descent at high zoom to match Mercator visible area.
+        let unit_altitude = globe_unit_altitude(self.zoom);
 
         // Local ENU (East-North-Up) basis at surface point
         let up_surface = surface_point.normalize();
@@ -580,9 +589,12 @@ impl Viewport {
 
         let aspect = self.width as f64 / self.height.max(1) as f64;
         let fov_y: f64 = std::f64::consts::FRAC_PI_3; // 60°
-        let near = unit_altitude * 0.01;
-        let far = (unit_altitude + 2.0) * 3.0; // far enough to see whole sphere
-        let proj = glam::DMat4::perspective_rh(fov_y, aspect, near.max(0.0001), far);
+        // At high zoom the camera is extremely close to the surface; use
+        // adaptive near/far to preserve depth-buffer precision.
+        let horizon_dist = (2.0 * unit_altitude).sqrt();
+        let near = (unit_altitude * 0.1).max(1e-7);
+        let far = (unit_altitude + horizon_dist) * 2.0 + 0.1;
+        let proj = glam::DMat4::perspective_rh(fov_y, aspect, near, far);
 
         proj * view
     }
@@ -789,11 +801,8 @@ impl CameraController {
     /// exactly the visible angular extent of the sphere surface.
     pub fn pan_globe(&self, viewport: &mut Viewport, dx: f64, dy: f64) {
         // Visible angular extent of the sphere surface from the camera.
-        // arccos(R/(R+h)) gives the angular radius of the visible cap
-        // on the unit sphere — this DECREASES when zooming in, correctly
-        // reducing the degrees-per-pixel rate at higher zoom.
-        let unit_altitude =
-            (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(viewport.zoom);
+        // Uses accelerated altitude so sensitivity matches Mercator at high zoom.
+        let unit_altitude = globe_unit_altitude(viewport.zoom);
         let visible_half = (1.0 / (unit_altitude + 1.0)).acos();
         let visible_deg = visible_half.to_degrees() * 2.0;
 
@@ -848,9 +857,7 @@ impl CameraController {
         let delta = delta * damping;
 
         // Compute angular offset of cursor from center before zoom.
-        // arccos(R/(R+h)) = visible surface angular radius (decreases when zooming in).
-        let unit_altitude =
-            (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(viewport.zoom);
+        let unit_altitude = globe_unit_altitude(viewport.zoom);
         let half_angle_old = (1.0 / (unit_altitude + 1.0)).acos().to_degrees();
 
         let dx_norm = (screen_x - viewport.width as f64 * 0.5) / viewport.height as f64;
@@ -867,8 +874,7 @@ impl CameraController {
 
         self.zoom(viewport, delta);
 
-        let unit_altitude_new =
-            (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(viewport.zoom);
+        let unit_altitude_new = globe_unit_altitude(viewport.zoom);
         let half_angle_new = (1.0 / (unit_altitude_new + 1.0)).acos().to_degrees();
 
         let cos_lat = viewport.center.lat.to_radians().cos().max(0.05);
