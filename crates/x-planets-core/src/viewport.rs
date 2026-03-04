@@ -307,72 +307,94 @@ impl Viewport {
             max_extent = max_extent.max(forward_dist);
         }
 
-        // Compute the actual angular distance on the sphere by sampling
-        // points at `max_extent` from the oblique Mercator center and
-        // inverse-projecting them back to geographic coordinates.
-        //
-        // The oblique Mercator center maps to (0.5, 0.5).  We sample 4
-        // cardinal directions (up, down, left, right) to find the worst-case
-        // angular distance, since the projection distortion is not uniform.
+        // Compute the geographic bounding box by densely sampling the
+        // viewport boundary in oblique Mercator space, inverse-projecting
+        // each point to geographic coordinates, and taking the envelope.
+        // This avoids any spherical-cap-to-rectangle approximation errors.
         let center_lat_rad = self.center.lat.to_radians();
         let center_lon_rad = self.center.lon.to_radians();
         let center_sphere = x_planets_math::geo_to_unit_sphere(center_lat_rad, center_lon_rad);
+        let threshold_deg: f64 = crate::pipeline::centered_angular_threshold_deg(self.zoom);
 
-        let sample_offsets = [
-            glam::DVec2::new(0.5, 0.5 - max_extent), // up
-            glam::DVec2::new(0.5, 0.5 + max_extent), // down
-            glam::DVec2::new(0.5 - max_extent, 0.5), // left
-            glam::DVec2::new(0.5 + max_extent, 0.5), // right
-            // diagonals (corners of the viewport)
-            glam::DVec2::new(0.5 - half_w, 0.5 - half_h),
-            glam::DVec2::new(0.5 + half_w, 0.5 - half_h),
-            glam::DVec2::new(0.5 - half_w, 0.5 + half_h),
-            glam::DVec2::new(0.5 + half_w, 0.5 + half_h),
-        ];
+        // For pitched views, extend the viewport rectangle forward.
+        let forward_ext = if self.pitch >= 1.0 { max_extent } else { 0.0 };
 
-        let mut max_angular_deg: f64 = 0.0;
-        for offset in &sample_offsets {
-            let (lat_r, lon_r) = x_planets_math::oblique_mercator_inverse(
-                *offset,
-                center_lat_rad,
-                center_lon_rad,
-            );
-            if !lat_r.is_finite() || !lon_r.is_finite() {
-                // Near the singularity — use the threshold as fallback.
-                max_angular_deg = crate::pipeline::centered_angular_threshold_deg(self.zoom);
-                break;
-            }
-            let pt_sphere = x_planets_math::geo_to_unit_sphere(lat_r, lon_r);
-            let cos_angle = center_sphere.dot(pt_sphere).clamp(-1.0, 1.0);
-            let angle_deg = cos_angle.acos().to_degrees();
-            if angle_deg > max_angular_deg {
-                max_angular_deg = angle_deg;
+        // Sample a grid of points covering the viewport rectangle in oblique
+        // Mercator space, inverse-project each to geographic coordinates, and
+        // take the lat/lon envelope.  We sample both the boundary AND interior
+        // because the oblique Mercator inverse is nonlinear and lat/lon
+        // extremes can occur inside the rectangle (especially near poles).
+        let n_grid = 8_usize; // 9×9 grid = 81 points
+        let mut lat_min_deg = self.center.lat;
+        let mut lat_max_deg = self.center.lat;
+        let mut lon_min_deg = self.center.lon;
+        let mut lon_max_deg = self.center.lon;
+        let mut hit_singularity = false;
+
+        // Viewport rectangle in oblique Mercator space
+        let rect_left = 0.5 - half_w;
+        let rect_right = 0.5 + half_w;
+        let rect_top = 0.5 - half_h - forward_ext;
+        let rect_bottom = 0.5 + half_h;
+
+        for iy in 0..=n_grid {
+            let ty = iy as f64 / n_grid as f64;
+            let y = rect_top + (rect_bottom - rect_top) * ty;
+            for ix in 0..=n_grid {
+                let tx = ix as f64 / n_grid as f64;
+                let x = rect_left + (rect_right - rect_left) * tx;
+                let pt = glam::DVec2::new(x, y);
+                let (lat_r, lon_r) = x_planets_math::oblique_mercator_inverse(
+                    pt,
+                    center_lat_rad,
+                    center_lon_rad,
+                );
+                if !lat_r.is_finite() || !lon_r.is_finite() {
+                    hit_singularity = true;
+                    continue;
+                }
+                // Check angular distance — skip points beyond threshold.
+                let pt_sphere = x_planets_math::geo_to_unit_sphere(lat_r, lon_r);
+                let cos_angle = center_sphere.dot(pt_sphere).clamp(-1.0, 1.0);
+                let angle_deg = cos_angle.acos().to_degrees();
+                if angle_deg > threshold_deg {
+                    continue;
+                }
+                let lat_d = lat_r.to_degrees();
+                let lon_d = lon_r.to_degrees();
+                if lat_d < lat_min_deg { lat_min_deg = lat_d; }
+                if lat_d > lat_max_deg { lat_max_deg = lat_d; }
+                if lon_d < lon_min_deg { lon_min_deg = lon_d; }
+                if lon_d > lon_max_deg { lon_max_deg = lon_d; }
             }
         }
 
-        // Cap at the oblique Mercator singularity guard threshold.
-        let threshold_deg: f64 = crate::pipeline::centered_angular_threshold_deg(self.zoom);
-        let visible_deg = max_angular_deg.min(threshold_deg);
+        // If we hit a singularity, widen to the full threshold cap.
+        if hit_singularity {
+            let lat = self.center.lat;
+            let lon = self.center.lon;
+            lat_min_deg = (lat - threshold_deg).max(-89.9);
+            lat_max_deg = (lat + threshold_deg).min(89.9);
+            let cos_worst = lat_max_deg.abs().max(lat_min_deg.abs()).to_radians().cos().max(0.01);
+            let lon_span = (threshold_deg / cos_worst).min(180.0);
+            lon_min_deg = lon - lon_span;
+            lon_max_deg = lon + lon_span;
+        }
 
-        let lat = self.center.lat;
-        let lon = self.center.lon;
+        // Add a generous margin to account for grid sampling resolution.
+        // Extra tiles are cheap — the angular filter discards those too far
+        // from the viewport center, so over-selection is harmless.
+        let lat_range = lat_max_deg - lat_min_deg;
+        let lon_range = lon_max_deg - lon_min_deg;
+        lat_min_deg = (lat_min_deg - lat_range * 0.15).max(-89.9);
+        lat_max_deg = (lat_max_deg + lat_range * 0.15).min(89.9);
+        lon_min_deg -= lon_range * 0.15;
+        lon_max_deg += lon_range * 0.15;
 
-        // Geographic bounding box covering the spherical cap.
-        let lat_min = (lat - visible_deg).max(-89.9);
-        let lat_max = (lat + visible_deg).min(89.9);
-        // Longitude span must cover the widest parallel within the cap.
-        // At the equator cos(lat)≈1 so lon_span≈visible_deg; near the
-        // poles cos(lat)→0 so lon_span→180°.  Use the highest-latitude
-        // edge of the cap (worst case for meridian convergence).
-        let worst_lat = if lat_min.abs() > lat_max.abs() {
-            lat_min.to_radians()
-        } else {
-            lat_max.to_radians()
-        };
-        let cos_worst = worst_lat.cos().max(0.01);
-        let lon_span = (visible_deg / cos_worst).min(180.0);
-        let lon_min = lon - lon_span;
-        let lon_max = lon + lon_span;
+        let lat_min = lat_min_deg;
+        let lat_max = lat_max_deg;
+        let lon_min = lon_min_deg;
+        let lon_max = lon_max_deg;
 
         // Build a Frustum2D from the geographic extent.
         let sw = geo_to_mercator(&GeoCoord::new(lat_min, lon_min));
