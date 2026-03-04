@@ -387,9 +387,15 @@ impl Viewport {
 
         let lat_min = (lat - half_deg).max(-89.9);
         let lat_max = (lat + half_deg).min(89.9);
-        // Longitude span scales by cos(lat) at the equator edge
-        let cos_lat = lat.to_radians().cos().max(0.05);
-        let lon_span = (half_deg / cos_lat).min(180.0);
+        // Longitude span must cover the widest parallel within the cap.
+        // Use the highest-latitude edge (worst case for meridian convergence).
+        let worst_lat = if lat_min.abs() > lat_max.abs() {
+            lat_min.to_radians()
+        } else {
+            lat_max.to_radians()
+        };
+        let cos_worst = worst_lat.cos().max(0.01);
+        let lon_span = (half_deg / cos_worst).min(180.0);
         let lon_min = lon - lon_span;
         let lon_max = lon + lon_span;
 
