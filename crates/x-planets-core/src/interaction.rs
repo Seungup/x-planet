@@ -767,4 +767,92 @@ mod tests {
         let action = ts.process_moves(&[(0, 120.0, 100.0), (1, 210.0, 100.0)], 1.0, 1.25);
         assert!(matches!(action, Some(GestureAction::MultiTouch(_))));
     }
+
+    #[test]
+    fn test_animation_controller_is_animating_idle() {
+        let anim = AnimationController::new(5.0);
+        // When zoom_target == current_zoom and no velocity or fades
+        assert!(!anim.is_animating(5.0));
+    }
+
+    #[test]
+    fn test_animation_controller_is_animating_zoom() {
+        let mut anim = AnimationController::new(5.0);
+        anim.zoom_target = 8.0;
+        assert!(anim.is_animating(5.0));
+    }
+
+    #[test]
+    fn test_animation_controller_is_animating_pan() {
+        let mut anim = AnimationController::new(5.0);
+        anim.pan_velocity = (100.0, 0.0);
+        assert!(anim.is_animating(5.0));
+    }
+
+    #[test]
+    fn test_animation_controller_tick_zoom_converges() {
+        let mut anim = AnimationController::new(5.0);
+        anim.zoom_target = 8.0;
+
+        let config = crate::engine::MapConfig::default();
+        let mut engine = MapEngine::new(config, 800, 600);
+
+        // Tick many frames
+        for _ in 0..100 {
+            anim.tick(&mut engine, 0.016);
+        }
+
+        // Zoom should have converged close to target
+        assert!(
+            (engine.viewport.zoom - 8.0).abs() < 0.01,
+            "Zoom should converge to target: got {}",
+            engine.viewport.zoom
+        );
+    }
+
+    #[test]
+    fn test_animation_controller_tick_inertia_decays() {
+        let mut anim = AnimationController::new(5.0);
+        anim.pan_velocity = (500.0, 0.0);
+
+        let config = crate::engine::MapConfig::default();
+        let mut engine = MapEngine::new(config, 800, 600);
+
+        // Tick several frames
+        for _ in 0..60 {
+            anim.tick(&mut engine, 0.016);
+        }
+
+        // Pan velocity should have decayed
+        let (vx, _) = anim.pan_velocity;
+        assert!(
+            vx.abs() < 10.0,
+            "Inertia should decay: velocity still at {}",
+            vx
+        );
+    }
+
+    #[test]
+    fn test_animation_controller_begin_drag_stops_inertia() {
+        let mut anim = AnimationController::new(5.0);
+        anim.pan_velocity = (500.0, 300.0);
+
+        anim.begin_drag();
+
+        assert_eq!(anim.pan_velocity, (0.0, 0.0));
+    }
+
+    #[test]
+    fn test_animation_controller_gc_fades() {
+        let mut anim = AnimationController::new(5.0);
+        let c1 = TileCoord::new(5, 10, 10);
+        let c2 = TileCoord::new(5, 11, 10);
+        anim.register_tile_loaded(c1, 1.0);
+        anim.register_tile_loaded(c2, 1.5);
+
+        // At t=1.5, c1 has been loaded for 0.5s (past FADE_DURATION=0.3)
+        anim.gc_fades(1.5);
+        assert!(anim.tile_fade_elapsed(&c1, 1.5).is_none(), "c1 should be GC'd");
+        assert!(anim.tile_fade_elapsed(&c2, 1.5).is_some(), "c2 should remain");
+    }
 }

@@ -1126,4 +1126,239 @@ mod tests {
         assert!(south.y > 0.9 && south.y < 1.0, "South pole merc.y={:.4}", south.y);
         assert!((equator.y - 0.5).abs() < 1e-10, "Equator merc.y={:.4}", equator.y);
     }
+
+    // ── Oblique Mercator tests ──────────────────────────────
+
+    #[test]
+    fn test_oblique_mercator_center_maps_to_half() {
+        // The center point should map to (0.5, 0.5) in oblique Mercator.
+        let center_lat = 37.5_f64.to_radians();
+        let center_lon = 127.0_f64.to_radians();
+        let result = oblique_mercator(center_lat, center_lon, center_lat, center_lon);
+        assert!((result.x - 0.5).abs() < 1e-10, "x={}", result.x);
+        assert!((result.y - 0.5).abs() < 1e-10, "y={}", result.y);
+    }
+
+    #[test]
+    fn test_oblique_mercator_roundtrip() {
+        // Forward + inverse should recover the original point.
+        let centers = [
+            (37.5_f64, 127.0_f64),   // Seoul
+            (40.7_f64, -74.0_f64),   // New York
+            (0.0_f64, 0.0_f64),      // Equator/prime meridian
+            (-33.9_f64, 18.4_f64),   // Cape Town
+            (78.0_f64, 15.6_f64),    // Svalbard (high latitude)
+        ];
+        for (clat, clon) in &centers {
+            let clat_r = clat.to_radians();
+            let clon_r = clon.to_radians();
+            // Test a point offset from center
+            let lat_r = (clat + 5.0).to_radians();
+            let lon_r = (clon + 5.0).to_radians();
+            let merc = oblique_mercator(lat_r, lon_r, clat_r, clon_r);
+            let (rlat, rlon) = oblique_mercator_inverse(merc, clat_r, clon_r);
+            assert!(
+                (lat_r - rlat).abs() < 1e-8,
+                "lat roundtrip failed for center ({}, {}): {} vs {}",
+                clat, clon, lat_r, rlat
+            );
+            assert!(
+                (lon_r - rlon).abs() < 1e-8,
+                "lon roundtrip failed for center ({}, {}): {} vs {}",
+                clat, clon, lon_r, rlon
+            );
+        }
+    }
+
+    #[test]
+    fn test_oblique_mercator_equator_center_matches_standard() {
+        // When centered at (0,0), oblique Mercator should match standard Mercator.
+        let lat = 48.8566_f64.to_radians(); // Paris
+        let lon = 2.3522_f64.to_radians();
+        let oblique = oblique_mercator(lat, lon, 0.0, 0.0);
+        let standard = geo_to_mercator(&GeoCoord::new(48.8566, 2.3522));
+        assert!(
+            (oblique.x - standard.x).abs() < 1e-8,
+            "x: {} vs {}", oblique.x, standard.x
+        );
+        assert!(
+            (oblique.y - standard.y).abs() < 1e-8,
+            "y: {} vs {}", oblique.y, standard.y
+        );
+    }
+
+    // ── VisibleTile tests ───────────────────────────────────
+
+    #[test]
+    fn test_visible_tile_canonical() {
+        let coord = TileCoord::new(3, 5, 2);
+        let vt = VisibleTile::canonical(coord);
+        assert_eq!(vt.coord, coord);
+        assert_eq!(vt.display_x, 5);
+    }
+
+    #[test]
+    fn test_visible_tile_display_mercator_center() {
+        let vt = VisibleTile::canonical(TileCoord::new(1, 0, 0));
+        let center = vt.display_mercator_center();
+        assert!((center.x - 0.25).abs() < 1e-10);
+        assert!((center.y - 0.25).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_visible_tile_children() {
+        let vt = VisibleTile::canonical(TileCoord::new(1, 0, 0));
+        let children = vt.children();
+        assert_eq!(children.len(), 4);
+        // Children should be at zoom 2
+        for child in &children {
+            assert_eq!(child.coord.z, 2);
+        }
+        // display_x should be 0 and 1 (parent display_x=0 → children 0,1)
+        assert_eq!(children[0].display_x, 0);
+        assert_eq!(children[1].display_x, 1);
+        assert_eq!(children[2].display_x, 0);
+        assert_eq!(children[3].display_x, 1);
+    }
+
+    #[test]
+    fn test_visible_tile_wrapped_negative_display_x() {
+        // A tile with negative display_x (across antimeridian)
+        let vt = VisibleTile {
+            coord: TileCoord::new(1, 1, 0), // canonical x=1
+            display_x: -1,                   // displayed at x=-1 (wrapped)
+        };
+        let center = vt.display_mercator_center();
+        // display_x=-1, n=2: (-1+0.5)/2 = -0.25
+        assert!((center.x - (-0.25)).abs() < 1e-10);
+
+        let children = vt.children();
+        // display_x=-1 → children at display_x=-2 and -1
+        assert_eq!(children[0].display_x, -2);
+        assert_eq!(children[1].display_x, -1);
+        // Canonical coord.x wraps via rem_euclid: (-2).rem_euclid(4)=2, (-1).rem_euclid(4)=3
+        assert_eq!(children[0].coord.x, 2);
+        assert_eq!(children[1].coord.x, 3);
+    }
+
+    // ── GeoCoord additional tests ───────────────────────────
+
+    #[test]
+    fn test_geo_coord_to_from_radians() {
+        let coord = GeoCoord::new(45.0, 90.0);
+        let rad = coord.to_radians();
+        let recovered = GeoCoord::from_radians(rad.x, rad.y);
+        assert!((coord.lat - recovered.lat).abs() < 1e-10);
+        assert!((coord.lon - recovered.lon).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_geo_coord_default() {
+        let coord = GeoCoord::default();
+        assert_eq!(coord.lat, 0.0);
+        assert_eq!(coord.lon, 0.0);
+    }
+
+    #[test]
+    fn test_geo_coord_normalize_boundary() {
+        // Exact boundary values
+        let coord = GeoCoord::new(90.0, 180.0);
+        let n = coord.normalize();
+        assert_eq!(n.lat, 90.0);
+        assert_eq!(n.lon, 180.0);
+
+        let coord = GeoCoord::new(-90.0, -180.0);
+        let n = coord.normalize();
+        assert_eq!(n.lat, -90.0);
+        assert_eq!(n.lon, -180.0);
+    }
+
+    // ── BoundingBox additional tests ────────────────────────
+
+    #[test]
+    fn test_bounding_box_center() {
+        let bbox = BoundingBox::new(
+            GeoCoord::new(10.0, 20.0),
+            GeoCoord::new(30.0, 40.0),
+        );
+        let c = bbox.center();
+        assert!((c.lat - 20.0).abs() < 1e-10);
+        assert!((c.lon - 30.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_bounding_box_width_height() {
+        let bbox = BoundingBox::new(
+            GeoCoord::new(10.0, 20.0),
+            GeoCoord::new(30.0, 50.0),
+        );
+        assert!((bbox.width() - 30.0).abs() < 1e-10);
+        assert!((bbox.height() - 20.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_bounding_box_world_constant() {
+        let w = BoundingBox::WORLD;
+        assert!(w.contains(&GeoCoord::new(0.0, 0.0)));
+        assert!(w.contains(&GeoCoord::new(85.0, 180.0)));
+        assert!(!w.contains(&GeoCoord::new(86.0, 0.0)));
+    }
+
+    #[test]
+    fn test_bounding_box_contains_on_edge() {
+        let bbox = BoundingBox::new(
+            GeoCoord::new(0.0, 0.0),
+            GeoCoord::new(10.0, 10.0),
+        );
+        // Points exactly on edges should be contained
+        assert!(bbox.contains(&GeoCoord::new(0.0, 0.0)));
+        assert!(bbox.contains(&GeoCoord::new(10.0, 10.0)));
+        assert!(bbox.contains(&GeoCoord::new(5.0, 0.0)));
+    }
+
+    #[test]
+    fn test_bounding_box_self_intersects() {
+        let bbox = BoundingBox::new(
+            GeoCoord::new(0.0, 0.0),
+            GeoCoord::new(10.0, 10.0),
+        );
+        assert!(bbox.intersects(&bbox));
+    }
+
+    // ── TileCoord additional tests ──────────────────────────
+
+    #[test]
+    fn test_tile_coord_display() {
+        let tile = TileCoord::new(5, 10, 15);
+        assert_eq!(format!("{}", tile), "5/10/15");
+    }
+
+    #[test]
+    fn test_tile_coord_extent() {
+        assert_eq!(TileCoord::new(0, 0, 0).extent(), 1);
+        assert_eq!(TileCoord::new(1, 0, 0).extent(), 2);
+        assert_eq!(TileCoord::new(4, 0, 0).extent(), 16);
+        assert_eq!(TileCoord::new(10, 0, 0).extent(), 1024);
+    }
+
+    #[test]
+    fn test_tile_coord_from_geo_at_poles() {
+        // Near north pole
+        let north = TileCoord::from_geo(&GeoCoord::new(85.0, 0.0), 3);
+        assert_eq!(north.z, 3);
+        assert_eq!(north.y, 0); // Northernmost row
+
+        // Near south pole
+        let south = TileCoord::from_geo(&GeoCoord::new(-85.0, 0.0), 3);
+        assert_eq!(south.z, 3);
+        assert_eq!(south.y, 7); // Southernmost row at z=3
+    }
+
+    // ── ConvexPolygon2D additional tests ────────────────────
+
+    #[test]
+    fn test_polygon_from_too_few_points() {
+        assert!(ConvexPolygon2D::from_points(&[DVec2::ZERO, DVec2::ONE]).is_none());
+        assert!(ConvexPolygon2D::from_points(&[]).is_none());
+    }
 }

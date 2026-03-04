@@ -218,4 +218,97 @@ mod tests {
             x_planets_math::ProjectionMode::Mercator,
         );
     }
+
+    #[test]
+    fn test_registry_empty() {
+        let registry = ProjectionRegistry::empty();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+        assert!(registry.get("Web Mercator").is_none());
+    }
+
+    #[test]
+    fn test_registry_list() {
+        let registry = ProjectionRegistry::new();
+        let names = registry.list();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"Web Mercator"));
+        assert!(names.contains(&"Globe"));
+    }
+
+    #[test]
+    fn test_registry_overwrite_same_name() {
+        let mut registry = ProjectionRegistry::new();
+        let custom = CustomProjection::new("Web Mercator", "// overridden shader");
+        registry.register(Arc::new(custom));
+
+        // Should still have 2 entries (overwritten, not duplicated)
+        assert_eq!(registry.len(), 2);
+        let proj = registry.get("Web Mercator").unwrap();
+        assert_eq!(proj.shader_source(), "// overridden shader");
+    }
+
+    #[test]
+    fn test_custom_projection_with_epsg() {
+        let custom = CustomProjection::new("Test", "// shader")
+            .with_epsg("EPSG:9999");
+        assert_eq!(custom.epsg_code(), Some("EPSG:9999"));
+    }
+
+    #[test]
+    fn test_custom_projection_with_function_name() {
+        let custom = CustomProjection::new("Test", "// shader")
+            .with_function_name("my_project");
+        assert_eq!(custom.shader_function_name(), "my_project");
+    }
+
+    #[test]
+    fn test_custom_projection_cpu_fallback_returns_input() {
+        let custom = CustomProjection::new("Test", "// shader");
+        let input = glam::DVec3::new(1.0, 2.0, 3.0);
+        assert_eq!(custom.project_cpu(input), input);
+        assert_eq!(custom.unproject_cpu(input), input);
+    }
+
+    #[test]
+    fn test_compose_shaders_base_only() {
+        let result = crate::compose_shaders("fn base() {}", &[]);
+        assert!(result.contains("fn base() {}"));
+        assert!(result.contains("// === Base Projection ==="));
+        assert!(!result.contains("Transform"));
+    }
+
+    #[test]
+    fn test_compose_shaders_with_transforms() {
+        let result = crate::compose_shaders(
+            "fn base() {}",
+            &["fn t0() {}", "fn t1() {}"],
+        );
+        assert!(result.contains("// === Base Projection ==="));
+        assert!(result.contains("fn base() {}"));
+        assert!(result.contains("// === Transform 0 ==="));
+        assert!(result.contains("fn t0() {}"));
+        assert!(result.contains("// === Transform 1 ==="));
+        assert!(result.contains("fn t1() {}"));
+    }
+
+    #[test]
+    fn test_mercator_epsg_code() {
+        let merc = crate::builtins::Mercator;
+        assert_eq!(merc.epsg_code(), Some("EPSG:3857"));
+    }
+
+    #[test]
+    fn test_globe_epsg_code() {
+        let globe = crate::builtins::Globe;
+        assert_eq!(globe.epsg_code(), Some("EPSG:4326"));
+    }
+
+    #[test]
+    fn test_mercator_latitude_range() {
+        let merc = crate::builtins::Mercator;
+        let (min, max) = merc.latitude_range();
+        assert!((min - (-85.0511)).abs() < 0.001);
+        assert!((max - 85.0511).abs() < 0.001);
+    }
 }

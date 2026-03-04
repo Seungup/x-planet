@@ -2039,4 +2039,163 @@ mod tests {
             }
         }
     }
+
+    // ── CameraController pan tests ──────────────────────────
+
+    #[test]
+    fn test_pan_moves_center() {
+        let ctrl = CameraController::new();
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        viewport.zoom = 5.0;
+
+        let lat_before = viewport.center.lat;
+        let lon_before = viewport.center.lon;
+        ctrl.pan(&mut viewport, 50.0, 50.0);
+
+        // Center should have moved
+        assert!(
+            (viewport.center.lat - lat_before).abs() > 1e-6
+                || (viewport.center.lon - lon_before).abs() > 1e-6,
+            "Pan should move the center"
+        );
+    }
+
+    #[test]
+    fn test_pan_wraps_antimeridian() {
+        let ctrl = CameraController::new();
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 179.0);
+        viewport.zoom = 5.0;
+
+        // Pan right to cross antimeridian
+        ctrl.pan(&mut viewport, -500.0, 0.0);
+
+        // Longitude should wrap (stay in valid range)
+        assert!(
+            viewport.center.lon >= -180.0 && viewport.center.lon <= 180.0,
+            "Longitude should wrap: got {}",
+            viewport.center.lon
+        );
+    }
+
+    #[test]
+    fn test_pan_y_clamped() {
+        let ctrl = CameraController::new();
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(85.0, 0.0);
+        viewport.zoom = 3.0;
+
+        // Pan way up past the Mercator limit
+        ctrl.pan(&mut viewport, 0.0, -5000.0);
+
+        // Latitude should be clamped (not go above ~85.05)
+        assert!(
+            viewport.center.lat <= 85.1,
+            "Latitude should be clamped, got {}",
+            viewport.center.lat
+        );
+    }
+
+    #[test]
+    fn test_set_pitch_clamped() {
+        let ctrl = CameraController::new();
+        let mut viewport = Viewport::new(800, 600);
+
+        ctrl.set_pitch(&mut viewport, 90.0);
+        assert!((viewport.pitch - 60.0).abs() < 1e-9, "pitch clamped to 60");
+
+        ctrl.set_pitch(&mut viewport, -10.0);
+        assert!((viewport.pitch - 0.0).abs() < 1e-9, "pitch clamped to 0");
+
+        ctrl.set_pitch(&mut viewport, 30.0);
+        assert!((viewport.pitch - 30.0).abs() < 1e-9, "pitch set to 30");
+    }
+
+    #[test]
+    fn test_zoom_at_center_stable() {
+        let ctrl = CameraController::new();
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(37.5, 127.0);
+        viewport.zoom = 5.0;
+
+        let lat_before = viewport.center.lat;
+        let lon_before = viewport.center.lon;
+
+        // Zoom at exact screen center
+        ctrl.zoom_at(&mut viewport, 2.0, 400.0, 300.0);
+
+        assert!(
+            (viewport.center.lat - lat_before).abs() < 0.01,
+            "Zoom at center should not shift lat: {} → {}",
+            lat_before, viewport.center.lat
+        );
+        assert!(
+            (viewport.center.lon - lon_before).abs() < 0.01,
+            "Zoom at center should not shift lon: {} → {}",
+            lon_before, viewport.center.lon
+        );
+    }
+
+    #[test]
+    fn test_zoom_at_offset_shifts_center() {
+        let ctrl = CameraController::new();
+        let mut viewport = Viewport::new(800, 600);
+        viewport.center = GeoCoord::new(0.0, 0.0);
+        viewport.zoom = 3.0;
+
+        // Zoom in at the right edge of the screen
+        ctrl.zoom_at(&mut viewport, 3.0, 750.0, 300.0);
+
+        // Center should shift east (negative longitude in Mercator convention)
+        // The exact direction depends on implementation, but center should have moved
+        assert!(
+            (viewport.center.lon).abs() > 0.01,
+            "Zoom at offset should shift center, got lon={}",
+            viewport.center.lon
+        );
+    }
+
+    #[test]
+    fn test_tile_zoom() {
+        let mut viewport = Viewport::new(800, 600);
+        viewport.zoom = 5.4;
+        assert_eq!(viewport.tile_zoom(), 5);
+
+        viewport.zoom = 5.6;
+        assert_eq!(viewport.tile_zoom(), 6);
+
+        viewport.zoom = 0.0;
+        assert_eq!(viewport.tile_zoom(), 0);
+
+        viewport.zoom = 25.0; // beyond max
+        assert_eq!(viewport.tile_zoom(), 22);
+    }
+
+    #[test]
+    fn test_pan_for_mode_delegates() {
+        let ctrl = CameraController::new();
+
+        // Mercator mode should use standard pan
+        let mut vp = Viewport::new(800, 600);
+        vp.center = GeoCoord::new(0.0, 0.0);
+        vp.zoom = 5.0;
+        let before = vp.center;
+        ctrl.pan_for_mode(&mut vp, 50.0, 0.0, x_planets_math::ProjectionMode::Mercator);
+        assert!(
+            (vp.center.lon - before.lon).abs() > 1e-6,
+            "pan_for_mode Mercator should pan"
+        );
+
+        // Globe mode should also pan
+        let mut vp = Viewport::new(800, 600);
+        vp.center = GeoCoord::new(0.0, 0.0);
+        vp.zoom = 5.0;
+        let before = vp.center;
+        ctrl.pan_for_mode(&mut vp, 50.0, 0.0, x_planets_math::ProjectionMode::Globe);
+        assert!(
+            (vp.center.lon - before.lon).abs() > 1e-6,
+            "pan_for_mode Globe should pan"
+        );
+    }
 }

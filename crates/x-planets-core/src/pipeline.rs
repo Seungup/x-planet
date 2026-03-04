@@ -3475,4 +3475,157 @@ mod tests {
             "threshold must stay below singularity (90°)"
         );
     }
+
+    // ── Globe tile mesh tests ─────────────────────────────
+
+    #[test]
+    fn test_build_globe_tile_mesh_produces_geometry() {
+        let tiles = vec![RenderableTile {
+            coord: TileCoord::new(2, 1, 1),
+            texture_coord: TileCoord::new(2, 1, 1),
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x: 1,
+        }];
+        let (verts, idxs, counts) = build_globe_tile_mesh(&tiles);
+
+        assert!(!verts.is_empty(), "Globe mesh should have vertices");
+        assert!(!idxs.is_empty(), "Globe mesh should have indices");
+        assert_eq!(counts.len(), 1, "Should have 1 tile count");
+        assert_eq!(counts[0] as usize, idxs.len());
+    }
+
+    #[test]
+    fn test_build_globe_tile_mesh_vertices_reasonable_size() {
+        // At higher zoom, RTE offsets are smaller since tiles cover less area.
+        let tiles = vec![RenderableTile {
+            coord: TileCoord::new(4, 8, 5),
+            texture_coord: TileCoord::new(4, 8, 5),
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x: 8,
+        }];
+        let (verts, _, _) = build_globe_tile_mesh(&tiles);
+
+        // At zoom 4, each tile covers ~22.5° of longitude, so RTE offsets
+        // should be well under 0.5 (on a unit sphere).
+        for v in &verts {
+            let pos_len = (v.position[0].powi(2) + v.position[1].powi(2) + v.position[2].powi(2)).sqrt();
+            assert!(
+                pos_len < 0.5,
+                "RTE vertex at zoom 4 should be small, got length {}",
+                pos_len
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_polar_caps_has_geometry() {
+        let (verts, idxs) = build_polar_caps();
+        assert!(!verts.is_empty(), "Polar caps should have vertices");
+        assert!(!idxs.is_empty(), "Polar caps should have indices");
+        // Should have both north and south caps
+        assert!(idxs.len() > 10, "Should have significant index data for two caps");
+    }
+
+    #[test]
+    fn test_tile_uniforms_for_globe_valid_mvp() {
+        let rt = RenderableTile {
+            coord: TileCoord::new(2, 1, 1),
+            texture_coord: TileCoord::new(2, 1, 1),
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x: 1,
+        };
+        let vp = glam::DMat4::IDENTITY;
+        let uniforms = tile_uniforms_for_globe(&rt, 1.0, &vp);
+
+        // MVP should not contain NaN
+        for v in &uniforms.mvp {
+            assert!(!v.is_nan(), "Globe MVP should not contain NaN");
+        }
+        // Opacity should be in meta[1]
+        assert_eq!(uniforms.meta[1], 1.0);
+        // Zoom level in meta[0]
+        assert_eq!(uniforms.meta[0], 2.0);
+    }
+
+    // ── Centered tile mesh tests ──────────────────────────
+
+    #[test]
+    fn test_build_centered_tile_mesh_produces_geometry() {
+        let center_lat = 37.5_f64.to_radians();
+        let center_lon = 127.0_f64.to_radians();
+        let tiles = vec![RenderableTile {
+            coord: TileCoord::new(3, 4, 3),
+            texture_coord: TileCoord::new(3, 4, 3),
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x: 4,
+        }];
+        let (verts, idxs, counts) = build_centered_tile_mesh(&tiles, center_lat, center_lon);
+
+        assert!(!verts.is_empty(), "Centered mesh should have vertices");
+        assert!(!idxs.is_empty(), "Centered mesh should have indices");
+        assert_eq!(counts.len(), 1);
+    }
+
+    #[test]
+    fn test_tile_uniforms_for_centered_valid() {
+        let rt = RenderableTile {
+            coord: TileCoord::new(3, 4, 3),
+            texture_coord: TileCoord::new(3, 4, 3),
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x: 4,
+        };
+        let center_lat = 37.5_f64.to_radians();
+        let center_lon = 127.0_f64.to_radians();
+        let vp = glam::DMat4::IDENTITY;
+        let uniforms = tile_uniforms_for_centered(&rt, 0.8, &vp, center_lat, center_lon);
+
+        for v in &uniforms.mvp {
+            assert!(!v.is_nan(), "Centered MVP should not contain NaN");
+        }
+        assert_eq!(uniforms.meta[1], 0.8); // opacity
+    }
+
+    #[test]
+    fn test_tile_passes_angular_filter_near_center() {
+        let center_lat = 37.5_f64.to_radians();
+        let center_lon = 127.0_f64.to_radians();
+
+        // A tile near the center (Seoul area at zoom 5) should pass
+        let center_tile = TileCoord::from_geo(
+            &x_planets_math::GeoCoord::new(37.5, 127.0),
+            5,
+        );
+        let rt = RenderableTile {
+            coord: center_tile,
+            texture_coord: center_tile,
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x: center_tile.x as i64,
+        };
+        assert!(
+            tile_passes_angular_filter(&rt, center_lat, center_lon, 5.0),
+            "Tile near center should pass angular filter"
+        );
+    }
+
+    #[test]
+    fn test_tile_passes_angular_filter_far_away() {
+        let center_lat = 37.5_f64.to_radians();
+        let center_lon = 127.0_f64.to_radians();
+
+        // A tile on the opposite side of the globe (antipodal)
+        let far_tile = TileCoord::from_geo(
+            &x_planets_math::GeoCoord::new(-37.5, -53.0),
+            5,
+        );
+        let rt = RenderableTile {
+            coord: far_tile,
+            texture_coord: far_tile,
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x: far_tile.x as i64,
+        };
+        assert!(
+            !tile_passes_angular_filter(&rt, center_lat, center_lon, 5.0),
+            "Antipodal tile should NOT pass angular filter"
+        );
+    }
 }
