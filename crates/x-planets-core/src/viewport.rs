@@ -836,9 +836,12 @@ impl CameraController {
 
     /// Zoom toward a screen point in globe mode.
     ///
-    /// Applies zoom-level-dependent damping: at low zoom levels the camera
-    /// altitude halves per level, making each step visually dramatic.
-    /// Damping smooths this out so pinch-zoom on mobile feels natural.
+    /// Zoom toward a screen point in globe mode.
+    ///
+    /// No internal damping — the caller (animation system's `exp_decay`)
+    /// already provides smooth interpolation.  Adding damping here would
+    /// fight the animation, preventing the zoom level from advancing and
+    /// causing tiles to appear stuck at high zoom.
     pub fn zoom_at_globe(
         &self,
         viewport: &mut Viewport,
@@ -846,16 +849,6 @@ impl CameraController {
         screen_x: f64,
         screen_y: f64,
     ) {
-        // Globe zoom damping: provide consistent visual zoom speed across
-        // all zoom levels. At low zoom (z<3), altitude halves dramatically
-        // per step. At high zoom (z>12), the camera is so close that each
-        // step causes hyper-sensitive movement. Damping smooths both extremes.
-        let z = viewport.zoom;
-        let ramp_up = 0.3 + 0.7 / (1.0 + (-1.5 * (z - 2.5)).exp());
-        let ramp_down = 1.0 / (1.0 + 0.02 * (z - 6.0).max(0.0).powi(2));
-        let damping = ramp_up * ramp_down;
-        let delta = delta * damping;
-
         // Compute angular offset of cursor from center before zoom.
         let unit_altitude = globe_unit_altitude(viewport.zoom);
         let half_angle_old = (1.0 / (unit_altitude + 1.0)).acos().to_degrees();
@@ -1413,27 +1406,22 @@ mod tests {
     // ── Globe zoom sensitivity ──────────────────────────
 
     #[test]
-    fn test_globe_zoom_damped_at_low_zoom() {
-        // At low zoom levels, globe zoom should be damped.
+    fn test_globe_zoom_applies_full_delta() {
+        // zoom_at_globe should apply the full delta without internal damping,
+        // because the caller (animation system) handles smoothing.
         let ctrl = CameraController::new();
         let mut viewport = Viewport::new(800, 600);
         viewport.center = GeoCoord::new(0.0, 0.0);
-        viewport.zoom = 1.0;
+        viewport.zoom = 5.0;
 
         let zoom_before = viewport.zoom;
         ctrl.zoom_at_globe(&mut viewport, 1.0, 400.0, 300.0);
-        let zoom_change_low = viewport.zoom - zoom_before;
-
-        // At high zoom, should be less damped
-        viewport.zoom = 10.0;
-        let zoom_before_high = viewport.zoom;
-        ctrl.zoom_at_globe(&mut viewport, 1.0, 400.0, 300.0);
-        let zoom_change_high = viewport.zoom - zoom_before_high;
+        let zoom_change = viewport.zoom - zoom_before;
 
         assert!(
-            zoom_change_low < zoom_change_high,
-            "Zoom at low level should be damped more: low_change={:.4}, high_change={:.4}",
-            zoom_change_low, zoom_change_high
+            (zoom_change - 1.0).abs() < 0.001,
+            "zoom_at_globe should apply full delta: expected 1.0, got {:.4}",
+            zoom_change
         );
     }
 
@@ -1481,40 +1469,31 @@ mod tests {
     }
 
     #[test]
-    fn test_globe_zoom_damped_at_high_zoom() {
-        // At high zoom (z=15+), zoom should be damped to prevent hyper-sensitivity.
+    fn test_globe_zoom_full_delta_at_high_zoom() {
+        // zoom_at_globe must apply the full delta even at high zoom levels
+        // so that the animation system can reach its target.
         let ctrl = CameraController::new();
 
-        // Measure effective zoom delta at medium zoom (z=8)
-        let mut vp_mid = Viewport::new(800, 600);
-        vp_mid.center = GeoCoord::new(0.0, 0.0);
-        vp_mid.zoom = 8.0;
-        let z_before = vp_mid.zoom;
-        ctrl.zoom_at_globe(&mut vp_mid, 0.3, 400.0, 300.0);
-        let dz_mid = (vp_mid.zoom - z_before).abs();
+        let mut vp = Viewport::new(800, 600);
+        vp.center = GeoCoord::new(0.0, 0.0);
+        vp.zoom = 18.0;
+        let z_before = vp.zoom;
+        ctrl.zoom_at_globe(&mut vp, 0.3, 400.0, 300.0);
+        let dz = (vp.zoom - z_before).abs();
 
-        // Measure effective zoom delta at high zoom (z=18)
-        let mut vp_high = Viewport::new(800, 600);
-        vp_high.center = GeoCoord::new(0.0, 0.0);
-        vp_high.zoom = 18.0;
-        let z_before = vp_high.zoom;
-        ctrl.zoom_at_globe(&mut vp_high, 0.3, 400.0, 300.0);
-        let dz_high = (vp_high.zoom - z_before).abs();
-
-        // High zoom delta should be strictly less than mid zoom delta (damping kicks in)
         assert!(
-            dz_high < dz_mid,
-            "Zoom at z=18 ({:.4}) should be more damped than at z=8 ({:.4})",
-            dz_high, dz_mid
+            (dz - 0.3).abs() < 0.001,
+            "zoom_at_globe at high zoom should apply full delta: expected 0.3, got {:.4}",
+            dz
         );
     }
 
     #[test]
-    fn test_globe_zoom_damping_smooth_no_discontinuity() {
-        // Damping should change smoothly across all zoom levels (no abrupt jumps).
+    fn test_globe_zoom_consistent_delta_all_levels() {
+        // Without internal damping, zoom_at_globe should apply the same
+        // delta at all zoom levels (zoom change = delta, clamped at bounds).
         let ctrl = CameraController::new();
         let delta = 0.3;
-        let mut prev_dz = None;
 
         for z_int in 0..=20 {
             let z = z_int as f64;
@@ -1525,15 +1504,14 @@ mod tests {
             ctrl.zoom_at_globe(&mut vp, delta, 400.0, 300.0);
             let dz = (vp.zoom - z_before).abs();
 
-            if let Some(prev) = prev_dz {
-                let ratio: f64 = if prev > 1e-9 { dz / prev } else { 1.0 };
+            // Should be exactly delta unless clamped at max_zoom
+            if z + delta <= ctrl.max_zoom {
                 assert!(
-                    ratio < 3.0 && ratio > 0.3,
-                    "Zoom damping discontinuity at z={}: dz={:.6}, prev_dz={:.6}, ratio={:.2}",
-                    z, dz, prev, ratio
+                    (dz - delta).abs() < 0.001,
+                    "At z={}: expected dz={:.3}, got {:.6}",
+                    z, delta, dz
                 );
             }
-            prev_dz = Some(dz);
         }
     }
 
