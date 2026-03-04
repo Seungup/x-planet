@@ -2506,4 +2506,175 @@ mod tests {
             "pan_for_mode Globe should pan"
         );
     }
+
+    /// Diagnostic: verify angular filter doesn't drop too many tiles.
+    #[test]
+    fn test_centered_mercator_angular_filter_pass_rate() {
+        use x_planets_math::ProjectionMode;
+
+        let configs: Vec<(f64, f64, f64)> = vec![
+            (30.0, 10.0, 5.0),
+            (60.0, 10.0, 4.0),
+            (-80.0, -60.0, 3.0),
+            (0.0, 170.0, 5.0),
+            (45.0, -90.0, 5.0),
+        ];
+
+        for (lat, lon, zoom) in &configs {
+            let mut vp = Viewport::new(800, 600);
+            vp.center = GeoCoord::new(*lat, *lon);
+            vp.zoom = *zoom;
+
+            let tiles = vp.visible_tiles_for_mode(ProjectionMode::Mercator);
+
+            // Simulate what the renderer does
+            let center_lat_rad = lat.to_radians();
+            let center_lon_rad = lon.to_radians();
+            let renderables: Vec<_> = tiles
+                .iter()
+                .map(|vt| crate::pipeline::RenderableTile {
+                    coord: vt.coord,
+                    texture_coord: vt.coord,
+                    uv_rect: [0.0, 0.0, 1.0, 1.0],
+                    display_x: vt.display_x,
+                })
+                .collect();
+
+            let passing: Vec<_> = renderables
+                .iter()
+                .filter(|rt| {
+                    crate::pipeline::tile_passes_angular_filter(
+                        rt,
+                        center_lat_rad,
+                        center_lon_rad,
+                        *zoom,
+                    )
+                })
+                .collect();
+
+            let ratio = passing.len() as f64 / renderables.len().max(1) as f64;
+            eprintln!(
+                "  ({},{}) zoom {}: {} tiles selected, {} pass filter ({:.1}%)",
+                lat, lon, zoom,
+                renderables.len(), passing.len(), ratio * 100.0,
+            );
+            // Near antimeridian the bounding box can be very wide,
+            // selecting many tiles outside the visible area. The angular
+            // filter correctly removes those. What matters is coverage.
+        }
+    }
+
+    /// Diagnostic test: verify that tile selection + angular filter for
+    /// centered Mercator covers the FULL viewport.
+    /// Each sample point inside the viewport (in oblique Mercator space)
+    /// must have a corresponding tile in the filtered selection.
+    #[test]
+    fn test_centered_mercator_full_viewport_coverage() {
+        use x_planets_math::ProjectionMode;
+
+        let configs: Vec<(f64, f64, f64, u32, u32)> = vec![
+            // (lat, lon, zoom, width, height)
+            (30.0, 10.0, 5.0, 800, 600),
+            (60.0, 10.0, 4.0, 800, 600),
+            (-80.0, -60.0, 3.0, 800, 600),
+            (0.0, 170.0, 5.0, 800, 600),  // near antimeridian
+            (45.0, -90.0, 5.0, 1024, 768),
+        ];
+
+        for (lat, lon, zoom, w, h) in &configs {
+            let mut vp = Viewport::new(*w, *h);
+            vp.center = GeoCoord::new(*lat, *lon);
+            vp.zoom = *zoom;
+
+            let tiles = vp.visible_tiles_for_mode(ProjectionMode::Mercator);
+
+            // Apply the angular filter (same as the renderer does)
+            let center_lat_rad = lat.to_radians();
+            let center_lon_rad = lon.to_radians();
+            let filtered_tiles: Vec<_> = tiles
+                .iter()
+                .filter(|vt| {
+                    let rt = crate::pipeline::RenderableTile {
+                        coord: vt.coord,
+                        texture_coord: vt.coord,
+                        uv_rect: [0.0, 0.0, 1.0, 1.0],
+                        display_x: vt.display_x,
+                    };
+                    crate::pipeline::tile_passes_angular_filter(
+                        &rt, center_lat_rad, center_lon_rad, *zoom,
+                    )
+                })
+                .collect();
+
+            // Build a set of covered Mercator tile coordinates
+            let tile_set: std::collections::HashSet<(u8, u32, u32)> = filtered_tiles
+                .iter()
+                .map(|vt| (vt.coord.z, vt.coord.x, vt.coord.y))
+                .collect();
+
+            // Verify: sample viewport interior points, inverse-project to geo,
+            // find what tile they'd fall in at the selected zoom, and check
+            // it's in our selection.
+            let scale = 2.0_f64.powf(-zoom);
+            let aspect = *w as f64 / *h as f64;
+            let half_h = scale * 1.0; // slightly less than the 1.1 used in selection
+            let half_w = scale * aspect * 1.0;
+            let center_lat_rad = lat.to_radians();
+            let center_lon_rad = lon.to_radians();
+            let threshold_cos = 85.0_f64.to_radians().cos();
+            let center_sphere =
+                x_planets_math::geo_to_unit_sphere(center_lat_rad, center_lon_rad);
+
+            let mut missing = 0;
+            let mut total = 0;
+            let n_sample = 10;
+            for iy in 0..=n_sample {
+                for ix in 0..=n_sample {
+                    let tx = ix as f64 / n_sample as f64;
+                    let ty = iy as f64 / n_sample as f64;
+                    let mx = 0.5 - half_w + 2.0 * half_w * tx;
+                    let my = 0.5 - half_h + 2.0 * half_h * ty;
+                    let (lr, lonr) = x_planets_math::oblique_mercator_inverse(
+                        glam::DVec2::new(mx, my),
+                        center_lat_rad,
+                        center_lon_rad,
+                    );
+                    if !lr.is_finite() || !lonr.is_finite() {
+                        continue;
+                    }
+                    let pt_sphere = x_planets_math::geo_to_unit_sphere(lr, lonr);
+                    let cos_angle = center_sphere.dot(pt_sphere);
+                    if cos_angle < threshold_cos {
+                        continue; // beyond shader clip
+                    }
+                    // Find the tile this point falls in
+                    let geo = GeoCoord::new(lr.to_degrees(), lonr.to_degrees());
+                    let target_z = vp.tile_zoom();
+                    let tc = x_planets_math::TileCoord::from_geo(&geo, target_z);
+                    total += 1;
+                    // Check if this tile (or a coarser tile covering it) exists
+                    let mut found = false;
+                    let mut check = Some(tc);
+                    while let Some(c) = check {
+                        if tile_set.contains(&(c.z, c.x, c.y)) {
+                            found = true;
+                            break;
+                        }
+                        check = c.parent();
+                    }
+                    if !found {
+                        missing += 1;
+                    }
+                }
+            }
+
+            let coverage = 1.0 - missing as f64 / total.max(1) as f64;
+            assert!(
+                coverage >= 0.95,
+                "Centered Mercator coverage at ({},{}) zoom {} is {:.1}% ({} missing / {} total). \
+                 Selected {} tiles.",
+                lat, lon, zoom, coverage * 100.0, missing, total, tiles.len(),
+            );
+        }
+    }
 }

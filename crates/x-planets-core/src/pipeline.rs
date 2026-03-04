@@ -345,13 +345,31 @@ pub fn tile_passes_angular_filter(
     let cos_threshold = centered_angular_threshold_deg(zoom).to_radians().cos();
 
     let n = tile.coord.extent() as f64;
-    let mx = (tile.display_x as f64 + 0.5) / n;
-    let my = (tile.coord.y as f64 + 0.5) / n;
-    let lon_rad = (mx * 2.0 - 1.0) * std::f64::consts::PI;
-    let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
-    let tile_sphere = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
-    let cos_angle = center_sphere.dot(tile_sphere);
-    cos_angle > cos_threshold
+
+    // Check tile center AND all four corners.  At low zoom levels tiles
+    // are very large in geographic extent, so the center can be beyond
+    // the threshold even though a large portion of the tile is within it.
+    // If ANY sample point is within the threshold, keep the tile.
+    let sample_points: [(f64, f64); 5] = [
+        // center
+        ((tile.display_x as f64 + 0.5) / n, (tile.coord.y as f64 + 0.5) / n),
+        // corners
+        (tile.display_x as f64 / n, tile.coord.y as f64 / n),
+        ((tile.display_x + 1) as f64 / n, tile.coord.y as f64 / n),
+        (tile.display_x as f64 / n, (tile.coord.y + 1) as f64 / n),
+        ((tile.display_x + 1) as f64 / n, (tile.coord.y + 1) as f64 / n),
+    ];
+
+    for &(mx, my) in &sample_points {
+        let lon_rad = (mx * 2.0 - 1.0) * std::f64::consts::PI;
+        let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+        let tile_sphere = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
+        let cos_angle = center_sphere.dot(tile_sphere);
+        if cos_angle > cos_threshold {
+            return true;
+        }
+    }
+    false
 }
 
 /// Build tessellated centered-Mercator meshes for all tiles.
