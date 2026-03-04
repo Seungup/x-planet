@@ -769,11 +769,19 @@ impl Viewport {
         let target = glam::DVec3::new(cx, cy, 0.0);
 
         let view = glam::DMat4::look_at_rh(eye, target, up);
-        // Adaptive near/far: tighten the ratio at low zoom to preserve
-        // depth-buffer precision and prevent jitter.  At zoom 0 cam_h ≈ 1.73;
-        // the old 0.005/10.0 gave a 2000:1 ratio which caused heavy shaking.
+        // Adaptive near/far: tighten the ratio to preserve depth-buffer
+        // precision, but extend far plane for pitched views.
+        let pitch_rad = self.pitch.to_radians();
+        let far_mult = if pitch_rad > 0.01 {
+            // At high pitch, distant tiles are much farther than cam_h.
+            // tan(pitch) gives the horizontal reach; camera→ground distance
+            // is sqrt(cam_h² + reach²).  Use a generous multiplier.
+            4.0 + 8.0 * pitch_rad.sin()
+        } else {
+            4.0
+        };
         let near = cam_h * 0.1;
-        let far = cam_h * 4.0;
+        let far = cam_h * far_mult;
         let proj = glam::DMat4::perspective_rh(fov_y, aspect, near, far);
 
         let flip_x = glam::DMat4::from_diagonal(glam::DVec4::new(-1.0, 1.0, 1.0, 1.0));
@@ -874,8 +882,13 @@ impl Viewport {
         let target = glam::Vec3::new(cx, cy, 0.0);
 
         let view = glam::Mat4::look_at_rh(eye, target, up);
+        let far_mult = if pitch_rad > 0.01 {
+            4.0 + 8.0 * pitch_rad.sin()
+        } else {
+            4.0
+        };
         let near = cam_h * 0.1;
-        let far = cam_h * 4.0;
+        let far = cam_h * far_mult;
         let proj = glam::Mat4::perspective_rh(fov_y, aspect, near, far);
 
         // look_at_rh with up=(sin_b,-cos_b,0) makes camera_right = world(-cos_b,-sin_b,0),
