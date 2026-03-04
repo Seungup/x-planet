@@ -215,6 +215,12 @@ impl MapEngine {
         self.needs_redraw = true;
     }
 
+    /// Zoom with projection-aware minimum zoom clamp.
+    pub fn zoom_for_mode(&mut self, delta: f64, mode: x_planets_math::ProjectionMode) {
+        self.camera.zoom_for_mode(&mut self.viewport, delta, mode);
+        self.needs_redraw = true;
+    }
+
     /// Zoom toward a specific screen point (zoom-to-pointer).
     pub fn zoom_at(&mut self, delta: f64, screen_x: f64, screen_y: f64) {
         self.camera.zoom_at(&mut self.viewport, delta, screen_x, screen_y);
