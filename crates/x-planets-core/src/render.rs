@@ -308,7 +308,18 @@ pub fn tile_centered_mesh(
 
             // Standard Mercator → lat/lon
             let lon_rad = (mx * 2.0 - 1.0) * PI;
-            let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+            let mut lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+
+            // Stretch edge tiles toward the poles to fill the ±85°–±90° gap.
+            // Only the outermost vertex row of the first/last tile row is moved.
+            const POLAR_STRETCH_LAT: f64 = 89.0 * (PI / 180.0);
+            let n_tiles = coord.extent();
+            if coord.y == 0 && j == 0 {
+                lat_rad = POLAR_STRETCH_LAT;
+            }
+            if coord.y == n_tiles - 1 && j == subdiv {
+                lat_rad = -POLAR_STRETCH_LAT;
+            }
 
             // Oblique (centered) Mercator
             let centered = x_planets_math::oblique_mercator(
