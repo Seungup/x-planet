@@ -327,12 +327,13 @@ pub fn tile_globe_mesh(
                 tex_coord: vb.tex_coord,
             });
 
-            // Double-sided quad (both windings for back-face culling safety)
+            // Single-sided quad (CCW winding from outside the sphere).
+            // The globe pipeline's back-face culling (FrontFace::Ccw,
+            // cull_mode: Back) correctly discards skirts on the far
+            // hemisphere.  Double-sided skirts would leak through.
             indices.extend_from_slice(&[
                 top_a, skirt_a, top_b,
                 top_b, skirt_a, skirt_b,
-                top_a, top_b, skirt_a,
-                top_b, skirt_b, skirt_a,
             ]);
         }
     }
