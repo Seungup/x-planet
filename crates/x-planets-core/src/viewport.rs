@@ -327,7 +327,7 @@ impl Viewport {
         if base_z == 0 {
             return frustum.visible_tiles(0);
         }
-        self.quadtree_lod_with_frustum(base_z, &frustum)
+        self.quadtree_lod_with_frustum(base_z, &frustum, false)
     }
 
     /// Globe-mode visible tile selection.
@@ -380,11 +380,21 @@ impl Viewport {
         }
 
         // Use the quadtree LOD algorithm with globe-derived zoom.
-        self.quadtree_lod_with_frustum(globe_zoom, &frustum)
+        self.quadtree_lod_with_frustum(globe_zoom, &frustum, true)
     }
 
-    /// Quadtree LOD with a custom frustum (used by globe-mode visible tiles).
-    fn quadtree_lod_with_frustum(&self, base_z: u8, frustum: &Frustum2D) -> Vec<VisibleTile> {
+    /// Quadtree LOD with a custom frustum.
+    ///
+    /// When `globe` is true, per-tile zoom is determined by angular distance
+    /// from the camera nadir on the sphere surface (tiles near the visible
+    /// edge are foreshortened and get coarser zoom).  When false the classic
+    /// pitch-based perspective LOD is used.
+    fn quadtree_lod_with_frustum(
+        &self,
+        base_z: u8,
+        frustum: &Frustum2D,
+        globe: bool,
+    ) -> Vec<VisibleTile> {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
@@ -401,10 +411,52 @@ impl Viewport {
         let sin_b = bearing_rad.sin();
         let cos_b = bearing_rad.cos();
 
-        let max_drop = ((self.pitch / 15.0).ceil() as u8).min(4);
+        // Pre-compute globe geometry for distance-based LOD on the unit
+        // sphere.  d² = 1 + (1+h)² − 2(1+h)cos(θ), nadir distance = h.
+        let globe_h = globe_unit_altitude(self.zoom);
+        let globe_r2 = 1.0 + (1.0 + globe_h).powi(2);
+        let globe_2rh = 2.0 * (1.0 + globe_h);
+        // Globe mode allows up to 3 zoom levels of LOD reduction for
+        // distant/foreshortened tiles.
+        let max_drop = if globe {
+            3_u8
+        } else {
+            ((self.pitch / 15.0).ceil() as u8).min(4)
+        };
         let min_z = base_z.saturating_sub(max_drop);
 
+        // Pre-compute center lat/lon in radians for haversine.
+        let center_lat_rad = self.center.lat.to_radians();
+        let center_lon_rad = self.center.lon.to_radians();
+        let cos_center_lat = center_lat_rad.cos();
+
         let ideal_zoom_at = |mx: f64, my: f64| -> u8 {
+            if globe {
+                // Combined distance + foreshortening LOD on the unit sphere.
+                // factor = cos(θ) × h / d, where:
+                //   θ = central angle from nadir to tile
+                //   h = camera altitude above unit sphere
+                //   d = camera-to-tile distance (law of cosines)
+                // cos(θ) captures surface foreshortening (oblique viewing),
+                // h/d captures the increased distance.  Together they give
+                // a realistic screen-space size estimate for each tile.
+                let tile_geo = mercator_to_geo(glam::DVec2::new(mx, my));
+                let dlat = tile_geo.lat.to_radians() - center_lat_rad;
+                let dlon = tile_geo.lon.to_radians() - center_lon_rad;
+                let a = (dlat * 0.5).sin().powi(2)
+                    + cos_center_lat
+                        * tile_geo.lat.to_radians().cos()
+                        * (dlon * 0.5).sin().powi(2);
+                let theta = 2.0 * a.sqrt().asin(); // central angle
+                let cos_theta = theta.cos();
+                let d = (globe_r2 - globe_2rh * cos_theta).sqrt().max(globe_h);
+                let factor = (cos_theta * globe_h / d).max(0.01);
+                let zoom_adjust = factor.log2(); // ≤ 0
+                return (base_z as f64 + zoom_adjust)
+                    .round()
+                    .clamp(min_z as f64, base_z as f64) as u8;
+            }
+
             if self.pitch < 5.0 {
                 return base_z;
             }
@@ -449,7 +501,13 @@ impl Viewport {
         let mut heap = BinaryHeap::<Candidate>::new();
         let mut result = Vec::<VisibleTile>::new();
 
-        for vt in frustum.visible_tiles(min_z) {
+        // In globe mode, start from z=0 so the quadtree can naturally
+        // build the LOD gradient: tiles near the camera get subdivided to
+        // base_z, while distant tiles stay coarse.  Starting from min_z
+        // would produce seed tiles whose centers are already far from the
+        // camera, preventing subdivision.
+        let seed_z = if globe { 0 } else { min_z };
+        for vt in frustum.visible_tiles(seed_z) {
             let tc = vt.display_mercator_center();
             let dist = (tc - center_merc).length();
             heap.push(Candidate {
@@ -463,7 +521,27 @@ impl Viewport {
             let tc = vt.display_mercator_center();
             let ideal_z = ideal_zoom_at(tc.x, tc.y);
 
-            let should_subdivide = vt.coord.z < ideal_z
+            // In globe mode, force subdivision for the tile that contains
+            // the viewport center.  Large low-zoom tiles have their centers
+            // far from the viewport center on the sphere, so `ideal_z`
+            // alone would prevent them from subdividing.  Only the single
+            // tile containing the camera nadir is forced; its siblings use
+            // the normal distance-based ideal_z.
+            let contains_center = if globe {
+                let n = (1u32 << vt.coord.z) as f64;
+                let tile_min_x = vt.coord.x as f64 / n;
+                let tile_max_x = (vt.coord.x + 1) as f64 / n;
+                let tile_min_y = vt.coord.y as f64 / n;
+                let tile_max_y = (vt.coord.y + 1) as f64 / n;
+                tile_min_x <= center_merc.x
+                    && center_merc.x < tile_max_x
+                    && tile_min_y <= center_merc.y
+                    && center_merc.y < tile_max_y
+            } else {
+                false
+            };
+
+            let should_subdivide = (vt.coord.z < ideal_z || contains_center)
                 && vt.coord.z < base_z
                 && (result.len() + heap.len() + 4) <= TILE_BUDGET;
 
@@ -503,7 +581,7 @@ impl Viewport {
     /// Quadtree-based LOD tile selection (gap-free, priority-ordered, budgeted).
     fn quadtree_lod(&self, base_z: u8) -> Vec<VisibleTile> {
         let frustum = self.frustum();
-        self.quadtree_lod_with_frustum(base_z, &frustum)
+        self.quadtree_lod_with_frustum(base_z, &frustum, false)
     }
 
     /// Compute the view-projection matrix in f64 for high-precision per-tile MVP.
@@ -1617,6 +1695,29 @@ mod tests {
             assert!(
                 pair[0].coord.z <= pair[1].coord.z,
                 "Globe tiles not sorted coarse-first"
+            );
+        }
+    }
+
+    #[test]
+    fn test_globe_lod_varies_by_distance() {
+        // In globe mode, tiles near the visible edge should use coarser
+        // zoom levels than tiles near the center (angular-distance LOD).
+        // At low zoom (large visible cap), the effect is most pronounced.
+        for zoom in [1.0, 2.0, 3.0] {
+            let mut viewport = Viewport::new(800, 600);
+            viewport.center = GeoCoord::new(0.0, 0.0);
+            viewport.zoom = zoom;
+
+            let tiles =
+                viewport.visible_tiles_for_mode(x_planets_math::ProjectionMode::Globe);
+
+            let zoom_levels: std::collections::HashSet<u8> =
+                tiles.iter().map(|t| t.coord.z).collect();
+            assert!(
+                zoom_levels.len() > 1,
+                "Globe mode at zoom={zoom} should produce multiple zoom levels (got {:?})",
+                zoom_levels,
             );
         }
     }
