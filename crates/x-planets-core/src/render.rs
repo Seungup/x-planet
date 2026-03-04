@@ -214,6 +214,10 @@ pub fn globe_subdivisions(zoom: u8) -> u32 {
 ///
 /// Each vertex is computed on the unit sphere surface, then offset relative
 /// to `tile_center_3d` (computed in f64 for precision).
+///
+/// Includes **skirts** along all four edges: extra vertices pushed slightly
+/// toward the sphere center.  This hides T-junction cracks that appear when
+/// adjacent tiles use different tessellation densities (mixed zoom LOD).
 pub fn tile_globe_mesh(
     coord: &x_planets_math::TileCoord,
     tile_center_3d: glam::DVec3,
@@ -223,8 +227,19 @@ pub fn tile_globe_mesh(
     let subdiv = globe_subdivisions(coord.z);
     let seg = subdiv + 1; // vertices per axis
     let n = coord.extent() as f64;
-    let mut vertices = Vec::with_capacity((seg * seg) as usize);
-    let mut indices = Vec::with_capacity((subdiv * subdiv * 6) as usize);
+
+    // Skirt depth: push vertices inward (toward sphere center) by a small
+    // fraction of the tile's angular extent.  0.2% of the unit sphere
+    // radius is enough to cover tessellation mismatches without being
+    // visible.
+    let skirt_depth: f64 = 0.002;
+
+    let surface_verts = (seg * seg) as usize;
+    let skirt_edge_verts = 4 * seg as usize; // one skirt vertex per edge vertex
+    let surface_indices = (subdiv * subdiv * 6) as usize;
+    let skirt_indices = 4 * subdiv as usize * 6;
+    let mut vertices = Vec::with_capacity(surface_verts + skirt_edge_verts);
+    let mut indices = Vec::with_capacity(surface_indices + skirt_indices);
 
     for j in 0..=subdiv {
         for i in 0..=subdiv {
@@ -259,6 +274,66 @@ pub fn tile_globe_mesh(
             let bl = (j + 1) * seg + i;
             let br = (j + 1) * seg + i + 1;
             indices.extend_from_slice(&[tl, bl, tr, tr, bl, br]);
+        }
+    }
+
+    // ── Skirt geometry ──
+    // For each of the 4 tile edges, duplicate the edge vertices pushed
+    // inward (toward the sphere center) and connect them with quads.
+    // This fills T-junction cracks between adjacent tiles at different
+    // tessellation densities.
+    //
+    // Each skirt quad is double-sided (both CW and CCW windings) so it
+    // is visible regardless of which side the camera sees through the
+    // crack.  The GPU discards the back-facing copy via culling.
+
+    // Edge strips: top (j=0), bottom (j=subdiv), left (i=0), right (i=subdiv).
+    let edge_strips: [Vec<u32>; 4] = [
+        (0..seg).collect(),
+        (0..seg).map(|i| subdiv * seg + i).collect(),
+        (0..seg).map(|j| j * seg).collect(),
+        (0..seg).map(|j| j * seg + subdiv).collect(),
+    ];
+
+    for strip in &edge_strips {
+        for k in 0..strip.len() - 1 {
+            let top_a = strip[k];
+            let top_b = strip[k + 1];
+
+            // Skirt vertex: same tex_coord, position pushed toward sphere center.
+            // The RTE position + tile_center ≈ unit vector on the sphere.
+            // Scaling by (1 − skirt_depth) pushes the vertex inward.
+            let skirt_a = vertices.len() as u32;
+            let va = &vertices[top_a as usize];
+            let pa = va.position;
+            vertices.push(GlobeTileVertex {
+                position: [
+                    pa[0] - (pa[0] as f64 * skirt_depth) as f32,
+                    pa[1] - (pa[1] as f64 * skirt_depth) as f32,
+                    pa[2] - (pa[2] as f64 * skirt_depth) as f32,
+                ],
+                tex_coord: va.tex_coord,
+            });
+
+            let skirt_b = vertices.len() as u32;
+            let vb = &vertices[top_b as usize];
+            let pb = vb.position;
+            vertices.push(GlobeTileVertex {
+                position: [
+                    pb[0] - (pb[0] as f64 * skirt_depth) as f32,
+                    pb[1] - (pb[1] as f64 * skirt_depth) as f32,
+                    pb[2] - (pb[2] as f64 * skirt_depth) as f32,
+                ],
+                tex_coord: vb.tex_coord,
+            });
+
+            // Double-sided quad (both windings for back-face culling safety)
+            indices.extend_from_slice(&[
+                top_a, skirt_a, top_b,
+                top_b, skirt_a, skirt_b,
+                top_a, top_b, skirt_a,
+                top_b, skirt_b, skirt_a,
+            ]);
         }
     }
 
@@ -620,7 +695,13 @@ mod tests {
         );
         let (verts, _idxs) = tile_globe_mesh(&coord, center);
 
-        for (i, v) in verts.iter().enumerate() {
+        // Only check surface vertices (skirt vertices are intentionally
+        // below the sphere surface).
+        let subdiv = globe_subdivisions(coord.z);
+        let seg = subdiv + 1;
+        let surface_count = (seg * seg) as usize;
+
+        for (i, v) in verts[..surface_count].iter().enumerate() {
             let p = glam::DVec3::new(
                 v.position[0] as f64 + center.x,
                 v.position[1] as f64 + center.y,
@@ -652,7 +733,13 @@ mod tests {
                     );
                     let (verts, idxs) = tile_globe_mesh(&coord, center);
 
-                    for tri in idxs.chunks(3) {
+                    // Only check surface triangles; skirt triangles
+                    // intentionally face inward (they're curtains below
+                    // the sphere surface to hide seam cracks).
+                    let subdiv = globe_subdivisions(z);
+                    let surface_idx_count = (subdiv * subdiv * 6) as usize;
+
+                    for tri in idxs[..surface_idx_count].chunks(3) {
                         let v0 = glam::Vec3::from(verts[tri[0] as usize].position);
                         let v1 = glam::Vec3::from(verts[tri[1] as usize].position);
                         let v2 = glam::Vec3::from(verts[tri[2] as usize].position);
