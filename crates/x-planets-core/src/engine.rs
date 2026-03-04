@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn test_engine_set_projection() {
         let mut engine = MapEngine::new(MapConfig::default(), 800, 600);
-        assert!(engine.set_projection("Equirectangular"));
+        assert!(engine.set_projection("Globe"));
         assert!(!engine.set_projection("NonExistent"));
     }
 
@@ -406,11 +406,11 @@ mod tests {
             x_planets_math::ProjectionMode::Mercator,
         );
 
-        // Switch to Equirectangular → Equirectangular rendering mode (flat map).
-        engine.set_projection("Equirectangular");
+        // Switch to Globe → Globe rendering mode (like Google Earth).
+        engine.set_projection("Globe");
         assert_eq!(
             engine.rendering_mode(),
-            x_planets_math::ProjectionMode::Equirectangular,
+            x_planets_math::ProjectionMode::Globe,
         );
 
         // Switch back → Mercator.

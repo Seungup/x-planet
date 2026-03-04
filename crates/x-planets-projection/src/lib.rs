@@ -99,5 +99,5 @@ pub fn compose_shaders(base: &str, transforms: &[&str]) -> String {
     source
 }
 
-pub use builtins::{Equirectangular, Mercator};
+pub use builtins::{Globe, Mercator};
 pub use registry::ProjectionRegistry;
