@@ -324,12 +324,15 @@ impl WebApp {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mode = self.resolve_projection_mode();
-        self.renderer
-            .render_frame_layered_projected(&self.gpu, &view, &self.engine.viewport, &layers, mode);
-
-        // ── Terrain rendering (when enabled) ──
         if self.terrain_enabled {
+            // Terrain mode: clear the background, then render 3D displaced mesh.
+            // TerrainRenderer uses LoadOp::Load, so we must clear first.
+            clear_surface(&self.gpu, &view);
             self.render_terrain(&view, &visible);
+        } else {
+            // Flat mode: render raster tiles as 2D quads.
+            self.renderer
+                .render_frame_layered_projected(&self.gpu, &view, &self.engine.viewport, &layers, mode);
         }
 
         frame.present();
@@ -615,6 +618,34 @@ impl WebApp {
 // ═══════════════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════════════
+
+/// Clear the surface to the background color (same as TileRenderer's clear).
+fn clear_surface(gpu: &GpuContext, target: &wgpu::TextureView) {
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    {
+        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("clear-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.08,
+                        g: 0.12,
+                        b: 0.18,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+    }
+    gpu.queue.submit(std::iter::once(encoder.finish()));
+}
 
 fn tile_url(template: &str, coord: &TileCoord) -> String {
     template
