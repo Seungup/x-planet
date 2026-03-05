@@ -8,6 +8,7 @@
 
 pub mod engine;
 pub mod interaction;
+pub mod map_controller;
 pub mod model3d_renderer;
 pub mod pipeline;
 pub mod render;
@@ -18,6 +19,7 @@ pub mod verify_chain;
 pub mod viewport;
 
 pub use engine::{LayerConfig, LayerKind, MapEngine, TileLayer};
+pub use map_controller::{LayerStateView, MapController, RenderOutput};
 pub use model3d_renderer::{GpuModel3d, Model3dRenderer, Model3dVertex, ModelUniforms};
 pub use pipeline::FrameSummary;
 pub use render::RenderLayerData;

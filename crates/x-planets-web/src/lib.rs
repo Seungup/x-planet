@@ -59,9 +59,9 @@ mod web_impl {
 
         log::info!("GPU: {}", gpu.adapter_info().name);
 
-        // ── MapEngine (default config = OSM base layer) ──
+        // ── MapController (default config = OSM base layer) ──
         let config = x_planets_core::engine::MapConfig::default();
-        let engine = x_planets_core::MapEngine::new(config, width, height);
+        let controller = x_planets_core::MapController::new(config, width, height);
 
         // ── TileRenderer ──
         let renderer = x_planets_core::TileRenderer::new(&gpu);
@@ -73,7 +73,7 @@ mod web_impl {
         let tex_manager = x_planets_gpu::TextureManager::new(&gpu.device);
 
         // ── WebApp ──
-        let app = WebApp::new(gpu, engine, renderer, terrain_renderer, tex_manager, canvas.clone(), dpr);
+        let app = WebApp::new(gpu, controller, renderer, terrain_renderer, tex_manager, canvas.clone(), dpr);
         let app = std::rc::Rc::new(std::cell::RefCell::new(app));
 
         // ── Input events ──
@@ -88,8 +88,168 @@ mod web_impl {
         // ── Start render loop ──
         WebApp::start_render_loop(std::rc::Rc::clone(&app));
 
+        // ── Expose JS API as window.xplanets ──
+        let xplanets = XPlanetsMap {
+            app: std::rc::Rc::clone(&app),
+        };
+        js_sys::Reflect::set(
+            &window,
+            &JsValue::from_str("xplanets"),
+            &xplanets.into(),
+        )?;
+
         log::info!("x-planets web started!");
         Ok(())
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // XPlanetsMap — JavaScript API exposed via wasm-bindgen
+    // ═══════════════════════════════════════════════════════════════
+
+    /// JavaScript API for controlling the x-planets map.
+    ///
+    /// Exposed as `window.xplanets` after initialization.
+    ///
+    /// ```javascript
+    /// const map = window.xplanets;
+    /// map.toggleTerrain();                  // terrain ON/OFF
+    /// map.setTerrainExaggeration(2.0);      // height exaggeration
+    /// map.setCenter(37.5665, 126.9780);     // move to Seoul
+    /// map.zoomTo(12);                       // zoom level
+    /// map.setProjection("Equirectangular"); // projection mode
+    /// map.setLayerOpacity("base", 0.5);     // layer transparency
+    /// ```
+    #[wasm_bindgen]
+    pub struct XPlanetsMap {
+        app: std::rc::Rc<std::cell::RefCell<WebApp>>,
+    }
+
+    #[wasm_bindgen]
+    impl XPlanetsMap {
+        // ── Map Control ──
+
+        /// Pan the map by pixel delta (dx, dy).
+        #[wasm_bindgen(js_name = "panBy")]
+        pub fn pan_by(&self, dx: f64, dy: f64) {
+            self.app.borrow_mut().controller.pan(dx, dy);
+        }
+
+        /// Set the zoom level directly.
+        #[wasm_bindgen(js_name = "zoomTo")]
+        pub fn zoom_to(&self, zoom: f64) {
+            self.app.borrow_mut().controller.set_zoom(zoom);
+        }
+
+        /// Set the map center to (lat, lon) in degrees.
+        #[wasm_bindgen(js_name = "setCenter")]
+        pub fn set_center(&self, lat: f64, lon: f64) {
+            self.app.borrow_mut().controller.set_center(lat, lon);
+        }
+
+        /// Get the current map center as [lat, lon].
+        #[wasm_bindgen(js_name = "getCenter")]
+        pub fn get_center(&self) -> Vec<f64> {
+            let (lat, lon) = self.app.borrow().controller.center();
+            vec![lat, lon]
+        }
+
+        /// Get the current zoom level.
+        #[wasm_bindgen(js_name = "getZoom")]
+        pub fn get_zoom(&self) -> f64 {
+            self.app.borrow().controller.zoom_level()
+        }
+
+        /// Get the current bearing (rotation) in degrees.
+        #[wasm_bindgen(js_name = "getBearing")]
+        pub fn get_bearing(&self) -> f64 {
+            self.app.borrow().controller.bearing()
+        }
+
+        /// Get the current pitch angle in degrees.
+        #[wasm_bindgen(js_name = "getPitch")]
+        pub fn get_pitch(&self) -> f64 {
+            self.app.borrow().controller.pitch_angle()
+        }
+
+        // ── Projection ──
+
+        /// Set the projection by name (e.g. "Web Mercator", "Globe", "Equirectangular").
+        /// Returns true if the projection was found.
+        #[wasm_bindgen(js_name = "setProjection")]
+        pub fn set_projection(&self, name: &str) -> bool {
+            self.app.borrow_mut().controller.set_projection(name)
+        }
+
+        /// Cycle to the next available projection. Returns the new projection name.
+        #[wasm_bindgen(js_name = "cycleProjection")]
+        pub fn cycle_projection(&self) -> String {
+            self.app.borrow_mut().cycle_projection()
+        }
+
+        /// Get the current projection name.
+        #[wasm_bindgen(js_name = "getProjection")]
+        pub fn get_projection(&self) -> String {
+            self.app.borrow().controller.projection_name().to_string()
+        }
+
+        // ── Terrain ──
+
+        /// Toggle terrain on/off. Returns the new state (true = terrain ON).
+        #[wasm_bindgen(js_name = "toggleTerrain")]
+        pub fn toggle_terrain(&self) -> bool {
+            self.app.borrow_mut().toggle_terrain()
+        }
+
+        /// Whether terrain is currently enabled.
+        #[wasm_bindgen(js_name = "terrainEnabled")]
+        pub fn terrain_enabled(&self) -> bool {
+            self.app.borrow().controller.terrain_enabled()
+        }
+
+        /// Set terrain height exaggeration factor.
+        #[wasm_bindgen(js_name = "setTerrainExaggeration")]
+        pub fn set_terrain_exaggeration(&self, value: f64) {
+            self.app.borrow_mut().terrain_renderer.exaggeration = value;
+        }
+
+        /// Get terrain height exaggeration factor.
+        #[wasm_bindgen(js_name = "getTerrainExaggeration")]
+        pub fn get_terrain_exaggeration(&self) -> f64 {
+            self.app.borrow().terrain_renderer.exaggeration
+        }
+
+        // ── Layer Management ──
+
+        /// Set layer visibility. Returns true if the layer was found.
+        #[wasm_bindgen(js_name = "setLayerVisible")]
+        pub fn set_layer_visible(&self, name: &str, visible: bool) -> bool {
+            self.app.borrow_mut().controller.set_layer_visible(name, visible)
+        }
+
+        /// Set layer opacity (0.0–1.0). Returns true if the layer was found.
+        #[wasm_bindgen(js_name = "setLayerOpacity")]
+        pub fn set_layer_opacity(&self, name: &str, opacity: f32) -> bool {
+            self.app.borrow_mut().controller.set_layer_opacity(name, opacity)
+        }
+
+        /// Remove a layer by name. Returns true if the layer was found.
+        #[wasm_bindgen(js_name = "removeLayer")]
+        pub fn remove_layer(&self, name: &str) -> bool {
+            self.app.borrow_mut().controller.remove_layer(name)
+        }
+
+        /// Get the number of layers.
+        #[wasm_bindgen(js_name = "layerCount")]
+        pub fn layer_count(&self) -> usize {
+            self.app.borrow().controller.layer_count()
+        }
+
+        // ── Viewport ──
+
+        /// Resize the map viewport.
+        pub fn resize(&self, width: u32, height: u32) {
+            self.app.borrow_mut().controller.resize(width, height);
+        }
     }
 }
 
