@@ -199,31 +199,30 @@ fn register_mouse_events(
             // Track mouse position for zoom anchor fallback (physical pixels)
             app.controller.anim.last_mouse_pos = Some((x * dpr, y * dpr));
 
-            // Left-drag: pan (scale delta to physical pixels)
+            // Left-drag: pan (projection-aware via MapController::pan)
             if ms.left_pressed {
                 if let Some((lx, ly)) = ms.left {
                     let dx = (x - lx) * dpr;
                     let dy = (y - ly) * dpr;
-                    let mode = app.resolve_projection_mode();
-                    app.controller.engine.pan_for_mode(dx, -dy, mode);
+                    app.controller.pan(dx, -dy);
                 }
                 app.controller.anim.record_drag((x * dpr, y * dpr), now_secs());
                 ms.left = Some((x, y));
             }
 
-            // Right-drag: pitch + rotate
+            // Right-drag: pitch + rotate (via MapController)
             if let Some((lx, ly)) = ms.right {
                 let dx = x - lx;
                 let dy = y - ly;
-                app.controller.engine.pitch(-dy * PITCH_SENSITIVITY);
-                app.controller.engine.rotate(dx * ROTATE_SENSITIVITY);
+                app.controller.pitch(-dy * PITCH_SENSITIVITY);
+                app.controller.rotate(dx * ROTATE_SENSITIVITY);
                 ms.right = Some((x, y));
             }
 
-            // Middle-drag: rotate
+            // Middle-drag: rotate (via MapController)
             if let Some(last_x) = ms.middle_x {
                 let dx = x - last_x;
-                app.controller.engine.rotate(dx * ROTATE_SENSITIVITY);
+                app.controller.rotate(dx * ROTATE_SENSITIVITY);
                 ms.middle_x = Some(x);
             }
         });
@@ -291,12 +290,12 @@ fn register_keyboard_events(app: Rc<RefCell<WebApp>>) {
         let key = e.code();
         let mut app = app.borrow_mut();
 
-        let mode = app.resolve_projection_mode();
         match key.as_str() {
-            "ArrowLeft" => app.controller.engine.pan_for_mode(-PAN_AMOUNT, 0.0, mode),
-            "ArrowRight" => app.controller.engine.pan_for_mode(PAN_AMOUNT, 0.0, mode),
-            "ArrowUp" => app.controller.engine.pan_for_mode(0.0, -PAN_AMOUNT, mode),
-            "ArrowDown" => app.controller.engine.pan_for_mode(0.0, PAN_AMOUNT, mode),
+            // Pan (projection-aware via MapController::pan)
+            "ArrowLeft" => app.controller.pan(-PAN_AMOUNT, 0.0),
+            "ArrowRight" => app.controller.pan(PAN_AMOUNT, 0.0),
+            "ArrowUp" => app.controller.pan(0.0, -PAN_AMOUNT),
+            "ArrowDown" => app.controller.pan(0.0, PAN_AMOUNT),
             "Equal" | "NumpadAdd" => {
                 app.controller.anim.zoom_target += ZOOM_STEP;
                 app.controller.anim.zoom_anchor = None;
@@ -305,8 +304,8 @@ fn register_keyboard_events(app: Rc<RefCell<WebApp>>) {
                 app.controller.anim.zoom_target -= ZOOM_STEP;
                 app.controller.anim.zoom_anchor = None;
             }
-            "KeyQ" => app.controller.engine.rotate(-KEYBOARD_ROTATE),
-            "KeyE" => app.controller.engine.rotate(KEYBOARD_ROTATE),
+            "KeyQ" => app.controller.rotate(-KEYBOARD_ROTATE),
+            "KeyE" => app.controller.rotate(KEYBOARD_ROTATE),
             "KeyP" => {
                 let name = app.cycle_projection();
                 update_projection_button(&name);
@@ -413,10 +412,9 @@ fn register_touch_events(
             let mut ts = ts.borrow_mut();
             if let Some(action) = ts.process_moves(&changes, dpr, now) {
                 let mut app = app.borrow_mut();
-                let mode = app.resolve_projection_mode();
                 match action {
                     GestureAction::Pan { dx, dy } => {
-                        app.controller.engine.pan_for_mode(dx, -dy, mode);
+                        app.controller.pan(dx, -dy);
                         // Record drag position for inertia velocity estimation.
                         if let Some(&(_, x, y)) = changes.first() {
                             app.controller.anim.record_drag((x * dpr, y * dpr), now);
@@ -424,17 +422,13 @@ fn register_touch_events(
                     }
                     GestureAction::MultiTouch(mt) => {
                         if let Some((delta, cx, cy)) = mt.zoom {
-                            app.controller.engine.zoom_at_for_mode(delta, cx, cy, mode);
-                            // Sync animation target so tick() doesn't fight
-                            // the pinch zoom by reverting to the old target.
-                            app.controller.anim.zoom_target = app.controller.engine.viewport.zoom;
-                            app.controller.anim.zoom_anchor = Some((cx, cy));
+                            app.controller.zoom_at(delta, cx, cy);
                         }
                         if let Some(deg) = mt.rotate {
-                            app.controller.engine.rotate(deg);
+                            app.controller.rotate(deg);
                         }
                         if let Some(deg) = mt.pitch {
-                            app.controller.engine.pitch(deg);
+                            app.controller.pitch(deg);
                         }
                         // Multi-touch gesture invalidates tap.
                         let mut tap = tap.borrow_mut();
