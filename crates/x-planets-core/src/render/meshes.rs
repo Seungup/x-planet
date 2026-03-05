@@ -1,103 +1,6 @@
-//! Render pipeline for tile layers.
+//! Mesh generation functions for tile rendering.
 
-use std::collections::HashMap;
-
-use x_planets_math::TileCoord;
-
-use crate::pipeline::RenderableTile;
-
-// ═══════════════════════════════════════════════════════════════════
-// Per-frame render data (passed to TileRenderer per layer)
-// ═══════════════════════════════════════════════════════════════════
-
-/// Per-layer data assembled each frame and handed to `TileRenderer::render_frame_layered`.
-pub struct RenderLayerData<'a> {
-    /// Layer name (for debug labels).
-    pub name: &'a str,
-    /// Layer opacity (0.0–1.0).
-    pub opacity: f32,
-    /// Tiles with fallback resolution.
-    pub tiles: Vec<RenderableTile>,
-    /// Map from TileCoord → GPU TextureView (both own + fallback textures).
-    pub texture_views: HashMap<TileCoord, &'a wgpu::TextureView>,
-    /// Per-tile opacity overrides (for fade-in animation).
-    /// If a tile's coord is in this map, use this opacity instead of layer opacity.
-    pub tile_opacity_overrides: HashMap<TileCoord, f32>,
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Legacy layer types (step07 example compat)
-// ═══════════════════════════════════════════════════════════════════
-
-/// Describes a tile ready to be rendered.
-pub struct RenderTile {
-    pub coord: TileCoord,
-    /// Index into the texture atlas or bind group array.
-    pub texture_index: usize,
-    /// Opacity for blending (0.0 - 1.0).
-    pub opacity: f32,
-}
-
-/// A layer of tiles to render.
-pub struct TileRenderLayer {
-    pub name: String,
-    pub tiles: Vec<RenderTile>,
-    pub visible: bool,
-    pub opacity: f32,
-}
-
-impl TileRenderLayer {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            tiles: Vec::new(),
-            visible: true,
-            opacity: 1.0,
-        }
-    }
-}
-
-/// Ordered stack of tile layers for compositing.
-pub struct LayerStack {
-    layers: Vec<TileRenderLayer>,
-}
-
-impl LayerStack {
-    pub fn new() -> Self {
-        Self { layers: Vec::new() }
-    }
-
-    pub fn add_layer(&mut self, layer: TileRenderLayer) {
-        self.layers.push(layer);
-    }
-
-    pub fn remove_layer(&mut self, name: &str) {
-        self.layers.retain(|l| l.name != name);
-    }
-
-    pub fn get_layer(&self, name: &str) -> Option<&TileRenderLayer> {
-        self.layers.iter().find(|l| l.name == name)
-    }
-
-    pub fn get_layer_mut(&mut self, name: &str) -> Option<&mut TileRenderLayer> {
-        self.layers.iter_mut().find(|l| l.name == name)
-    }
-
-    /// Get all visible layers in render order (bottom to top).
-    pub fn visible_layers(&self) -> impl Iterator<Item = &TileRenderLayer> {
-        self.layers.iter().filter(|l| l.visible)
-    }
-
-    pub fn layer_count(&self) -> usize {
-        self.layers.len()
-    }
-}
-
-impl Default for LayerStack {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+use super::{TileVertex, GlobeTileVertex};
 
 /// Quad vertices for a single tile (Relative-To-Center) in Mercator space.
 ///
@@ -107,7 +10,7 @@ impl Default for LayerStack {
 ///
 /// At zoom z, each tile spans `1 / 2^z` in Mercator space, so the half-size
 /// is `0.5 / 2^z`.  Vertices are at `(±hw, ±hh)` centered on the origin.
-pub fn tile_quad_vertices(coord: &TileCoord) -> [TileVertex; 4] {
+pub fn tile_quad_vertices(coord: &x_planets_math::TileCoord) -> [TileVertex; 4] {
     tile_quad_vertices_projected(coord, x_planets_math::ProjectionMode::Mercator)
 }
 
@@ -116,7 +19,7 @@ pub fn tile_quad_vertices(coord: &TileCoord) -> [TileVertex; 4] {
 /// For Mercator, all tiles at the same zoom have equal height.
 /// Height varies by projection mode.
 pub fn tile_quad_vertices_projected(
-    coord: &TileCoord,
+    coord: &x_planets_math::TileCoord,
     mode: x_planets_math::ProjectionMode,
 ) -> [TileVertex; 4] {
     let n = coord.extent() as f32;
@@ -136,74 +39,6 @@ pub fn tile_quad_vertices_projected(
 
 /// Indices for a tile quad (two triangles).
 pub const TILE_QUAD_INDICES: [u32; 6] = [0, 1, 2, 2, 1, 3];
-
-/// Vertex layout for tile rendering.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct TileVertex {
-    pub position: [f32; 2],
-    pub tex_coord: [f32; 2],
-}
-
-impl TileVertex {
-    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x2,
-                },
-                wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x2,
-                },
-            ],
-        }
-    }
-}
-
-/// Vertex layout for globe tile rendering (3D position on sphere surface + UV + sphere pos).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GlobeTileVertex {
-    /// Position (x, y, z) relative to tile center on the unit sphere (RTE).
-    pub position: [f32; 3],
-    /// Texture coordinate (0..1) within the tile.
-    pub tex_coord: [f32; 2],
-    /// Original position on the unit sphere (for small-circle clipping in fragment shader).
-    pub sphere_pos: [f32; 3],
-}
-
-impl GlobeTileVertex {
-    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress, // 32 bytes
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3, // position xyz
-                },
-                wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x2, // tex_coord
-                },
-                wgpu::VertexAttribute {
-                    offset: (std::mem::size_of::<[f32; 3]>() + std::mem::size_of::<[f32; 2]>())
-                        as wgpu::BufferAddress,
-                    shader_location: 2,
-                    format: wgpu::VertexFormat::Float32x3, // sphere_pos
-                },
-            ],
-        }
-    }
-}
 
 /// Tessellation subdivisions for a globe tile based on zoom level.
 ///
@@ -527,47 +362,10 @@ pub fn polar_cap_mesh(north: bool) -> (Vec<GlobeTileVertex>, Vec<u32>) {
     (vertices, indices)
 }
 
-/// Vertex layout for terrain tile rendering (3D displaced positions + normals).
-#[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct TerrainVertex {
-    /// Position in Mercator x, y + elevation z.
-    pub position: [f32; 3],
-    /// Surface normal (for hillshade lighting).
-    pub normal: [f32; 3],
-    /// UV for imagery texture draping.
-    pub tex_coord: [f32; 2],
-}
-
-impl TerrainVertex {
-    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress, // 32 bytes
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3, // position xyz
-                },
-                wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x3, // normal xyz
-                },
-                wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 6]>() as wgpu::BufferAddress,
-                    shader_location: 2,
-                    format: wgpu::VertexFormat::Float32x2, // tex_coord
-                },
-            ],
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use x_planets_math::TileCoord;
 
     #[test]
     fn test_tile_quad_vertices_rte() {
@@ -635,19 +433,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn test_layer_stack() {
-        let mut stack = LayerStack::new();
-        stack.add_layer(TileRenderLayer::new("base"));
-        stack.add_layer(TileRenderLayer::new("overlay"));
-
-        assert_eq!(stack.layer_count(), 2);
-        assert!(stack.get_layer("base").is_some());
-
-        stack.remove_layer("base");
-        assert_eq!(stack.layer_count(), 1);
     }
 
     // ── Polar cap winding tests ──────────────────────────
