@@ -55,9 +55,12 @@ impl NativeApp {
                         ls.tile_textures.insert(decoded.coord, tex);
                     }
                     Ok(TileResult::Terrain(decoded)) => {
+                        // Could be from config-file terrain layer (pending_coords)
+                        // or runtime elevation loading (pending_elevation_coords)
                         if ls.pending_coords.remove(&decoded.coord) {
                             ls.tile_loader.complete();
                         }
+                        ls.pending_elevation_coords.remove(&decoded.coord);
                         log::debug!(
                             "[{}] Terrain tile loaded: z={} x={} y={} elev=[{:.0}..{:.0}]m",
                             ls.name,
@@ -314,6 +317,7 @@ impl NativeApp {
                         if ls.pending_coords.remove(&coord) {
                             ls.tile_loader.complete();
                         }
+                        ls.pending_elevation_coords.remove(&coord);
                         // Backoff cooldown:
                         //   429 (rate limit) → 30s
                         //   400 (bad request / tile doesn't exist at this zoom) → 300s

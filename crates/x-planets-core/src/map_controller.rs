@@ -58,13 +58,22 @@ pub struct RenderOutput<'a> {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Terrain toggle config
+// Terrain state — rendering property, not a layer
 // ═══════════════════════════════════════════════════════════════════
 
-/// Stored configuration for the terrain layer pair (imagery + elevation).
-struct TerrainConfig {
-    imagery_layer_name: String,
-    terrain_layer_name: String,
+/// Terrain rendering configuration.
+///
+/// Terrain is a **rendering property** on the map controller, not a separate
+/// layer in the engine's layer stack.  When enabled, tiles with available
+/// elevation data are rendered as displaced meshes; tiles without elevation
+/// continue rendering as flat raster.
+pub struct TerrainState {
+    /// Elevation tile URL template (e.g. `https://…/{z}/{x}/{y}.png`).
+    pub url: String,
+    /// Elevation encoding format.
+    pub encoding: TerrainEncoding,
+    /// Name of the raster layer whose imagery is draped onto the terrain mesh.
+    pub imagery_layer_name: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -84,8 +93,8 @@ pub struct MapController {
     /// Tiles that recently left the visible set, with departure timestamp.
     departing_tiles: HashMap<TileCoord, f64>,
 
-    /// Terrain toggle state.
-    terrain_config: Option<TerrainConfig>,
+    /// Terrain rendering state (rendering property, not a layer).
+    pub terrain: Option<TerrainState>,
 }
 
 impl MapController {
@@ -99,7 +108,7 @@ impl MapController {
             anim: AnimationController::new(initial_zoom),
             prev_visible_available: HashSet::new(),
             departing_tiles: HashMap::new(),
-            terrain_config: None,
+            terrain: None,
         }
     }
 
@@ -226,16 +235,14 @@ impl MapController {
 
     /// Toggle terrain on/off.  Returns the new state (true = terrain ON).
     ///
-    /// When turning ON:
-    /// - Adds a terrain layer referencing the first raster layer as imagery
-    /// - Platform code should create a corresponding `WebLayerState`/`NativeLayerState`
-    ///
-    /// When turning OFF:
-    /// - Removes the terrain layer from the engine
+    /// Terrain is a rendering property, not a layer.  No layers are added or
+    /// removed from the engine.  Platform code should start/stop loading
+    /// elevation data on the raster layer when this returns true/false.
     pub fn toggle_terrain(&mut self, url: &str, encoding: TerrainEncoding) -> bool {
-        if let Some(tc) = self.terrain_config.take() {
+        if self.terrain.is_some() {
             // Turn OFF
-            self.engine.remove_layer(&tc.terrain_layer_name);
+            self.terrain = None;
+            self.engine.request_redraw();
             log::info!("Terrain: OFF");
             false
         } else {
@@ -248,28 +255,13 @@ impl MapController {
                 .map(|l| l.config.name.clone())
                 .unwrap_or_else(|| "base".to_string());
 
-            let terrain_name = "terrain".to_string();
-
-            self.engine.add_layer(LayerConfig {
-                name: terrain_name.clone(),
-                tile_source_url: url.to_string(),
-                opacity: 1.0,
-                visible: true,
-                z_order: 100,
-                max_cached_tiles: 256,
-                max_concurrent_loads: 6,
-                kind: LayerKind::Terrain {
-                    imagery_layer: imagery_name.clone(),
-                    encoding,
-                },
-                ..Default::default()
-            });
-
-            self.terrain_config = Some(TerrainConfig {
+            self.terrain = Some(TerrainState {
+                url: url.to_string(),
+                encoding,
                 imagery_layer_name: imagery_name,
-                terrain_layer_name: terrain_name,
             });
 
+            self.engine.request_redraw();
             log::info!("Terrain: ON");
             true
         }
@@ -277,48 +269,22 @@ impl MapController {
 
     /// Whether terrain is currently enabled.
     pub fn terrain_enabled(&self) -> bool {
-        self.terrain_config.is_some()
+        self.terrain.is_some()
     }
 
-    /// Set terrain height exaggeration.
-    ///
-    /// Note: exaggeration is applied by the `TerrainRenderer`, not the engine.
-    /// This is a convenience pass-through; platforms should also update their
-    /// renderer's `exaggeration` field directly.
-    pub fn set_terrain_exaggeration(&mut self, _value: f64) {
-        // Exaggeration is stored per-renderer, not per-layer.
-        // Platform code should update the TerrainRenderer directly.
-        // This method is provided for API completeness.
-    }
-
-    /// Get current terrain exaggeration value.
-    ///
-    /// Platforms should read their `TerrainRenderer::exaggeration` directly.
-    pub fn terrain_exaggeration(&self) -> f64 {
-        1.5
-    }
-
-    /// The terrain layer's URL template, if terrain is enabled.
+    /// The terrain elevation URL template, if terrain is enabled.
     pub fn terrain_url(&self) -> Option<&str> {
-        self.terrain_config.as_ref().and_then(|tc| {
-            self.engine
-                .get_layer(&tc.terrain_layer_name)
-                .map(|l| l.config.tile_source_url.as_str())
-        })
-    }
-
-    /// The terrain layer name, if terrain is enabled.
-    pub fn terrain_layer_name(&self) -> Option<&str> {
-        self.terrain_config
-            .as_ref()
-            .map(|tc| tc.terrain_layer_name.as_str())
+        self.terrain.as_ref().map(|ts| ts.url.as_str())
     }
 
     /// The imagery layer name used by terrain, if terrain is enabled.
     pub fn terrain_imagery_name(&self) -> Option<&str> {
-        self.terrain_config
-            .as_ref()
-            .map(|tc| tc.imagery_layer_name.as_str())
+        self.terrain.as_ref().map(|ts| ts.imagery_layer_name.as_str())
+    }
+
+    /// The terrain encoding, if terrain is enabled.
+    pub fn terrain_encoding(&self) -> Option<TerrainEncoding> {
+        self.terrain.as_ref().map(|ts| ts.encoding)
     }
 
     // ── Per-frame orchestration ─────────────────────────────────
@@ -425,8 +391,9 @@ impl MapController {
         let mut terrain_layers: Vec<TerrainLayerData<'a>> = Vec::new();
         let mut terrain_overlay_layers: Vec<TerrainLayerData<'a>> = Vec::new();
 
-        // Collect raster layer names consumed as terrain imagery (skip from raster render).
-        let terrain_imagery_names: HashSet<&str> = self
+        // Collect raster layer names consumed as terrain imagery by config-file
+        // terrain layers (NOT the runtime toggle — that uses per-tile split).
+        let config_terrain_imagery: HashSet<&str> = self
             .engine
             .visible_layers()
             .filter_map(|l| match &l.config.kind {
@@ -437,6 +404,12 @@ impl MapController {
 
         let fade_fn = |coord: &TileCoord| self.anim.tile_fade_elapsed(coord, now_secs);
 
+        // Is this raster layer the terrain imagery target (runtime toggle)?
+        let terrain_imagery_layer = self
+            .terrain
+            .as_ref()
+            .map(|ts| ts.imagery_layer_name.as_str());
+
         for layer in self.engine.visible_layers() {
             let lv = layer_views
                 .iter()
@@ -444,25 +417,68 @@ impl MapController {
 
             match &layer.config.kind {
                 LayerKind::Raster => {
-                    if terrain_imagery_names.contains(layer.config.name.as_str()) {
+                    // Skip if consumed by a config-file terrain layer
+                    if config_terrain_imagery.contains(layer.config.name.as_str()) {
                         continue;
                     }
                     if let Some(lv) = lv {
-                        let (base, overlay) = build_raster_layer(
-                            &layer.config.name,
-                            layer.config.opacity,
-                            *lv,
-                            texture_fn,
-                            visible,
-                            &fade_fn,
-                        );
-                        raster_layers.push(base);
-                        if let Some(ovl) = overlay {
-                            raster_layers.push(ovl);
+                        // Per-tile split: terrain-enabled raster imagery layer
+                        let is_terrain_imagery = terrain_imagery_layer == Some(layer.config.name.as_str());
+                        if is_terrain_imagery {
+                            // Split visible tiles: elevation available → terrain, rest → flat raster
+                            let (flat_visible, terrain_visible) =
+                                split_by_elevation(visible, *lv);
+
+                            // Flat raster for tiles without elevation
+                            if !flat_visible.is_empty() {
+                                let (base, overlay) = build_raster_layer(
+                                    &layer.config.name,
+                                    layer.config.opacity,
+                                    *lv,
+                                    texture_fn,
+                                    &flat_visible,
+                                    &fade_fn,
+                                );
+                                raster_layers.push(base);
+                                if let Some(ovl) = overlay {
+                                    raster_layers.push(ovl);
+                                }
+                            }
+
+                            // Terrain mesh for tiles with elevation (single layer view)
+                            if !terrain_visible.is_empty() {
+                                let (base, overlay) = build_terrain_layer(
+                                    &layer.config.name,
+                                    layer.config.opacity,
+                                    *lv, // elevation data
+                                    *lv, // imagery textures (same layer)
+                                    texture_fn,
+                                    &terrain_visible,
+                                    &fade_fn,
+                                );
+                                terrain_layers.push(base);
+                                if let Some(ovl) = overlay {
+                                    terrain_overlay_layers.push(ovl);
+                                }
+                            }
+                        } else {
+                            let (base, overlay) = build_raster_layer(
+                                &layer.config.name,
+                                layer.config.opacity,
+                                *lv,
+                                texture_fn,
+                                visible,
+                                &fade_fn,
+                            );
+                            raster_layers.push(base);
+                            if let Some(ovl) = overlay {
+                                raster_layers.push(ovl);
+                            }
                         }
                     }
                 }
                 LayerKind::Terrain { imagery_layer, .. } => {
+                    // Config-file terrain layers (backward compat)
                     let terrain_lv = lv;
                     let imagery_lv = layer_views.iter().find(|v| v.name() == imagery_layer.as_str());
 
@@ -583,6 +599,38 @@ fn build_raster_layer<'a>(
     };
 
     (base, overlay)
+}
+
+/// Split visible tiles into (flat, terrain) based on elevation data availability.
+///
+/// A tile goes to the terrain list if the layer state has elevation data for it
+/// OR any of its ancestor tiles (parent fallback).  Otherwise it stays in flat.
+fn split_by_elevation(
+    visible: &[VisibleTile],
+    lv: &dyn LayerStateView,
+) -> (Vec<VisibleTile>, Vec<VisibleTile>) {
+    let mut flat = Vec::new();
+    let mut terrain = Vec::new();
+    for vt in visible {
+        let has_elev = {
+            let mut c = Some(vt.coord);
+            let mut found = false;
+            while let Some(candidate) = c {
+                if lv.terrain_tile_data(&candidate).is_some() {
+                    found = true;
+                    break;
+                }
+                c = candidate.parent();
+            }
+            found
+        };
+        if has_elev {
+            terrain.push(vt.clone());
+        } else {
+            flat.push(vt.clone());
+        }
+    }
+    (flat, terrain)
 }
 
 fn build_terrain_layer<'a>(
@@ -714,13 +762,14 @@ mod tests {
         assert!(!ctrl.terrain_enabled());
         assert_eq!(ctrl.layer_count(), 1);
 
-        // Toggle ON
+        // Toggle ON — no layer added (terrain is a rendering property)
         let on = ctrl.toggle_terrain(url, TerrainEncoding::Terrarium);
         assert!(on);
         assert!(ctrl.terrain_enabled());
-        assert_eq!(ctrl.layer_count(), 2);
-        assert!(ctrl.terrain_layer_name().is_some());
+        assert_eq!(ctrl.layer_count(), 1); // unchanged
         assert!(ctrl.terrain_imagery_name().is_some());
+        assert!(ctrl.terrain_url().is_some());
+        assert_eq!(ctrl.terrain_encoding(), Some(TerrainEncoding::Terrarium));
 
         // Toggle OFF
         let off = ctrl.toggle_terrain(url, TerrainEncoding::Terrarium);

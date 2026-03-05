@@ -115,6 +115,9 @@ pub(super) fn init_layer_states(
                 geographic: meta.geographic,
                 geo_heightmap_cache: HashMap::new(),
                 available_coords_cache: HashSet::new(),
+                elevation_source: None,
+                pending_elevation_coords: HashSet::new(),
+                max_elevation_concurrent: 4,
             }
         })
         .collect()

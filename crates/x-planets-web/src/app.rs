@@ -43,6 +43,7 @@ pub(crate) struct WebLayerState {
     pub kind: LayerKind,
     pub url_template: String,
     pub tile_textures: TileCache<GpuTexture>,
+    /// Elevation data (populated when terrain is enabled on this raster layer).
     pub terrain_data: HashMap<TileCoord, TerrainTileData>,
     pub pending_coords: HashSet<TileCoord>,
     completed_queue: Rc<RefCell<Vec<CompletedTileResult>>>,
@@ -50,6 +51,11 @@ pub(crate) struct WebLayerState {
     pub max_concurrent: usize,
     /// Cached set of available raster tile coords (rebuilt each frame).
     available_coords_cache: HashSet<TileCoord>,
+    /// Elevation tile URL template (set when terrain is toggled on).
+    pub elevation_url: Option<String>,
+    /// Pending elevation tile fetches (separate from raster pending).
+    pub pending_elevation_coords: HashSet<TileCoord>,
+    pub max_elevation_concurrent: usize,
 }
 
 impl WebLayerState {
@@ -65,6 +71,9 @@ impl WebLayerState {
             failed_queue: Rc::new(RefCell::new(Vec::new())),
             max_concurrent: 6,
             available_coords_cache: HashSet::new(),
+            elevation_url: None,
+            pending_elevation_coords: HashSet::new(),
+            max_elevation_concurrent: 4,
         }
     }
 
@@ -156,29 +165,29 @@ impl WebApp {
     }
 
     /// Toggle terrain rendering on/off. Returns the new state.
+    ///
+    /// No layers are added or removed.  Elevation data is loaded on the
+    /// raster imagery layer as a secondary data stream.
     pub fn toggle_terrain(&mut self) -> bool {
         let url = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
         let enabled = self.controller.toggle_terrain(url, TerrainEncoding::Terrarium);
 
         if enabled {
-            // Add a WebLayerState for the new terrain layer
-            if let Some(terrain_name) = self.controller.terrain_layer_name() {
-                let terrain_url = self.controller.terrain_url().unwrap_or(url).to_string();
-                self.layer_states.push(WebLayerState::new(
-                    terrain_name.to_string(),
-                    LayerKind::Terrain {
-                        imagery_layer: self.controller.terrain_imagery_name()
-                            .unwrap_or("base").to_string(),
-                        encoding: TerrainEncoding::Terrarium,
-                    },
-                    terrain_url,
-                ));
+            // Set elevation URL on the imagery layer so it starts loading elevation
+            let imagery_name = self.controller.terrain_imagery_name()
+                .unwrap_or("base").to_string();
+            let terrain_url = self.controller.terrain_url()
+                .unwrap_or(url).to_string();
+            if let Some(ls) = self.layer_states.iter_mut().find(|ls| ls.name == imagery_name) {
+                ls.elevation_url = Some(terrain_url);
             }
         } else {
-            // Remove the terrain layer state
-            self.layer_states.retain(|ls| {
-                !matches!(ls.kind, LayerKind::Terrain { .. })
-            });
+            // Clear elevation data and pending on the imagery layer
+            for ls in &mut self.layer_states {
+                ls.elevation_url = None;
+                ls.terrain_data.clear();
+                ls.pending_elevation_coords.clear();
+            }
         }
 
         enabled
@@ -371,7 +380,7 @@ impl WebApp {
                         self.controller.register_tile_loaded(coord, now_secs);
                     }
                     CompletedTileResult::Elevation { coord, elevation, width, height } => {
-                        ls.pending_coords.remove(&coord);
+                        ls.pending_elevation_coords.remove(&coord);
                         ls.terrain_data.insert(
                             coord,
                             TerrainTileData::Heightmap { elevation, width, height },
@@ -389,13 +398,19 @@ impl WebApp {
         for ls in &mut self.layer_states {
             let visible_set: HashSet<TileCoord> = visible.iter().map(|vt| vt.coord).collect();
             ls.pending_coords.retain(|c| c.z <= 1 || visible_set.contains(c));
+            ls.pending_elevation_coords.retain(|c| visible_set.contains(c));
 
             match &ls.kind {
                 LayerKind::Raster => {
                     request_raster_tiles(ls, visible, camera_center);
+                    // Also request elevation tiles if terrain is enabled on this layer
+                    if let Some(elev_url) = ls.elevation_url.clone() {
+                        request_elevation_tiles(ls, visible, camera_center, &elev_url);
+                    }
                 }
                 LayerKind::Terrain { .. } => {
-                    request_elevation_tiles(ls, visible, camera_center);
+                    // Config-file terrain layers (backward compat)
+                    request_elevation_tiles(ls, visible, camera_center, &ls.url_template.clone());
                 }
                 LayerKind::Tiles3d => {}
             }
@@ -484,6 +499,7 @@ fn request_elevation_tiles(
     ls: &mut WebLayerState,
     visible: &[VisibleTile],
     camera_center: x_planets_math::DVec2,
+    elev_url_template: &str,
 ) {
     let mut missing: Vec<(TileCoord, f64)> = Vec::new();
 
@@ -492,7 +508,7 @@ fn request_elevation_tiles(
         .iter()
         .filter(|vt| {
             !ls.terrain_data.contains_key(&vt.coord)
-                && !ls.pending_coords.contains(&vt.coord)
+                && !ls.pending_elevation_coords.contains(&vt.coord)
                 && seen.insert(vt.coord)
         })
         .map(|vt| {
@@ -504,12 +520,12 @@ fn request_elevation_tiles(
     visible_missing.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     missing.extend(visible_missing);
 
-    let slots = ls.max_concurrent.saturating_sub(ls.pending_coords.len());
+    let slots = ls.max_elevation_concurrent.saturating_sub(ls.pending_elevation_coords.len());
     for (coord, _) in missing.into_iter().take(slots) {
-        ls.pending_coords.insert(coord);
+        ls.pending_elevation_coords.insert(coord);
         let queue = Rc::clone(&ls.completed_queue);
         let failed = Rc::clone(&ls.failed_queue);
-        let url = tile_url(&ls.url_template, &coord);
+        let url = tile_url(elev_url_template, &coord);
 
         wasm_bindgen_futures::spawn_local(async move {
             match fetch_bytes(&url).await {
