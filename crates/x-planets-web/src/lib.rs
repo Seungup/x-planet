@@ -66,11 +66,14 @@ mod web_impl {
         // ── TileRenderer ──
         let renderer = x_planets_core::TileRenderer::new(&gpu);
 
+        // ── TerrainRenderer ──
+        let terrain_renderer = x_planets_core::TerrainRenderer::new(&gpu);
+
         // ── TextureManager ──
         let tex_manager = x_planets_gpu::TextureManager::new(&gpu.device);
 
         // ── WebApp ──
-        let app = WebApp::new(gpu, engine, renderer, tex_manager, canvas.clone(), dpr);
+        let app = WebApp::new(gpu, engine, renderer, terrain_renderer, tex_manager, canvas.clone(), dpr);
         let app = std::rc::Rc::new(std::cell::RefCell::new(app));
 
         // ── Input events ──
@@ -78,6 +81,9 @@ mod web_impl {
 
         // ── Projection switcher button ──
         crate::input::setup_projection_button(std::rc::Rc::clone(&app));
+
+        // ── Altitude toggle button ──
+        crate::input::setup_altitude_button(std::rc::Rc::clone(&app));
 
         // ── Start render loop ──
         WebApp::start_render_loop(std::rc::Rc::clone(&app));

@@ -311,6 +311,10 @@ fn register_keyboard_events(app: Rc<RefCell<WebApp>>) {
                 let name = app.cycle_projection();
                 update_projection_button(&name);
             }
+            "KeyT" => {
+                let enabled = app.toggle_terrain();
+                update_altitude_button(enabled);
+            }
             "Home" => {
                 app.engine.viewport.center = x_planets_math::GeoCoord::new(0.0, 0.0);
                 app.engine.viewport.zoom = 2.0;
@@ -511,6 +515,41 @@ fn update_projection_button(name: &str) {
             btn.set_text_content(Some(name));
         }
     }
+}
+
+/// Update the altitude button text and style to match the current state.
+fn update_altitude_button(enabled: bool) {
+    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+        if let Some(btn) = doc.get_element_by_id("alt-btn") {
+            if enabled {
+                btn.set_text_content(Some("Terrain ON"));
+                let _ = btn.set_attribute("class", "active");
+            } else {
+                btn.set_text_content(Some("Terrain OFF"));
+                let _ = btn.remove_attribute("class");
+            }
+        }
+    }
+}
+
+/// Set up the click listener on the altitude toggle button (called from lib.rs).
+pub fn setup_altitude_button(app: Rc<RefCell<WebApp>>) {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Some(btn) = doc.get_element_by_id("alt-btn") else {
+        return;
+    };
+
+    let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::Event| {
+        e.stop_propagation();
+        let mut app = app.borrow_mut();
+        let enabled = app.toggle_terrain();
+        update_altitude_button(enabled);
+    });
+    btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
+        .unwrap();
+    cb.forget();
 }
 
 /// Set up the click listener on the projection button (called from lib.rs).
