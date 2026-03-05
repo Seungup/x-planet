@@ -160,14 +160,14 @@ fn register_mouse_events(
                     let now = now_secs();
                     let mut app = app.borrow_mut();
 
-                    if app.anim.check_double_click(pos, now) {
+                    if app.controller.anim.check_double_click(pos, now) {
                         // Double-click: smooth zoom in +1 level at cursor
-                        app.anim.zoom_target += 1.0;
-                        app.anim.zoom_anchor = Some((pos.0 * dpr, pos.1 * dpr));
+                        app.controller.anim.zoom_target += 1.0;
+                        app.controller.anim.zoom_anchor = Some((pos.0 * dpr, pos.1 * dpr));
                     }
 
                     // Stop inertia when starting a new drag
-                    app.anim.begin_drag();
+                    app.controller.anim.begin_drag();
                     ms.left = Some(pos);
                     ms.left_pressed = true;
                 }
@@ -197,7 +197,7 @@ fn register_mouse_events(
             let mut app = app.borrow_mut();
 
             // Track mouse position for zoom anchor fallback (physical pixels)
-            app.anim.last_mouse_pos = Some((x * dpr, y * dpr));
+            app.controller.anim.last_mouse_pos = Some((x * dpr, y * dpr));
 
             // Left-drag: pan (scale delta to physical pixels)
             if ms.left_pressed {
@@ -205,9 +205,9 @@ fn register_mouse_events(
                     let dx = (x - lx) * dpr;
                     let dy = (y - ly) * dpr;
                     let mode = app.resolve_projection_mode();
-                    app.engine.pan_for_mode(dx, -dy, mode);
+                    app.controller.engine.pan_for_mode(dx, -dy, mode);
                 }
-                app.anim.record_drag((x * dpr, y * dpr), now_secs());
+                app.controller.anim.record_drag((x * dpr, y * dpr), now_secs());
                 ms.left = Some((x, y));
             }
 
@@ -215,15 +215,15 @@ fn register_mouse_events(
             if let Some((lx, ly)) = ms.right {
                 let dx = x - lx;
                 let dy = y - ly;
-                app.engine.pitch(-dy * PITCH_SENSITIVITY);
-                app.engine.rotate(dx * ROTATE_SENSITIVITY);
+                app.controller.engine.pitch(-dy * PITCH_SENSITIVITY);
+                app.controller.engine.rotate(dx * ROTATE_SENSITIVITY);
                 ms.right = Some((x, y));
             }
 
             // Middle-drag: rotate
             if let Some(last_x) = ms.middle_x {
                 let dx = x - last_x;
-                app.engine.rotate(dx * ROTATE_SENSITIVITY);
+                app.controller.engine.rotate(dx * ROTATE_SENSITIVITY);
                 ms.middle_x = Some(x);
             }
         });
@@ -243,7 +243,7 @@ fn register_mouse_events(
                 0 => {
                     ms.left = None;
                     ms.left_pressed = false;
-                    app.borrow_mut().anim.compute_release_velocity(now_secs());
+                    app.borrow_mut().controller.anim.compute_release_velocity(now_secs());
                 }
                 1 => {
                     ms.middle_x = None;
@@ -273,8 +273,8 @@ fn register_wheel_event(canvas: &web_sys::HtmlCanvasElement, app: Rc<RefCell<Web
         let x = e.offset_x() as f64 * dpr;
         let y = e.offset_y() as f64 * dpr;
         let mut app = app.borrow_mut();
-        app.anim.zoom_target += delta;
-        app.anim.zoom_anchor = Some((x, y));
+        app.controller.anim.zoom_target += delta;
+        app.controller.anim.zoom_anchor = Some((x, y));
     });
     // Must be non-passive so preventDefault() stops browser scroll/zoom
     add_non_passive_listener(canvas, "wheel", cb.as_ref().unchecked_ref());
@@ -293,20 +293,20 @@ fn register_keyboard_events(app: Rc<RefCell<WebApp>>) {
 
         let mode = app.resolve_projection_mode();
         match key.as_str() {
-            "ArrowLeft" => app.engine.pan_for_mode(-PAN_AMOUNT, 0.0, mode),
-            "ArrowRight" => app.engine.pan_for_mode(PAN_AMOUNT, 0.0, mode),
-            "ArrowUp" => app.engine.pan_for_mode(0.0, -PAN_AMOUNT, mode),
-            "ArrowDown" => app.engine.pan_for_mode(0.0, PAN_AMOUNT, mode),
+            "ArrowLeft" => app.controller.engine.pan_for_mode(-PAN_AMOUNT, 0.0, mode),
+            "ArrowRight" => app.controller.engine.pan_for_mode(PAN_AMOUNT, 0.0, mode),
+            "ArrowUp" => app.controller.engine.pan_for_mode(0.0, -PAN_AMOUNT, mode),
+            "ArrowDown" => app.controller.engine.pan_for_mode(0.0, PAN_AMOUNT, mode),
             "Equal" | "NumpadAdd" => {
-                app.anim.zoom_target += ZOOM_STEP;
-                app.anim.zoom_anchor = None;
+                app.controller.anim.zoom_target += ZOOM_STEP;
+                app.controller.anim.zoom_anchor = None;
             }
             "Minus" | "NumpadSubtract" => {
-                app.anim.zoom_target -= ZOOM_STEP;
-                app.anim.zoom_anchor = None;
+                app.controller.anim.zoom_target -= ZOOM_STEP;
+                app.controller.anim.zoom_anchor = None;
             }
-            "KeyQ" => app.engine.rotate(-KEYBOARD_ROTATE),
-            "KeyE" => app.engine.rotate(KEYBOARD_ROTATE),
+            "KeyQ" => app.controller.engine.rotate(-KEYBOARD_ROTATE),
+            "KeyE" => app.controller.engine.rotate(KEYBOARD_ROTATE),
             "KeyP" => {
                 let name = app.cycle_projection();
                 update_projection_button(&name);
@@ -316,13 +316,13 @@ fn register_keyboard_events(app: Rc<RefCell<WebApp>>) {
                 update_altitude_button(enabled);
             }
             "Home" => {
-                app.engine.viewport.center = x_planets_math::GeoCoord::new(0.0, 0.0);
-                app.engine.viewport.zoom = 2.0;
-                app.engine.viewport.pitch = 0.0;
-                app.engine.viewport.bearing = 0.0;
-                app.anim.zoom_target = 2.0;
-                app.anim.pan_velocity = (0.0, 0.0);
-                app.engine.request_redraw();
+                app.controller.engine.viewport.center = x_planets_math::GeoCoord::new(0.0, 0.0);
+                app.controller.engine.viewport.zoom = 2.0;
+                app.controller.engine.viewport.pitch = 0.0;
+                app.controller.engine.viewport.bearing = 0.0;
+                app.controller.anim.zoom_target = 2.0;
+                app.controller.anim.pan_velocity = (0.0, 0.0);
+                app.controller.engine.request_redraw();
             }
             _ => return,
         }
@@ -374,7 +374,7 @@ fn register_touch_events(
 
             if ts.touch_count() == 1 {
                 // Single finger: stop any running inertia and begin new drag.
-                app.borrow_mut().anim.begin_drag();
+                app.borrow_mut().controller.anim.begin_drag();
                 // Record tap start for double-tap detection.
                 if let Some(t) = e.changed_touches().get(0) {
                     let mut tap = tap.borrow_mut();
@@ -416,25 +416,25 @@ fn register_touch_events(
                 let mode = app.resolve_projection_mode();
                 match action {
                     GestureAction::Pan { dx, dy } => {
-                        app.engine.pan_for_mode(dx, -dy, mode);
+                        app.controller.engine.pan_for_mode(dx, -dy, mode);
                         // Record drag position for inertia velocity estimation.
                         if let Some(&(_, x, y)) = changes.first() {
-                            app.anim.record_drag((x * dpr, y * dpr), now);
+                            app.controller.anim.record_drag((x * dpr, y * dpr), now);
                         }
                     }
                     GestureAction::MultiTouch(mt) => {
                         if let Some((delta, cx, cy)) = mt.zoom {
-                            app.engine.zoom_at_for_mode(delta, cx, cy, mode);
+                            app.controller.engine.zoom_at_for_mode(delta, cx, cy, mode);
                             // Sync animation target so tick() doesn't fight
                             // the pinch zoom by reverting to the old target.
-                            app.anim.zoom_target = app.engine.viewport.zoom;
-                            app.anim.zoom_anchor = Some((cx, cy));
+                            app.controller.anim.zoom_target = app.controller.engine.viewport.zoom;
+                            app.controller.anim.zoom_anchor = Some((cx, cy));
                         }
                         if let Some(deg) = mt.rotate {
-                            app.engine.rotate(deg);
+                            app.controller.engine.rotate(deg);
                         }
                         if let Some(deg) = mt.pitch {
-                            app.engine.pitch(deg);
+                            app.controller.engine.pitch(deg);
                         }
                         // Multi-touch gesture invalidates tap.
                         let mut tap = tap.borrow_mut();
@@ -481,16 +481,16 @@ fn register_touch_events(
                             if duration < TAP_MAX_DURATION && dist < TAP_MAX_DISTANCE {
                                 // Use CSS pixels for distance check (matches mouse),
                                 // physical pixels only for the zoom anchor.
-                                if app.anim.check_double_click(start_pos, now) {
-                                    app.anim.zoom_target += 1.0;
-                                    app.anim.zoom_anchor =
+                                if app.controller.anim.check_double_click(start_pos, now) {
+                                    app.controller.anim.zoom_target += 1.0;
+                                    app.controller.anim.zoom_anchor =
                                         Some((start_pos.0 * dpr, start_pos.1 * dpr));
                                 }
                             }
                         }
 
                         // Compute inertia velocity from drag samples.
-                        app.anim.compute_release_velocity(now);
+                        app.controller.anim.compute_release_velocity(now);
 
                         tap.start_pos = None;
                         tap.start_time = None;
