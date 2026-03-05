@@ -138,6 +138,52 @@ impl NativeApp {
         instant.duration_since(self.start_time).as_secs_f64()
     }
 
+    /// Toggle terrain rendering on/off. Returns the new state.
+    /// Mirrors `WebApp::toggle_terrain()` exactly.
+    pub(super) fn toggle_terrain(&mut self) -> bool {
+        let url = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
+        let ctrl = self.controller.as_mut().unwrap();
+        let enabled = ctrl.toggle_terrain(url, x_planets_tiles::TerrainEncoding::Terrarium);
+
+        if enabled {
+            // Add a NativeLayerState for the new terrain layer
+            if let Some(terrain_name) = ctrl.terrain_layer_name() {
+                let terrain_url = ctrl.terrain_url().unwrap_or(url).to_string();
+                let imagery_layer = ctrl
+                    .terrain_imagery_name()
+                    .unwrap_or("base")
+                    .to_string();
+                self.layer_states.push(NativeLayerState {
+                    name: terrain_name.to_string(),
+                    kind: x_planets_core::engine::LayerKind::Terrain {
+                        imagery_layer,
+                        encoding: x_planets_tiles::TerrainEncoding::Terrarium,
+                    },
+                    tile_source: std::sync::Arc::new(
+                        crate::tile_source::NativeTileSource::new(terrain_url),
+                    ),
+                    tile_textures: x_planets_tiles::TileCache::new(256),
+                    tile_loader: x_planets_tiles::TileLoader::new(6),
+                    pending_coords: std::collections::HashSet::new(),
+                    terrain_data: x_planets_tiles::TileCache::new(256),
+                    failed_cooldowns: std::collections::HashMap::new(),
+                    min_zoom: 0,
+                    max_zoom: 15,
+                    tile_scale: 1.0,
+                    geographic: false,
+                    geo_heightmap_cache: std::collections::HashMap::new(),
+                    available_coords_cache: std::collections::HashSet::new(),
+                });
+            }
+        } else {
+            // Remove terrain layer states
+            self.layer_states.retain(|ls| {
+                !matches!(ls.kind, x_planets_core::engine::LayerKind::Terrain { .. })
+            });
+        }
+
+        enabled
+    }
 }
 
 impl ApplicationHandler for NativeApp {

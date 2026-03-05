@@ -1,7 +1,8 @@
 //! Input event handling: keyboard, mouse, cursor, and scroll wheel.
 //!
-//! Uses shared constants from `x_planets_core::interaction` and drives
-//! `MapController` (the same controller used by the web platform).
+//! Mirrors `x-planets-web/src/input.rs` exactly — uses `MapController`'s
+//! high-level methods (`pan`, `rotate`, `pitch`, `zoom_at`) so that
+//! projection-specific behavior is handled consistently across platforms.
 
 use std::time::Instant;
 
@@ -11,103 +12,70 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use x_planets_core::interaction::{
     KEYBOARD_ROTATE, PAN_AMOUNT, PITCH_SENSITIVITY, ROTATE_SENSITIVITY, ZOOM_STEP,
 };
-use x_planets_tiles::TerrainEncoding;
 
 use super::NativeApp;
 
 impl NativeApp {
     pub(super) fn handle_keyboard_input(&mut self, event: winit::event::KeyEvent) {
-        if event.state == ElementState::Pressed {
-            if let Some(ctrl) = &mut self.controller {
-                let mode = ctrl.rendering_mode();
-                match event.physical_key {
-                    PhysicalKey::Code(KeyCode::ArrowLeft) => {
-                        ctrl.engine.pan_for_mode(-PAN_AMOUNT, 0.0, mode);
-                    }
-                    PhysicalKey::Code(KeyCode::ArrowRight) => {
-                        ctrl.engine.pan_for_mode(PAN_AMOUNT, 0.0, mode);
-                    }
-                    PhysicalKey::Code(KeyCode::ArrowUp) => {
-                        ctrl.engine.pan_for_mode(0.0, -PAN_AMOUNT, mode);
-                    }
-                    PhysicalKey::Code(KeyCode::ArrowDown) => {
-                        ctrl.engine.pan_for_mode(0.0, PAN_AMOUNT, mode);
-                    }
-                    PhysicalKey::Code(KeyCode::Equal)
-                    | PhysicalKey::Code(KeyCode::NumpadAdd) => {
-                        ctrl.anim.zoom_target += ZOOM_STEP;
-                        ctrl.anim.zoom_anchor = None;
-                    }
-                    PhysicalKey::Code(KeyCode::Minus)
-                    | PhysicalKey::Code(KeyCode::NumpadSubtract) => {
-                        ctrl.anim.zoom_target -= ZOOM_STEP;
-                        ctrl.anim.zoom_anchor = None;
-                    }
-                    PhysicalKey::Code(KeyCode::KeyQ) => {
-                        ctrl.engine.rotate(-KEYBOARD_ROTATE);
-                    }
-                    PhysicalKey::Code(KeyCode::KeyE) => {
-                        ctrl.engine.rotate(KEYBOARD_ROTATE);
-                    }
-                    PhysicalKey::Code(KeyCode::KeyP) => {
-                        let name = ctrl.cycle_projection();
-                        log::info!("Projection: {}", name);
-                    }
-                    PhysicalKey::Code(KeyCode::KeyT) => {
-                        let url = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
-                        let enabled = ctrl.toggle_terrain(url, TerrainEncoding::Terrarium);
-                        log::info!("Terrain: {}", if enabled { "ON" } else { "OFF" });
-
-                        if enabled {
-                            // Add NativeLayerState for the new terrain layer
-                            if let Some(terrain_name) = ctrl.terrain_layer_name() {
-                                let terrain_url = ctrl.terrain_url().unwrap_or(url).to_string();
-                                let imagery_layer = ctrl.terrain_imagery_name()
-                                    .unwrap_or("base").to_string();
-                                self.layer_states.push(crate::tile_source::NativeLayerState {
-                                    name: terrain_name.to_string(),
-                                    kind: x_planets_core::engine::LayerKind::Terrain {
-                                        imagery_layer,
-                                        encoding: TerrainEncoding::Terrarium,
-                                    },
-                                    tile_source: std::sync::Arc::new(
-                                        crate::tile_source::NativeTileSource::new(terrain_url),
-                                    ),
-                                    tile_textures: x_planets_tiles::TileCache::new(256),
-                                    tile_loader: x_planets_tiles::TileLoader::new(6),
-                                    pending_coords: std::collections::HashSet::new(),
-                                    terrain_data: x_planets_tiles::TileCache::new(256),
-                                    failed_cooldowns: std::collections::HashMap::new(),
-                                    min_zoom: 0,
-                                    max_zoom: 15,
-                                    tile_scale: 1.0,
-                                    geographic: false,
-                                    geo_heightmap_cache: std::collections::HashMap::new(),
-                                    available_coords_cache: std::collections::HashSet::new(),
-                                });
-                            }
-                        } else {
-                            // Remove terrain layer states
-                            self.layer_states.retain(|ls| {
-                                !matches!(ls.kind, x_planets_core::engine::LayerKind::Terrain { .. })
-                            });
-                        }
-                    }
-                    PhysicalKey::Code(KeyCode::Home) => {
-                        ctrl.engine.viewport.center =
-                            x_planets_math::GeoCoord::new(0.0, 0.0);
-                        ctrl.engine.viewport.zoom = 2.0;
-                        ctrl.engine.viewport.pitch = 0.0;
-                        ctrl.engine.viewport.bearing = 0.0;
-                        ctrl.anim.zoom_target = 2.0;
-                        ctrl.anim.pan_velocity = (0.0, 0.0);
-                        ctrl.engine.request_redraw();
-                    }
-                    _ => {}
-                }
-            }
-            self.window.as_ref().unwrap().request_redraw();
+        if event.state != ElementState::Pressed {
+            return;
         }
+
+        if let Some(ctrl) = &mut self.controller {
+            match event.physical_key {
+                // ── Pan (projection-aware via MapController::pan) ──
+                PhysicalKey::Code(KeyCode::ArrowLeft) => ctrl.pan(-PAN_AMOUNT, 0.0),
+                PhysicalKey::Code(KeyCode::ArrowRight) => ctrl.pan(PAN_AMOUNT, 0.0),
+                PhysicalKey::Code(KeyCode::ArrowUp) => ctrl.pan(0.0, -PAN_AMOUNT),
+                PhysicalKey::Code(KeyCode::ArrowDown) => ctrl.pan(0.0, PAN_AMOUNT),
+
+                // ── Zoom (animated) ──
+                PhysicalKey::Code(KeyCode::Equal) | PhysicalKey::Code(KeyCode::NumpadAdd) => {
+                    ctrl.anim.zoom_target += ZOOM_STEP;
+                    ctrl.anim.zoom_anchor = None;
+                }
+                PhysicalKey::Code(KeyCode::Minus) | PhysicalKey::Code(KeyCode::NumpadSubtract) => {
+                    ctrl.anim.zoom_target -= ZOOM_STEP;
+                    ctrl.anim.zoom_anchor = None;
+                }
+
+                // ── Rotate ──
+                PhysicalKey::Code(KeyCode::KeyQ) => ctrl.rotate(-KEYBOARD_ROTATE),
+                PhysicalKey::Code(KeyCode::KeyE) => ctrl.rotate(KEYBOARD_ROTATE),
+
+                // ── Projection cycle ──
+                PhysicalKey::Code(KeyCode::KeyP) => {
+                    let name = ctrl.cycle_projection();
+                    log::info!("Projection: {}", name);
+                }
+
+                // ── Terrain toggle (same as web KeyT) ──
+                PhysicalKey::Code(KeyCode::KeyT) => {
+                    // Must drop ctrl borrow before calling self.toggle_terrain()
+                }
+
+                // ── Reset view (same as web Home) ──
+                PhysicalKey::Code(KeyCode::Home) => {
+                    ctrl.set_center(0.0, 0.0);
+                    ctrl.set_zoom(2.0);
+                    ctrl.engine.viewport.pitch = 0.0;
+                    ctrl.engine.viewport.bearing = 0.0;
+                    ctrl.anim.zoom_target = 2.0;
+                    ctrl.anim.pan_velocity = (0.0, 0.0);
+                    ctrl.engine.request_redraw();
+                }
+
+                _ => return,
+            }
+        }
+
+        // Handle terrain toggle separately (needs &mut self, not &mut controller)
+        if event.physical_key == PhysicalKey::Code(KeyCode::KeyT) {
+            let enabled = self.toggle_terrain();
+            log::info!("Terrain: {}", if enabled { "ON" } else { "OFF" });
+        }
+
+        self.window.as_ref().unwrap().request_redraw();
     }
 
     pub(super) fn handle_mouse_input(&mut self, state: ElementState, button: MouseButton) {
@@ -115,27 +83,23 @@ impl NativeApp {
         match button {
             MouseButton::Left => {
                 if pressed {
-                    let now = Instant::now();
-                    let now_secs = self.now_secs(now);
-                    let current_pos = self.last_mouse_pos.unwrap_or((0.0, 0.0));
+                    let now_secs = self.now_secs(Instant::now());
+                    let pos = self.last_mouse_pos.unwrap_or((0.0, 0.0));
 
                     if let Some(ctrl) = &mut self.controller {
-                        if ctrl.check_double_click(current_pos.0, current_pos.1, now_secs) {
+                        // Double-click: smooth zoom in +1 level (same as web)
+                        if ctrl.anim.check_double_click(pos, now_secs) {
                             ctrl.anim.zoom_target += 1.0;
-                            ctrl.anim.zoom_anchor = Some(current_pos);
+                            ctrl.anim.zoom_anchor = Some(pos);
                         }
-                        ctrl.begin_drag();
+                        // Stop inertia when starting a new drag
+                        ctrl.anim.begin_drag();
                     }
                 } else {
                     // Mouse up: compute release velocity for inertia
                     let now_secs = self.now_secs(Instant::now());
                     if let Some(ctrl) = &mut self.controller {
-                        ctrl.end_drag(now_secs);
-                        if ctrl.anim.pan_velocity.0.abs() > 1.0
-                            || ctrl.anim.pan_velocity.1.abs() > 1.0
-                        {
-                            self.window.as_ref().unwrap().request_redraw();
-                        }
+                        ctrl.anim.compute_release_velocity(now_secs);
                     }
                     self.last_mouse_pos = None;
                 }
@@ -158,53 +122,50 @@ impl NativeApp {
     }
 
     pub(super) fn handle_cursor_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
-        let pos = (position.x, position.y);
+        let (x, y) = (position.x, position.y);
+        let now_secs = self.now_secs(Instant::now());
 
-        // Left-drag: pan
-        if self.mouse_pressed {
-            if let Some(last) = self.last_mouse_pos {
-                let dx = pos.0 - last.0;
-                let dy = pos.1 - last.1;
-                if let Some(ctrl) = &mut self.controller {
-                    let mode = ctrl.rendering_mode();
-                    ctrl.engine.pan_for_mode(dx, -dy, mode);
+        if let Some(ctrl) = &mut self.controller {
+            // Track mouse position for zoom anchor fallback (same as web)
+            ctrl.anim.last_mouse_pos = Some((x, y));
+
+            // Left-drag: pan (projection-aware via MapController::pan)
+            if self.mouse_pressed {
+                if let Some((lx, ly)) = self.last_mouse_pos {
+                    let dx = x - lx;
+                    let dy = y - ly;
+                    ctrl.pan(dx, -dy);
                 }
-                self.window.as_ref().unwrap().request_redraw();
+                // Record drag position for inertia velocity estimation
+                ctrl.anim.record_drag((x, y), now_secs);
             }
-            // Record sample for inertia velocity estimation
-            let now_secs = self.now_secs(Instant::now());
-            if let Some(ctrl) = &mut self.controller {
-                ctrl.record_drag(pos.0, pos.1, now_secs);
+
+            // Right-drag: pitch (vertical) + rotate (horizontal)
+            if self.right_mouse_pressed {
+                if let Some((lx, ly)) = self.last_right_pos {
+                    let dx = x - lx;
+                    let dy = y - ly;
+                    ctrl.pitch(-dy * PITCH_SENSITIVITY);
+                    ctrl.rotate(dx * ROTATE_SENSITIVITY);
+                }
+                self.last_right_pos = Some((x, y));
+            }
+
+            // Middle-drag: rotate
+            if self.middle_mouse_pressed {
+                if let Some(last_x) = self.last_rotate_x {
+                    let dx = x - last_x;
+                    ctrl.rotate(dx * ROTATE_SENSITIVITY);
+                }
+                self.last_rotate_x = Some(x);
             }
         }
 
-        // Right-drag: pitch (vertical) + rotate (horizontal)
-        if self.right_mouse_pressed {
-            if let Some(last) = self.last_right_pos {
-                let dx = pos.0 - last.0;
-                let dy = pos.1 - last.1;
-                if let Some(ctrl) = &mut self.controller {
-                    ctrl.engine.pitch(-dy * PITCH_SENSITIVITY);
-                    ctrl.engine.rotate(dx * ROTATE_SENSITIVITY);
-                }
-                self.window.as_ref().unwrap().request_redraw();
-            }
-            self.last_right_pos = Some(pos);
-        }
+        self.last_mouse_pos = Some((x, y));
 
-        // Middle-drag: rotate
-        if self.middle_mouse_pressed {
-            if let Some(last_x) = self.last_rotate_x {
-                let dx = pos.0 - last_x;
-                if let Some(ctrl) = &mut self.controller {
-                    ctrl.engine.rotate(dx * ROTATE_SENSITIVITY);
-                }
-                self.window.as_ref().unwrap().request_redraw();
-            }
-            self.last_rotate_x = Some(pos.0);
+        if self.mouse_pressed || self.right_mouse_pressed || self.middle_mouse_pressed {
+            self.window.as_ref().unwrap().request_redraw();
         }
-
-        self.last_mouse_pos = Some(pos);
     }
 
     pub(super) fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
@@ -214,11 +175,7 @@ impl NativeApp {
         };
         if let Some(ctrl) = &mut self.controller {
             ctrl.anim.zoom_target += scroll_y;
-            if let Some((mx, my)) = self.last_mouse_pos {
-                ctrl.anim.zoom_anchor = Some((mx, my));
-            } else {
-                ctrl.anim.zoom_anchor = None;
-            }
+            ctrl.anim.zoom_anchor = self.last_mouse_pos;
         }
         self.window.as_ref().unwrap().request_redraw();
     }
