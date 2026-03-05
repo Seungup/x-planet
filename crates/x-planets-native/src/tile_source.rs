@@ -64,6 +64,12 @@ pub(crate) struct NativeLayerState {
     pub geo_heightmap_cache: HashMap<(u32, u32, u8), GeoHeightmapEntry>,
     /// Cached set of available raster tile coords (rebuilt each frame).
     pub available_coords_cache: HashSet<TileCoord>,
+    /// Elevation tile source (set when terrain is toggled on for this raster layer).
+    pub elevation_source: Option<Arc<NativeTileSource>>,
+    /// Pending elevation tile fetches (separate from raster pending).
+    pub pending_elevation_coords: HashSet<TileCoord>,
+    /// Maximum concurrent elevation tile loads.
+    pub max_elevation_concurrent: usize,
 }
 
 impl NativeLayerState {

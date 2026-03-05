@@ -312,6 +312,44 @@ impl NativeApp {
                     });
                 }
             }
+
+            // ── Elevation loading (runtime terrain toggle) ──
+            // When terrain is enabled on a raster layer, spawn elevation
+            // fetch tasks using the separate elevation_source.
+            if let Some(elev_source) = &ls.elevation_source {
+                // Prune stale elevation requests
+                ls.pending_elevation_coords.retain(|c| visible_set.contains(c));
+
+                let elev_slots = ls.max_elevation_concurrent
+                    .saturating_sub(ls.pending_elevation_coords.len());
+                let mut elev_count = 0usize;
+                for vt in visible {
+                    if elev_count >= elev_slots { break; }
+                    let coord = vt.coord;
+                    if ls.terrain_data.contains(&coord)
+                        || ls.pending_elevation_coords.contains(&coord)
+                    {
+                        continue;
+                    }
+                    ls.pending_elevation_coords.insert(coord);
+                    let source = Arc::clone(elev_source);
+                    let tx = self.tile_tx.clone();
+                    let layer_name = ls.name.clone();
+                    self.rt.spawn(async move {
+                        let result = match source.fetch(coord).await {
+                            Ok(bytes) => {
+                                match TerrariumDecoder.decode(coord, &bytes).await {
+                                    Ok(d) => Ok(TileResult::Terrain(d)),
+                                    Err(e) => Err((coord, e.to_string())),
+                                }
+                            }
+                            Err(e) => Err((coord, e.to_string())),
+                        };
+                        let _ = tx.send(LayerTileResult { layer_name, result });
+                    });
+                    elev_count += 1;
+                }
+            }
         }
     }
 }
