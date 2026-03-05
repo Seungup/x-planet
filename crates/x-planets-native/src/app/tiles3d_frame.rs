@@ -159,7 +159,7 @@ impl NativeApp {
 
     /// Traverse initialized 3D Tiles layers, spawn loads, and render.
     pub(super) fn tiles3d_traverse_and_render(&mut self, view: &wgpu::TextureView) {
-        let engine = self.engine.as_ref().unwrap();
+        let engine = &self.controller.as_ref().unwrap().engine;
         for ts3d in &mut self.tiles3d_states {
             if !ts3d.is_initialized() {
                 continue;
