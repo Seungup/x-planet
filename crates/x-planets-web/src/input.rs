@@ -505,7 +505,8 @@ fn register_touch_events(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Projection button (created from lib.rs, updated here)
+// Button text updates (buttons are created by TypeScript, updated here
+// when keyboard shortcuts trigger projection/terrain changes)
 // ═══════════════════════════════════════════════════════════════════
 
 /// Update the projection button text to match the current projection.
@@ -523,51 +524,11 @@ fn update_altitude_button(enabled: bool) {
         if let Some(btn) = doc.get_element_by_id("alt-btn") {
             if enabled {
                 btn.set_text_content(Some("Terrain ON"));
-                let _ = btn.set_attribute("class", "active");
+                let _ = btn.set_attribute("class", "xp-btn active");
             } else {
                 btn.set_text_content(Some("Terrain OFF"));
-                let _ = btn.remove_attribute("class");
+                let _ = btn.set_attribute("class", "xp-btn");
             }
         }
     }
-}
-
-/// Set up the click listener on the altitude toggle button (called from lib.rs).
-pub fn setup_altitude_button(app: Rc<RefCell<WebApp>>) {
-    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
-        return;
-    };
-    let Some(btn) = doc.get_element_by_id("alt-btn") else {
-        return;
-    };
-
-    let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::Event| {
-        e.stop_propagation();
-        let mut app = app.borrow_mut();
-        let enabled = app.toggle_terrain();
-        update_altitude_button(enabled);
-    });
-    btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
-        .unwrap();
-    cb.forget();
-}
-
-/// Set up the click listener on the projection button (called from lib.rs).
-pub fn setup_projection_button(app: Rc<RefCell<WebApp>>) {
-    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
-        return;
-    };
-    let Some(btn) = doc.get_element_by_id("proj-btn") else {
-        return;
-    };
-
-    let cb = Closure::<dyn FnMut(_)>::new(move |e: web_sys::Event| {
-        e.stop_propagation();
-        let mut app = app.borrow_mut();
-        let name = app.cycle_projection();
-        update_projection_button(&name);
-    });
-    btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())
-        .unwrap();
-    cb.forget();
 }

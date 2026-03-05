@@ -8,5 +8,8 @@ Cargo.lock
 /pkg
 /web_viewer/dist
 /crates/x-planets-web/dist
+/web/pkg
+/web/node_modules
+/web/dist
 .claude/
 .env

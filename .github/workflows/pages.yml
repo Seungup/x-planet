@@ -40,18 +40,29 @@ jobs:
             echo "::warning::sccache unavailable, building without cache"
           fi
 
-      - name: Install trunk
-        uses: taiki-e/install-action@trunk
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
 
       - name: Build WASM
-        run: |
-          cd crates/x-planets-web
-          trunk build --release --public-url /x-planet/
+        run: wasm-pack build crates/x-planets-web --target web --out-dir ../../web/pkg
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install npm dependencies
+        run: cd web && npm ci
+
+      - name: Build frontend
+        run: cd web && npm run build
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: crates/x-planets-web/dist
+          path: web/dist
 
   deploy:
     needs: build
