@@ -18,6 +18,11 @@ impl NativeApp {
     pub(super) fn poll_tile_results(&mut self, now: Instant) {
         const MAX_TILES_PER_FRAME: usize = 4;
         let mut tiles_this_frame = 0;
+        let now_secs = now.duration_since(self.start_time).as_secs_f64();
+
+        // Collect raster tile coords to register fade-in after the loop
+        // (avoids borrow conflicts between layer_states and controller).
+        let mut raster_loaded_coords: Vec<x_planets_math::TileCoord> = Vec::new();
 
         let gpu = self.gpu.as_ref().unwrap();
         let tex_mgr = self.tex_manager.as_ref().unwrap();
@@ -31,9 +36,6 @@ impl NativeApp {
             if let Some(ls) = self.layer_states.iter_mut().find(|s| s.name == msg.layer_name) {
                 match msg.result {
                     Ok(TileResult::Raster(decoded)) => {
-                        // Only decrement active_count if tile was still tracked as
-                        // pending.  Stale tiles pruned during abort already freed
-                        // their concurrency slot.
                         if ls.pending_coords.remove(&decoded.coord) {
                             ls.tile_loader.complete();
                         }
@@ -43,7 +45,7 @@ impl NativeApp {
                             decoded.coord.z, decoded.coord.x, decoded.coord.y,
                             decoded.width, decoded.height,
                         );
-                        self.anim.tile_fade_start.insert(decoded.coord, now);
+                        raster_loaded_coords.push(decoded.coord);
                         let tex = tex_mgr.create_rgba_texture(
                             &gpu.device, &gpu.queue,
                             &format!("{}-tile-{}-{}-{}", ls.name,
@@ -338,6 +340,15 @@ impl NativeApp {
                             ls.name, coord, cooldown_secs, err_msg,
                         );
                     }
+                }
+            }
+        }
+
+        // Register fade-in for loaded raster tiles via MapController
+        if !raster_loaded_coords.is_empty() {
+            if let Some(ctrl) = &mut self.controller {
+                for coord in raster_loaded_coords {
+                    ctrl.register_tile_loaded(coord, now_secs);
                 }
             }
         }

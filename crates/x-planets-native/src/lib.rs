@@ -6,7 +6,6 @@
 //! Supports raster, terrain, and OGC 3D Tiles layers.
 
 pub mod config;
-mod animation;
 mod app;
 mod tile_source;
 mod tilejson;

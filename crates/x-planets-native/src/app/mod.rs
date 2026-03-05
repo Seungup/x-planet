@@ -2,10 +2,13 @@
 //!
 //! The `NativeApp` struct and `ApplicationHandler` implementation that drives
 //! rendering.  Sub-modules split the logic into focused responsibilities.
+//!
+//! Uses `MapController` from `x_planets_core` — the same controller used by the
+//! web platform — for unified animation, camera, layer management, and
+//! render-data assembly.
 
 mod init;
 mod input;
-mod render_layers;
 mod tile_loading;
 mod tile_upload;
 mod tiles3d_frame;
@@ -22,11 +25,11 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 use x_planets_core::engine::MapConfig;
-use x_planets_core::{MapEngine, Model3dRenderer, TerrainRenderer, TileRenderer};
+use x_planets_core::map_controller::LayerStateView;
+use x_planets_core::{MapController, Model3dRenderer, TerrainRenderer, TileRenderer};
 use x_planets_gpu::{GpuContext, TextureManager};
 use x_planets_math::TileCoord;
 
-use crate::animation::AnimationState;
 use crate::tile_source::{LayerTileResult, NativeLayerState};
 use crate::tiles3d_native::{Tiles3dLayerState, Tiles3dMessage};
 
@@ -39,6 +42,7 @@ use crate::tiles3d_native::{Tiles3dLayerState, Tiles3dMessage};
 ///   Right-drag (up/down)          — pitch (tilt)
 ///   Middle-drag (left/right)      — rotate (bearing)
 ///   Q / E keys                    — rotate left / right
+///   T key                         — toggle terrain
 ///   Home                          — reset view
 pub fn run_native(config: MapConfig) -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -58,7 +62,7 @@ pub fn run_native(config: MapConfig) -> Result<(), Box<dyn std::error::Error>> {
         config,
         window: None,
         gpu: None,
-        engine: None,
+        controller: None,
         renderer: None,
         terrain_renderer: None,
         model3d_renderer: None,
@@ -73,9 +77,8 @@ pub fn run_native(config: MapConfig) -> Result<(), Box<dyn std::error::Error>> {
         rt,
         tile_tx,
         tile_rx,
-        // Animation
-        anim: AnimationState::new(2.0), // will be re-initialized in resumed()
         // Frame timing
+        start_time: Instant::now(),
         last_frame_time: None,
         frame_count: 0,
         fps_update_time: None,
@@ -92,49 +95,49 @@ pub fn run_native(config: MapConfig) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct NativeApp {
+pub(crate) struct NativeApp {
     config: MapConfig,
-    window: Option<Arc<Window>>,
-    gpu: Option<GpuContext>,
-    engine: Option<MapEngine>,
-    renderer: Option<TileRenderer>,
-    terrain_renderer: Option<TerrainRenderer>,
-    model3d_renderer: Option<Model3dRenderer>,
-    tex_manager: Option<TextureManager>,
+    pub(super) window: Option<Arc<Window>>,
+    pub(super) gpu: Option<GpuContext>,
+    /// Unified map controller (same as web platform).
+    pub(super) controller: Option<MapController>,
+    pub(super) renderer: Option<TileRenderer>,
+    pub(super) terrain_renderer: Option<TerrainRenderer>,
+    pub(super) model3d_renderer: Option<Model3dRenderer>,
+    pub(super) tex_manager: Option<TextureManager>,
     /// Per-layer tile source, texture cache, loader, pending set.
-    layer_states: Vec<NativeLayerState>,
+    pub(super) layer_states: Vec<NativeLayerState>,
     // ── 3D Tiles state ──
-    tiles3d_states: Vec<Tiles3dLayerState>,
-    tiles3d_tx: mpsc::Sender<Tiles3dMessage>,
-    tiles3d_rx: mpsc::Receiver<Tiles3dMessage>,
+    pub(super) tiles3d_states: Vec<Tiles3dLayerState>,
+    pub(super) tiles3d_tx: mpsc::Sender<Tiles3dMessage>,
+    pub(super) tiles3d_rx: mpsc::Receiver<Tiles3dMessage>,
     // Shared async tile channel (results tagged with layer name)
-    rt: tokio::runtime::Runtime,
-    tile_tx: mpsc::Sender<LayerTileResult>,
+    pub(super) rt: tokio::runtime::Runtime,
+    pub(super) tile_tx: mpsc::Sender<LayerTileResult>,
     tile_rx: mpsc::Receiver<LayerTileResult>,
-    // Animation state
-    anim: AnimationState,
-    // Frame timing
+    // ── Timing ──
+    /// Reference epoch for converting Instant → f64 seconds.
+    pub(super) start_time: Instant,
     last_frame_time: Option<Instant>,
     frame_count: u32,
     fps_update_time: Option<Instant>,
     // Left-click drag: pan
-    mouse_pressed: bool,
-    last_mouse_pos: Option<(f64, f64)>,
+    pub(super) mouse_pressed: bool,
+    pub(super) last_mouse_pos: Option<(f64, f64)>,
     // Right-click drag: pitch (vertical) + rotate (horizontal)
-    right_mouse_pressed: bool,
-    last_right_pos: Option<(f64, f64)>,
+    pub(super) right_mouse_pressed: bool,
+    pub(super) last_right_pos: Option<(f64, f64)>,
     // Middle-click drag: rotate (bearing, alternative)
-    middle_mouse_pressed: bool,
-    last_rotate_x: Option<f64>,
+    pub(super) middle_mouse_pressed: bool,
+    pub(super) last_rotate_x: Option<f64>,
 }
 
 impl NativeApp {
-    fn resolve_projection_mode(&self) -> x_planets_math::ProjectionMode {
-        match self.engine.as_ref() {
-            Some(engine) => engine.rendering_mode(),
-            None => x_planets_math::ProjectionMode::Mercator,
-        }
+    /// Convert an Instant to f64 seconds since app start (for AnimationController).
+    pub(super) fn now_secs(&self, instant: Instant) -> f64 {
+        instant.duration_since(self.start_time).as_secs_f64()
     }
+
 }
 
 impl ApplicationHandler for NativeApp {
@@ -144,7 +147,7 @@ impl ApplicationHandler for NativeApp {
         }
 
         let attrs = WindowAttributes::default()
-            .with_title("x-planets — Arrows: pan | +/-: zoom | RMB: pitch | MMB/Q/E: rotate")
+            .with_title("x-planets — Arrows: pan | +/-: zoom | RMB: pitch | MMB/Q/E: rotate | T: terrain")
             .with_inner_size(winit::dpi::PhysicalSize::new(800, 600));
 
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
@@ -174,25 +177,22 @@ impl ApplicationHandler for NativeApp {
         // ── TextureManager (creates per-tile label textures on demand) ──
         let tex_manager = TextureManager::new(&gpu.device);
 
-        // ── MapEngine ──
+        // ── MapController (unified: same as web platform) ──
         let config = std::mem::take(&mut self.config);
-        let engine = MapEngine::new(config, size.width, size.height);
-
-        // ── Animation state (sync zoom target with engine) ──
-        self.anim = AnimationState::new(engine.viewport.zoom);
+        let controller = MapController::new(config, size.width, size.height);
 
         // ── Per-layer GPU state (raster + terrain) ──
-        self.layer_states = init::init_layer_states(&self.rt, &engine);
+        self.layer_states = init::init_layer_states(&self.rt, &controller.engine);
 
         // ── Per-layer 3D Tiles state ──
-        self.tiles3d_states = init::init_tiles3d_states(&engine);
+        self.tiles3d_states = init::init_tiles3d_states(&controller.engine);
 
         log::info!(
             "Engine ready: {} layers, center=({:.2},{:.2}) zoom={:.1}",
-            engine.layers.len(),
-            engine.viewport.center.lat,
-            engine.viewport.center.lon,
-            engine.viewport.zoom,
+            controller.engine.layers.len(),
+            controller.engine.viewport.center.lat,
+            controller.engine.viewport.center.lon,
+            controller.engine.viewport.zoom,
         );
 
         self.gpu = Some(gpu);
@@ -200,7 +200,8 @@ impl ApplicationHandler for NativeApp {
         self.terrain_renderer = Some(terrain_renderer);
         self.model3d_renderer = Some(model3d_renderer);
         self.tex_manager = Some(tex_manager);
-        self.engine = Some(engine);
+        self.controller = Some(controller);
+        self.start_time = Instant::now();
     }
 
     fn window_event(
@@ -217,7 +218,6 @@ impl ApplicationHandler for NativeApp {
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize_surface(size.width, size.height);
-                    // Resize depth texture alongside surface.
                     if let Some(renderer) = &mut self.renderer {
                         renderer.resize(&gpu.device, size.width, size.height);
                     }
@@ -228,8 +228,8 @@ impl ApplicationHandler for NativeApp {
                         model3d_renderer.resize(&gpu.device, size.width, size.height);
                     }
                 }
-                if let Some(engine) = &mut self.engine {
-                    engine.resize(size.width, size.height);
+                if let Some(ctrl) = &mut self.controller {
+                    ctrl.resize(size.width, size.height);
                 }
                 self.window.as_ref().unwrap().request_redraw();
             }
@@ -256,7 +256,7 @@ impl ApplicationHandler for NativeApp {
 impl NativeApp {
     fn render_frame(&mut self) {
         if self.gpu.is_none()
-            || self.engine.is_none()
+            || self.controller.is_none()
             || self.renderer.is_none()
             || self.tex_manager.is_none()
         {
@@ -265,21 +265,18 @@ impl NativeApp {
 
         // ── 1. Frame timing ──
         let now = Instant::now();
+        let now_secs = self.now_secs(now);
         let dt = self
             .last_frame_time
             .map(|t| now.duration_since(t).as_secs_f64())
             .unwrap_or(1.0 / 60.0)
-            .min(0.1); // clamp: 100ms max (prevents jump after tab switch)
+            .min(0.1);
         self.last_frame_time = Some(now);
 
-        // ── 2. Tick animations (needs mutable engine) ──
-        {
-            let mode = self.resolve_projection_mode();
-            let engine = self.engine.as_mut().unwrap();
-            self.anim.tick_zoom_for_mode(engine, dt, mode);
-            self.anim.tick_pan_for_mode(engine, dt, mode);
-        }
-        self.anim.gc_fades(now);
+        // ── 2. Tick animations via MapController (same as web) ──
+        let ctrl = self.controller.as_mut().unwrap();
+        ctrl.tick(dt);
+        ctrl.gc_fades(now_secs);
 
         // ── 3. Surface setup ──
         let (frame, view) = {
@@ -305,54 +302,33 @@ impl NativeApp {
         };
 
         // ── 4. Per-layer async tile loading pipeline ──
-        let proj_mode_for_tiles = self.resolve_projection_mode();
-        let visible = self.engine.as_ref().unwrap().viewport.visible_tiles_for_mode(proj_mode_for_tiles);
-        let camera_center =
-            x_planets_math::geo_to_mercator(&self.engine.as_ref().unwrap().viewport.center);
+        let ctrl = self.controller.as_ref().unwrap();
+        let visible = ctrl.visible_tiles();
+        let camera_center = x_planets_math::geo_to_mercator(&ctrl.engine.viewport.center);
         let visible_set: HashSet<TileCoord> = visible.iter().map(|vt| vt.coord).collect();
 
         self.run_tile_loading(&visible, &visible_set, camera_center, now);
         self.poll_tile_results(now);
 
-        // ── 4b. Tile visibility tracking (shared core logic) ──
-        // Register fade-in for cached tiles newly entering viewport and
-        // track departing tiles for zoom-out fade-out.
+        // ── 4a. Refresh available coords caches ──
+        for ls in &mut self.layer_states {
+            ls.refresh_available_cache();
+        }
+
+        // ── 4b. Tile visibility tracking via MapController ──
         {
             let mut all_available: HashSet<TileCoord> = HashSet::new();
             for ls in &self.layer_states {
-                for coord in ls.tile_textures.keys() {
+                for coord in &ls.available_coords_cache {
                     all_available.insert(*coord);
                 }
             }
-            let now_secs = self.anim.to_secs_f64(now);
-            let prev = std::mem::take(&mut self.anim.prev_visible_available);
-            // Split borrows: fade_start is read by fade_elapsed_fn and
-            // written by register_fade_fn, departing_tiles is separate.
-            let fade_start = &self.anim.tile_fade_start;
-            let departing = &mut self.anim.departing_tiles;
-            let mut to_register: Vec<TileCoord> = Vec::new();
-            let new_prev = x_planets_core::interaction::update_tile_visibility(
-                &visible,
-                &all_available,
-                &prev,
-                |coord| fade_start.get(coord).map(|&s| now.duration_since(s).as_secs_f64()),
-                |coord| to_register.push(coord),
-                departing,
-                now_secs,
-            );
-            for coord in to_register {
-                self.anim.tile_fade_start.insert(coord, now);
-            }
-            self.anim.prev_visible_available = new_prev;
+            let ctrl = self.controller.as_mut().unwrap();
+            ctrl.update_visibility(&visible, &all_available, now_secs);
         }
 
-        // ── 5. LRU bump all layers (mutable pass) ──
-        // Bump visible tiles AND their fallback ancestors to prevent
-        // parent tiles from being evicted while still needed as fallback
-        // coverage for unloaded children.
+        // ── 5. LRU bump all layers ──
         for ls in &mut self.layer_states {
-            // Always bump base tiles (z=0, z=1) to prevent LRU eviction.
-            // These provide global fallback coverage for all tiles.
             {
                 let base_max = 1u8.min(ls.max_zoom);
                 for z in ls.min_zoom..=base_max {
@@ -370,62 +346,72 @@ impl NativeApp {
                 let coord = vt.coord;
                 let _ = ls.tile_textures.get(&coord);
                 let _ = ls.terrain_data.get(&coord);
-                // Also bump ancestor tiles that might serve as fallbacks
                 let mut parent = coord.parent();
                 while let Some(p) = parent {
                     let tex_found = ls.tile_textures.get(&p).is_some();
                     let _ = ls.terrain_data.get(&p);
                     if tex_found {
-                        break; // bumped — ancestors above are even older, skip
+                        break;
                     }
                     parent = p.parent();
                 }
             }
         }
 
-        // ── 6. Build RenderLayerData for each visible layer (immutable pass) ──
-        // ── 7. Render (raster first, then terrain on top) ──
+        // ── 6. Build render data via MapController (same as web) ──
+        // ── 7. Render ──
         {
-            let (render_layers, terrain_layers, terrain_overlay_layers) =
-                render_layers::build_all_layers(
-                    self.engine.as_ref().unwrap(),
-                    &self.layer_states,
-                    &self.anim,
-                    &visible,
-                    now,
-                );
+            let ctrl = self.controller.as_ref().unwrap();
+            let layer_view_refs: Vec<&dyn LayerStateView> = self
+                .layer_states
+                .iter()
+                .map(|ls| ls as &dyn LayerStateView)
+                .collect();
+
+            let render_output = ctrl.build_render_data(
+                &layer_view_refs,
+                &|layer_name, coord| {
+                    self.layer_states
+                        .iter()
+                        .find(|ls| ls.name == layer_name)
+                        .and_then(|ls| ls.tile_textures.peek(coord))
+                        .map(|tex| &tex.view)
+                },
+                &visible,
+                now_secs,
+            );
 
             let renderer = self.renderer.as_ref().unwrap();
             let gpu = self.gpu.as_ref().unwrap();
-            let engine = self.engine.as_ref().unwrap();
 
-            let proj_mode = engine.rendering_mode();
-            renderer.render_frame_layered_projected(gpu, &view, &engine.viewport, &render_layers, proj_mode);
+            let proj_mode = ctrl.rendering_mode();
+            renderer.render_frame_layered_projected(
+                gpu,
+                &view,
+                &ctrl.engine.viewport,
+                &render_output.raster_layers,
+                proj_mode,
+            );
 
-            // Render terrain layers (displaced meshes) on top of raster
-            if !terrain_layers.is_empty() || !terrain_overlay_layers.is_empty() {
+            // Render terrain layers on top of raster
+            if !render_output.terrain_layers.is_empty()
+                || !render_output.terrain_overlay_layers.is_empty()
+            {
                 if let Some(terrain_renderer) = &mut self.terrain_renderer {
-                    // Base terrain pass: parent fallback imagery for stable coverage.
-                    if !terrain_layers.is_empty() {
+                    if !render_output.terrain_layers.is_empty() {
                         terrain_renderer.render_terrain_layered(
                             gpu,
                             &view,
-                            &engine.viewport,
-                            &terrain_layers,
+                            &ctrl.engine.viewport,
+                            &render_output.terrain_layers,
                         );
                     }
-                    // Cross-fade overlay pass: child imagery fading in.
-                    // Must be a SEPARATE call because the mesh cache has
-                    // one uniform buffer per tile coord — the overlay needs
-                    // different uniform values (child texture + fade opacity)
-                    // for the same coords.  Separate submission ensures the
-                    // base pass uniforms are consumed before being overwritten.
-                    if !terrain_overlay_layers.is_empty() {
+                    if !render_output.terrain_overlay_layers.is_empty() {
                         terrain_renderer.render_terrain_layered(
                             gpu,
                             &view,
-                            &engine.viewport,
-                            &terrain_overlay_layers,
+                            &ctrl.engine.viewport,
+                            &render_output.terrain_overlay_layers,
                         );
                     }
                 }
@@ -439,20 +425,20 @@ impl NativeApp {
 
         frame.present();
 
-        // ── 8. FPS counter (update window title every 500ms) ──
-        let engine = self.engine.as_ref().unwrap();
+        // ── 8. FPS counter ──
+        let ctrl = self.controller.as_ref().unwrap();
         self.frame_count += 1;
         let fps_elapsed = self
             .fps_update_time
             .map(|t| now.duration_since(t).as_secs_f64())
-            .unwrap_or(1.0); // trigger immediately on first frame
+            .unwrap_or(1.0);
         if fps_elapsed >= 0.5 {
             let fps = self.frame_count as f64 / fps_elapsed;
             if let Some(window) = &self.window {
                 window.set_title(&format!(
                     "x-planets — {:.0} FPS | z={:.1} | {} tiles",
                     fps,
-                    engine.viewport.zoom,
+                    ctrl.engine.viewport.zoom,
                     visible.len(),
                 ));
             }
@@ -470,7 +456,7 @@ impl NativeApp {
         });
         if any_pending
             || any_tiles3d_pending
-            || self.anim.is_animating(engine.viewport.zoom)
+            || ctrl.needs_redraw()
         {
             self.window.as_ref().unwrap().request_redraw();
         }

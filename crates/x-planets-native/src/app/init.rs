@@ -114,6 +114,7 @@ pub(super) fn init_layer_states(
                 tile_scale: meta.scale,
                 geographic: meta.geographic,
                 geo_heightmap_cache: HashMap::new(),
+                available_coords_cache: HashSet::new(),
             }
         })
         .collect()

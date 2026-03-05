@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use x_planets_core::engine::LayerKind;
+use x_planets_core::map_controller::LayerStateView;
 use x_planets_core::TerrainTileData;
 use x_planets_gpu::GpuTexture;
 use x_planets_math::TileCoord;
@@ -61,6 +62,29 @@ pub(crate) struct NativeLayerState {
     /// function can look up both heightmaps from this cache to produce a
     /// seamless 3857 heightmap without cliff walls.
     pub geo_heightmap_cache: HashMap<(u32, u32, u8), GeoHeightmapEntry>,
+    /// Cached set of available raster tile coords (rebuilt each frame).
+    pub available_coords_cache: HashSet<TileCoord>,
+}
+
+impl NativeLayerState {
+    /// Refresh the cached available coords set from tile_textures.
+    pub fn refresh_available_cache(&mut self) {
+        self.available_coords_cache = self.tile_textures.keys().copied().collect();
+    }
+}
+
+impl LayerStateView for NativeLayerState {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn available_raster_coords(&self) -> &HashSet<TileCoord> {
+        &self.available_coords_cache
+    }
+
+    fn terrain_tile_data(&self, coord: &TileCoord) -> Option<&TerrainTileData> {
+        self.terrain_data.peek(coord)
+    }
 }
 
 /// Native HTTP-based tile source using reqwest.
