@@ -1,0 +1,78 @@
+* {
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #1a2640;
+}
+
+canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+}
+
+/* Shared glassmorphism button style */
+.xp-btn {
+  position: fixed;
+  right: 20px;
+  min-width: 48px;
+  min-height: 48px;
+  padding: 10px 16px;
+  border: none;
+  border-radius: 24px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 13px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  z-index: 1000;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: background 0.15s;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.xp-btn:hover {
+  background: rgba(0, 0, 0, 0.7);
+}
+.xp-btn:active {
+  background: rgba(0, 0, 0, 0.85);
+  transform: scale(0.95);
+}
+
+/* Projection button — bottom-right */
+#proj-btn {
+  bottom: 20px;
+}
+
+/* Altitude button — stacked above projection */
+#alt-btn {
+  bottom: 80px;
+}
+#alt-btn.active {
+  background: rgba(40, 120, 200, 0.7);
+}
+#alt-btn.active:hover {
+  background: rgba(40, 120, 200, 0.85);
+}
+
+/* Safe area inset for notched phones */
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  #proj-btn {
+    bottom: calc(20px + env(safe-area-inset-bottom));
+  }
+  #alt-btn {
+    bottom: calc(80px + env(safe-area-inset-bottom));
+  }
+}

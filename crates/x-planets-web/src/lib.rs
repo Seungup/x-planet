@@ -79,12 +79,6 @@ mod web_impl {
         // ── Input events ──
         crate::input::register_events(&canvas, std::rc::Rc::clone(&app));
 
-        // ── Projection switcher button ──
-        crate::input::setup_projection_button(std::rc::Rc::clone(&app));
-
-        // ── Altitude toggle button ──
-        crate::input::setup_altitude_button(std::rc::Rc::clone(&app));
-
         // ── Start render loop ──
         WebApp::start_render_loop(std::rc::Rc::clone(&app));
 
@@ -97,6 +91,11 @@ mod web_impl {
             &JsValue::from_str("xplanets"),
             &xplanets.into(),
         )?;
+
+        // ── Notify TypeScript that the API is ready ──
+        let event = web_sys::CustomEvent::new("xplanets-ready")
+            .map_err(|e| JsValue::from_str(&format!("Event error: {:?}", e)))?;
+        window.dispatch_event(&event)?;
 
         log::info!("x-planets web started!");
         Ok(())
