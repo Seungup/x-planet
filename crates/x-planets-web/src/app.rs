@@ -56,6 +56,8 @@ pub(crate) struct WebLayerState {
     /// Pending elevation tile fetches (separate from raster pending).
     pub pending_elevation_coords: HashSet<TileCoord>,
     pub max_elevation_concurrent: usize,
+    /// Failed elevation tile fetches (separate from raster failures).
+    pub failed_elevation_queue: Rc<RefCell<Vec<TileCoord>>>,
 }
 
 impl WebLayerState {
@@ -74,6 +76,7 @@ impl WebLayerState {
             elevation_url: None,
             pending_elevation_coords: HashSet::new(),
             max_elevation_concurrent: 4,
+            failed_elevation_queue: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -355,9 +358,13 @@ impl WebApp {
 
     fn upload_completed_tiles(&mut self, now_secs: f64) {
         for ls in &mut self.layer_states {
-            // Drain failed fetch notifications
+            // Drain failed raster fetch notifications
             for coord in ls.failed_queue.borrow_mut().drain(..) {
                 ls.pending_coords.remove(&coord);
+            }
+            // Drain failed elevation fetch notifications
+            for coord in ls.failed_elevation_queue.borrow_mut().drain(..) {
+                ls.pending_elevation_coords.remove(&coord);
             }
 
             // Drain completed results
@@ -524,7 +531,7 @@ fn request_elevation_tiles(
     for (coord, _) in missing.into_iter().take(slots) {
         ls.pending_elevation_coords.insert(coord);
         let queue = Rc::clone(&ls.completed_queue);
-        let failed = Rc::clone(&ls.failed_queue);
+        let failed = Rc::clone(&ls.failed_elevation_queue);
         let url = tile_url(elev_url_template, &coord);
 
         wasm_bindgen_futures::spawn_local(async move {

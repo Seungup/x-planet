@@ -471,8 +471,10 @@ impl TerrainRenderer {
         let uniforms = viewport.to_uniforms();
         gpu.update_buffer(&self.viewport_buffer, &uniforms);
 
-        // Compute f64 VP for per-tile MVP (eliminates high-zoom jitter)
-        let vp_f64 = viewport.to_view_proj_f64();
+        // Compute f64 VP for per-tile MVP (eliminates high-zoom jitter).
+        // Use terrain-specific VP centered on the actual geographic center,
+        // NOT the fixed (0.5, 0.5) used by the raster renderer's centered Mercator.
+        let vp_f64 = viewport.to_terrain_view_proj_f64();
 
         // Track which tiles are rendered this frame for cache eviction.
         let mut rendered_coords = HashSet::new();

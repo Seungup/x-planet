@@ -65,6 +65,52 @@ impl super::Viewport {
         flip_x * proj * view
     }
 
+    /// Compute the f64 VP matrix centered on the viewport's actual geographic center.
+    ///
+    /// Unlike [`to_view_proj_f64`] (which maps the viewport center to a fixed
+    /// (0.5, 0.5) for use with oblique-Mercator re-projected tile meshes), this
+    /// method places the camera over the *real* Mercator center.  Use this for
+    /// renderers whose meshes live in standard Mercator space (e.g. terrain).
+    pub fn to_terrain_view_proj_f64(&self) -> glam::DMat4 {
+        let center_merc = geo_to_mercator(&self.center);
+        let cx = center_merc.x;
+        let cy = center_merc.y;
+
+        let scale = 2.0_f64.powf(self.zoom);
+        let aspect = self.width as f64 / self.height as f64;
+        let half_h = 1.0 / scale;
+
+        let fov_y: f64 = std::f64::consts::FRAC_PI_3; // 60°
+        let cam_h = half_h / (fov_y * 0.5).tan();
+
+        let pitch_rad = self.pitch.to_radians();
+        let bearing_rad = self.bearing.to_radians();
+        let sin_b = bearing_rad.sin();
+        let cos_b = bearing_rad.cos();
+
+        let up = glam::DVec3::new(sin_b, -cos_b, 0.0);
+
+        let eye = glam::DVec3::new(
+            cx - sin_b * cam_h * pitch_rad.sin(),
+            cy + cos_b * cam_h * pitch_rad.sin(),
+            cam_h * pitch_rad.cos(),
+        );
+        let target = glam::DVec3::new(cx, cy, 0.0);
+
+        let view = glam::DMat4::look_at_rh(eye, target, up);
+        let far_mult = if pitch_rad > 0.01 {
+            4.0 + 8.0 * pitch_rad.sin()
+        } else {
+            4.0
+        };
+        let near = cam_h * 0.1;
+        let far = cam_h * far_mult;
+        let proj = glam::DMat4::perspective_rh(fov_y, aspect, near, far);
+
+        let flip_x = glam::DMat4::from_diagonal(glam::DVec4::new(-1.0, 1.0, 1.0, 1.0));
+        flip_x * proj * view
+    }
+
     /// Compute the globe view-projection matrix in f64.
     ///
     /// Orbital camera around a unit sphere.  The camera looks at the surface
