@@ -15,9 +15,10 @@ use x_planets_core::interaction::{
 use x_planets_core::pipeline::{resolve_fallbacks, RenderableTile};
 use x_planets_core::render::RenderLayerData;
 use x_planets_core::TileRenderer;
+use x_planets_core::{TerrainLayerData, TerrainRenderer, TerrainTileData};
 use x_planets_gpu::{GpuContext, GpuTexture, TextureManager};
 use x_planets_math::{TileCoord, VisibleTile};
-use x_planets_tiles::{RasterTileDecoder, TileCache, TileDecoder};
+use x_planets_tiles::{RasterTileDecoder, TerrariumDecoder, TileCache, TileDecoder};
 use wasm_bindgen_futures::JsFuture;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -31,6 +32,14 @@ struct CompletedTile {
     pixels: Vec<u8>,
 }
 
+/// Completed elevation tile (produced by async fetch, consumed each frame).
+struct CompletedElevation {
+    coord: TileCoord,
+    elevation: Vec<f32>,
+    width: u32,
+    height: u32,
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // WebApp
 // ═══════════════════════════════════════════════════════════════════
@@ -39,6 +48,7 @@ pub struct WebApp {
     pub gpu: GpuContext,
     pub engine: MapEngine,
     renderer: TileRenderer,
+    terrain_renderer: TerrainRenderer,
     tex_manager: TextureManager,
     canvas: web_sys::HtmlCanvasElement,
     dpr: f64,
@@ -53,6 +63,20 @@ pub struct WebApp {
     /// Failed fetch notifications (coord pushed from async task, drained each frame).
     failed_queue: Rc<RefCell<Vec<TileCoord>>>,
     max_concurrent: usize,
+
+    // ── Terrain state ──
+    /// Whether terrain rendering is enabled (toggled by the user).
+    pub terrain_enabled: bool,
+    /// Elevation URL template (Terrarium tiles, free, no API key).
+    elev_url_template: String,
+    /// Cached elevation data per tile.
+    elevation_data: TileCache<TerrainTileData>,
+    /// Pending elevation tile fetches.
+    pending_elev: HashSet<TileCoord>,
+    /// Completed elevation tile results (produced by async fetch).
+    completed_elev_queue: Rc<RefCell<Vec<CompletedElevation>>>,
+    /// Failed elevation fetch notifications.
+    failed_elev_queue: Rc<RefCell<Vec<TileCoord>>>,
 
     // ── Shared animation controller (from x-planets-core) ──
     pub anim: AnimationController,
@@ -72,6 +96,7 @@ impl WebApp {
         gpu: GpuContext,
         engine: MapEngine,
         renderer: TileRenderer,
+        terrain_renderer: TerrainRenderer,
         tex_manager: TextureManager,
         canvas: web_sys::HtmlCanvasElement,
         dpr: f64,
@@ -90,6 +115,7 @@ impl WebApp {
             gpu,
             engine,
             renderer,
+            terrain_renderer,
             tex_manager,
             canvas,
             dpr,
@@ -101,6 +127,12 @@ impl WebApp {
             completed_queue: Rc::new(RefCell::new(Vec::new())),
             failed_queue: Rc::new(RefCell::new(Vec::new())),
             max_concurrent: 6,
+            terrain_enabled: false,
+            elev_url_template: "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png".into(),
+            elevation_data: TileCache::new(256),
+            pending_elev: HashSet::new(),
+            completed_elev_queue: Rc::new(RefCell::new(Vec::new())),
+            failed_elev_queue: Rc::new(RefCell::new(Vec::new())),
             anim: AnimationController::new(initial_zoom),
             last_frame_ms: None,
             prev_visible_available: HashSet::new(),
@@ -114,6 +146,13 @@ impl WebApp {
     /// the active projection in the registry.
     pub(crate) fn resolve_projection_mode(&self) -> x_planets_math::ProjectionMode {
         self.engine.rendering_mode()
+    }
+
+    /// Toggle terrain rendering on/off. Returns the new state.
+    pub fn toggle_terrain(&mut self) -> bool {
+        self.terrain_enabled = !self.terrain_enabled;
+        log::info!("Terrain: {}", if self.terrain_enabled { "ON" } else { "OFF" });
+        self.terrain_enabled
     }
 
     /// Cycle to the next projection and return its name.
@@ -288,6 +327,11 @@ impl WebApp {
         self.renderer
             .render_frame_layered_projected(&self.gpu, &view, &self.engine.viewport, &layers, mode);
 
+        // ── Terrain rendering (when enabled) ──
+        if self.terrain_enabled {
+            self.render_terrain(&view, &visible);
+        }
+
         frame.present();
 
         // ── 6. LRU bump visible tiles + base tiles ──
@@ -316,6 +360,7 @@ impl WebApp {
             self.gpu.resize_surface(w, h);
             self.engine.resize(w, h);
             self.renderer.resize(&self.gpu.device, w, h);
+            self.terrain_renderer.resize(&self.gpu.device, w, h);
             self.last_width = w;
             self.last_height = h;
             log::info!("Resized: {}x{}", w, h);
@@ -343,6 +388,24 @@ impl WebApp {
             self.tile_textures.insert(tile.coord, gpu_tex);
             // Register for fade-in animation
             self.anim.register_tile_loaded(tile.coord, now_secs);
+        }
+
+        // Upload completed elevation tiles.
+        for coord in self.failed_elev_queue.borrow_mut().drain(..) {
+            self.pending_elev.remove(&coord);
+        }
+        let completed_elev: Vec<CompletedElevation> =
+            self.completed_elev_queue.borrow_mut().drain(..).collect();
+        for elev in completed_elev {
+            self.pending_elev.remove(&elev.coord);
+            self.elevation_data.insert(
+                elev.coord,
+                TerrainTileData::Heightmap {
+                    elevation: elev.elevation,
+                    width: elev.width,
+                    height: elev.height,
+                },
+            );
         }
     }
 
@@ -429,6 +492,123 @@ impl WebApp {
                 }
             });
         }
+
+        // ── Elevation tile loading (only when terrain is enabled) ──
+        if self.terrain_enabled {
+            self.request_missing_elevation(&visible);
+        }
+    }
+
+    fn request_missing_elevation(&mut self, visible: &[VisibleTile]) {
+        let visible_set: HashSet<TileCoord> = visible.iter().map(|vt| vt.coord).collect();
+        self.pending_elev.retain(|c| c.z <= 1 || visible_set.contains(c));
+
+        let camera_center = x_planets_math::geo_to_mercator(&self.engine.viewport.center);
+
+        let mut missing: Vec<(TileCoord, f64)> = Vec::new();
+
+        // Deduplicate and sort by distance
+        let mut seen = HashSet::new();
+        let mut visible_missing: Vec<(TileCoord, f64)> = visible
+            .iter()
+            .filter(|vt| {
+                !self.elevation_data.contains(&vt.coord)
+                    && !self.pending_elev.contains(&vt.coord)
+                    && seen.insert(vt.coord)
+            })
+            .map(|vt| {
+                let center = vt.display_mercator_center();
+                let dist = (center - camera_center).length();
+                (vt.coord, dist)
+            })
+            .collect();
+        visible_missing.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        missing.extend(visible_missing);
+
+        let slots = self.max_concurrent.saturating_sub(self.pending_elev.len());
+        for (coord, _) in missing.into_iter().take(slots) {
+            self.pending_elev.insert(coord);
+            let queue = Rc::clone(&self.completed_elev_queue);
+            let failed = Rc::clone(&self.failed_elev_queue);
+            let url = tile_url(&self.elev_url_template, &coord);
+
+            wasm_bindgen_futures::spawn_local(async move {
+                match fetch_bytes(&url).await {
+                    Ok(bytes) => {
+                        let decoder = TerrariumDecoder;
+                        match decoder.decode(coord, &bytes).await {
+                            Ok(decoded) => {
+                                queue.borrow_mut().push(CompletedElevation {
+                                    coord,
+                                    elevation: decoded.elevation,
+                                    width: decoded.width,
+                                    height: decoded.height,
+                                });
+                            }
+                            Err(e) => {
+                                log::warn!("Elev decode {}: {}", coord, e);
+                                failed.borrow_mut().push(coord);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Elev fetch {}: {}", coord, e);
+                        failed.borrow_mut().push(coord);
+                    }
+                }
+            });
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Terrain rendering
+// ═══════════════════════════════════════════════════════════════════
+
+impl WebApp {
+    /// Render terrain mesh with imagery draped on top.
+    fn render_terrain(&mut self, target: &wgpu::TextureView, visible: &[VisibleTile]) {
+        use x_planets_core::pipeline::resolve_fallbacks;
+
+        let available: HashSet<TileCoord> = self.tile_textures.keys().copied().collect();
+        let renderable = resolve_fallbacks(visible, &available);
+
+        // Build imagery texture views
+        let imagery_views: HashMap<TileCoord, &wgpu::TextureView> = self
+            .tile_textures
+            .iter()
+            .map(|(k, v)| (*k, &v.view))
+            .collect();
+
+        // Build elevation data map with parent fallback
+        let mut elevation_data: HashMap<TileCoord, (&TerrainTileData, TileCoord)> = HashMap::new();
+        let all_needed: HashSet<TileCoord> = renderable.iter().map(|rt| rt.coord).collect();
+        for &coord in &all_needed {
+            let mut c = Some(coord);
+            while let Some(candidate) = c {
+                if let Some(data) = self.elevation_data.peek(&candidate) {
+                    elevation_data.insert(coord, (data, candidate));
+                    break;
+                }
+                c = candidate.parent();
+            }
+        }
+
+        if elevation_data.is_empty() {
+            return;
+        }
+
+        let layer = TerrainLayerData {
+            name: "terrain",
+            opacity: 1.0,
+            tiles: renderable,
+            imagery_views,
+            elevation_data,
+            tile_opacity_overrides: HashMap::new(),
+        };
+
+        self.terrain_renderer
+            .render_terrain_layered(&self.gpu, target, &self.engine.viewport, &[layer]);
     }
 }
 
