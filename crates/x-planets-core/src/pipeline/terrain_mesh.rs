@@ -540,6 +540,33 @@ pub fn build_terrain_mesh_centered(
         }
     }
 
+    // Detect whether the oblique Mercator projection has flipped the
+    // spatial orientation of this tile.  The standard winding (tl→bl→tr)
+    // is CW in y-down space.  After oblique reprojection, tiles far from
+    // the center can have inverted orientation, which flips the winding.
+    // Check the 2D cross product of a center quad to decide.
+    let mid = grid / 2;
+    let mid_tl = (mid * verts_per_side + mid) as usize;
+    let mid_tr = mid_tl + 1;
+    let mid_bl = mid_tl + verts_per_side as usize;
+    let winding_cross = {
+        let a = positions[mid_tl];
+        let b = positions[mid_bl];
+        let c = positions[mid_tr];
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    };
+    // winding_cross > 0 → CW in y-down (normal), < 0 → inverted by projection.
+    let flipped = winding_cross < 0.0;
+
+    // When flipped, negate normals so hillshade lighting is correct.
+    if flipped {
+        for n in &mut normals {
+            n[0] = -n[0];
+            n[1] = -n[1];
+            n[2] = -n[2];
+        }
+    }
+
     let mut vertices: Vec<TerrainVertex> = (0..vert_count)
         .map(|i| TerrainVertex {
             position: positions[i],
@@ -548,19 +575,31 @@ pub fn build_terrain_mesh_centered(
         })
         .collect();
 
-    // Surface triangle indices (same winding as build_terrain_mesh)
+    // Surface triangle indices.
+    // When the oblique projection inverts orientation, swap the winding
+    // so back-face culling doesn't discard the visible faces.
     for gy in 0..grid {
         for gx in 0..grid {
             let tl = gy * verts_per_side + gx;
             let tr = tl + 1;
             let bl = tl + verts_per_side;
             let br = bl + 1;
-            indices.push(tl);
-            indices.push(bl);
-            indices.push(tr);
-            indices.push(tr);
-            indices.push(bl);
-            indices.push(br);
+            if flipped {
+                // Swap to CCW in y-down (= CW after flip_x = correct)
+                indices.push(tl);
+                indices.push(tr);
+                indices.push(bl);
+                indices.push(tr);
+                indices.push(br);
+                indices.push(bl);
+            } else {
+                indices.push(tl);
+                indices.push(bl);
+                indices.push(tr);
+                indices.push(tr);
+                indices.push(bl);
+                indices.push(br);
+            }
         }
     }
 
@@ -604,12 +643,21 @@ pub fn build_terrain_mesh_centered(
             let mut pb = positions[top_b];
             pb[2] -= skirt_depth;
             vertices.push(TerrainVertex { position: pb, normal: down_normal, tex_coord: tex_coords[top_b] });
-            indices.push(edge[i]);
-            indices.push(skirt_a);
-            indices.push(edge[i + 1]);
-            indices.push(skirt_a);
-            indices.push(skirt_b);
-            indices.push(edge[i + 1]);
+            if flipped {
+                indices.push(edge[i]);
+                indices.push(edge[i + 1]);
+                indices.push(skirt_a);
+                indices.push(skirt_a);
+                indices.push(edge[i + 1]);
+                indices.push(skirt_b);
+            } else {
+                indices.push(edge[i]);
+                indices.push(skirt_a);
+                indices.push(edge[i + 1]);
+                indices.push(skirt_a);
+                indices.push(skirt_b);
+                indices.push(edge[i + 1]);
+            }
         }
     }
 

@@ -18,6 +18,7 @@ use x_planets_math::{TileCoord, TileUniforms, ViewportUniforms};
 use crate::pipeline::{
     build_terrain_mesh, build_terrain_mesh_centered, build_terrain_mesh_globe,
     compute_height_scale, fallback_uv_rect,
+    tile_passes_angular_filter,
     tile_uniforms_for_centered, tile_uniforms_for_globe,
     RenderableTile,
 };
@@ -606,6 +607,18 @@ impl TerrainRenderer {
             let tile_data: Vec<_> = layer
                 .tiles
                 .iter()
+                .filter(|rt| {
+                    // In centered Mercator mode, skip tiles beyond the angular
+                    // threshold to avoid degenerate geometry from the oblique
+                    // Mercator singularity.  Same filter the raster renderer uses.
+                    if is_centered {
+                        tile_passes_angular_filter(
+                            rt, center_lat_rad, center_lon_rad, viewport.zoom,
+                        )
+                    } else {
+                        true
+                    }
+                })
                 .filter_map(|rt| {
                     let tex_view = layer.imagery_views.get(&rt.texture_coord);
                     let elev_entry = layer.elevation_data.get(&rt.coord);
