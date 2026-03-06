@@ -15,7 +15,12 @@
 use x_planets_gpu::GpuContext;
 use x_planets_math::{TileCoord, TileUniforms, ViewportUniforms};
 
-use crate::pipeline::{build_terrain_mesh, compute_height_scale, fallback_uv_rect, tile_uniforms_with_uv, RenderableTile};
+use crate::pipeline::{
+    build_terrain_mesh, build_terrain_mesh_centered, build_terrain_mesh_globe,
+    compute_height_scale, fallback_uv_rect,
+    tile_uniforms_for_centered, tile_uniforms_for_globe,
+    RenderableTile,
+};
 use crate::render::TerrainVertex;
 use crate::viewport::Viewport;
 use std::collections::{HashMap, HashSet};
@@ -92,6 +97,8 @@ struct CachedMesh {
     index_count: u32,
     /// Which elevation tile was used (for mesh invalidation).
     elev_source: TileCoord,
+    /// Which projection mode was used (mesh geometry depends on projection).
+    _projection_mode: x_planets_math::ProjectionMode,
     /// Reusable uniform buffer — updated every frame, never reallocated.
     uniform_buffer: wgpu::Buffer,
     /// Cached bind group — reused when imagery texture hasn't changed.
@@ -120,6 +127,34 @@ pub struct TerrainRenderer {
     /// Exaggeration value when the cache was last valid.
     /// If exaggeration changes, the entire cache is invalidated.
     cached_exaggeration: f64,
+    /// Projection mode when the cache was last valid.
+    /// If projection changes, the entire cache is invalidated
+    /// (mesh geometry is projection-dependent).
+    cached_projection_mode: x_planets_math::ProjectionMode,
+}
+
+/// Projection-specific parameters for terrain mesh building.
+#[allow(dead_code)]
+enum TerrainMeshParams {
+    Mercator,
+    Centered {
+        center_lat_rad: f64,
+        center_lon_rad: f64,
+        tile_center_2d: glam::DVec2,
+    },
+    Globe {
+        tile_center_3d: glam::DVec3,
+    },
+}
+
+impl TerrainMeshParams {
+    fn mode(&self) -> x_planets_math::ProjectionMode {
+        match self {
+            Self::Mercator => x_planets_math::ProjectionMode::Mercator,
+            Self::Centered { .. } => x_planets_math::ProjectionMode::Mercator, // uses Mercator enum for centered
+            Self::Globe { .. } => x_planets_math::ProjectionMode::Globe,
+        }
+    }
 }
 
 impl TerrainRenderer {
@@ -306,6 +341,7 @@ impl TerrainRenderer {
             exaggeration,
             mesh_cache: HashMap::new(),
             cached_exaggeration: exaggeration,
+            cached_projection_mode: x_planets_math::ProjectionMode::Mercator,
         }
     }
 
@@ -355,6 +391,8 @@ impl TerrainRenderer {
     ///
     /// Returns the cached vertex/index buffers if the elevation source
     /// hasn't changed, otherwise rebuilds the mesh and updates the cache.
+    ///
+    /// `mesh_params` provides projection-specific parameters for mesh building.
     fn get_or_build_mesh(
         &mut self,
         gpu: &GpuContext,
@@ -363,6 +401,7 @@ impl TerrainRenderer {
         elev_uv_rect: [f32; 4],
         elev_source: TileCoord,
         height_scale: f32,
+        mesh_params: &TerrainMeshParams,
     ) -> &CachedMesh {
         // Check if cache entry is still valid
         let needs_rebuild = match self.mesh_cache.get(coord) {
@@ -371,47 +410,33 @@ impl TerrainRenderer {
         };
 
         if needs_rebuild {
-            let (vertices, indices) = match elevation {
-                TerrainTileData::Heightmap { elevation: elev, width, height } => {
-                    build_terrain_mesh(coord, elev, *width, *height, height_scale, elev_uv_rect)
+            // Get raw elevation data (heightmap) for projection-aware builders.
+            // For PrebuiltMesh with fallback, use the fallback heightmap.
+            // For PrebuiltMesh with own data, we need to handle differently per projection.
+            let (vertices, indices) = match mesh_params {
+                TerrainMeshParams::Mercator => {
+                    self.build_mesh_standard(coord, elevation, elev_uv_rect, elev_source, height_scale)
                 }
-                TerrainTileData::PrebuiltMesh {
-                    vertices,
-                    indices,
-                    fallback_heightmap,
-                    fallback_grid_size,
-                } => {
-                    if elev_source != *coord {
-                        // Parent's QM mesh covers the parent tile area, not this
-                        // child's sub-region.  Use the rasterized fallback heightmap
-                        // to provide elevation data.  `build_terrain_mesh` will
-                        // sub-sample via `elev_uv_rect` just like regular heightmaps.
-                        build_terrain_mesh(
-                            coord,
-                            fallback_heightmap,
-                            *fallback_grid_size,
-                            *fallback_grid_size,
-                            height_scale,
-                            elev_uv_rect,
-                        )
-                    } else {
-                        // Pre-built mesh: apply height_scale to the z component.
-                        // Heights are stored in metres; scale here so exaggeration
-                        // changes (which clear the GPU mesh cache) work correctly.
-                        let scaled: Vec<crate::render::TerrainVertex> = vertices
-                            .iter()
-                            .map(|v| crate::render::TerrainVertex {
-                                position: [
-                                    v.position[0],
-                                    v.position[1],
-                                    v.position[2] * height_scale,
-                                ],
-                                normal: v.normal,
-                                tex_coord: v.tex_coord,
-                            })
-                            .collect();
-                        (scaled, indices.clone())
-                    }
+                TerrainMeshParams::Centered { center_lat_rad, center_lon_rad, tile_center_2d } => {
+                    self.build_mesh_for_heightmap(
+                        coord, elevation, elev_uv_rect, elev_source, height_scale,
+                        |elev, w, h, uv_rect, hs| {
+                            build_terrain_mesh_centered(
+                                coord, elev, w, h, hs, uv_rect,
+                                *center_lat_rad, *center_lon_rad, *tile_center_2d,
+                            )
+                        },
+                    )
+                }
+                TerrainMeshParams::Globe { tile_center_3d } => {
+                    self.build_mesh_for_heightmap(
+                        coord, elevation, elev_uv_rect, elev_source, height_scale,
+                        |elev, w, h, uv_rect, hs| {
+                            build_terrain_mesh_globe(
+                                coord, elev, w, h, hs, uv_rect, *tile_center_3d,
+                            )
+                        },
+                    )
                 }
             };
 
@@ -423,7 +448,6 @@ impl TerrainRenderer {
                 &format!("terrain-idx-{}-{}-{}", coord.z, coord.x, coord.y),
                 &indices,
             );
-            // Uniform buffer allocated once, reused every frame via update_buffer.
             let zero_uniforms: TileUniforms = bytemuck::Zeroable::zeroed();
             let uniform_buffer = gpu.create_uniform_buffer(
                 &format!("terrain-uni-{}-{}-{}", coord.z, coord.x, coord.y),
@@ -435,6 +459,7 @@ impl TerrainRenderer {
                 index_buffer,
                 index_count: indices.len() as u32,
                 elev_source,
+                _projection_mode: mesh_params.mode(),
                 uniform_buffer,
                 bind_group: None,
                 last_texture_coord: None,
@@ -444,25 +469,117 @@ impl TerrainRenderer {
         self.mesh_cache.get(coord).unwrap()
     }
 
+    /// Build mesh using standard Mercator (original logic).
+    fn build_mesh_standard(
+        &self,
+        coord: &TileCoord,
+        elevation: &TerrainTileData,
+        elev_uv_rect: [f32; 4],
+        elev_source: TileCoord,
+        height_scale: f32,
+    ) -> (Vec<TerrainVertex>, Vec<u32>) {
+        match elevation {
+            TerrainTileData::Heightmap { elevation: elev, width, height } => {
+                build_terrain_mesh(coord, elev, *width, *height, height_scale, elev_uv_rect)
+            }
+            TerrainTileData::PrebuiltMesh {
+                vertices,
+                indices,
+                fallback_heightmap,
+                fallback_grid_size,
+            } => {
+                if elev_source != *coord {
+                    build_terrain_mesh(
+                        coord, fallback_heightmap, *fallback_grid_size, *fallback_grid_size,
+                        height_scale, elev_uv_rect,
+                    )
+                } else {
+                    let scaled: Vec<TerrainVertex> = vertices
+                        .iter()
+                        .map(|v| TerrainVertex {
+                            position: [v.position[0], v.position[1], v.position[2] * height_scale],
+                            normal: v.normal,
+                            tex_coord: v.tex_coord,
+                        })
+                        .collect();
+                    (scaled, indices.clone())
+                }
+            }
+        }
+    }
+
+    /// Build mesh using a projection-aware builder that takes heightmap data.
+    ///
+    /// For PrebuiltMesh (QM), always uses the fallback heightmap since the
+    /// projection-aware builders need to recompute vertex positions from scratch
+    /// (the pre-built QM positions are in standard Mercator space).
+    fn build_mesh_for_heightmap<F>(
+        &self,
+        _coord: &TileCoord,
+        elevation: &TerrainTileData,
+        elev_uv_rect: [f32; 4],
+        _elev_source: TileCoord,
+        height_scale: f32,
+        builder: F,
+    ) -> (Vec<TerrainVertex>, Vec<u32>)
+    where
+        F: FnOnce(&[f32], u32, u32, [f32; 4], f32) -> (Vec<TerrainVertex>, Vec<u32>),
+    {
+        match elevation {
+            TerrainTileData::Heightmap { elevation: elev, width, height } => {
+                builder(elev, *width, *height, elev_uv_rect, height_scale)
+            }
+            TerrainTileData::PrebuiltMesh {
+                fallback_heightmap,
+                fallback_grid_size,
+                ..
+            } => {
+                builder(
+                    fallback_heightmap, *fallback_grid_size, *fallback_grid_size,
+                    elev_uv_rect, height_scale,
+                )
+            }
+        }
+    }
+
     /// Render terrain layers to the target surface.
     ///
     /// Terrain layers use `LoadOp::Load` for color (preserves raster layers already drawn)
     /// and `LoadOp::Clear` for depth (own depth buffer).
+    ///
+    /// `mode` controls how terrain meshes are built and positioned:
+    /// - `Mercator`: standard flat Mercator space (original behavior)
+    /// - `Globe`: unit sphere with radial elevation displacement
+    /// The centered Mercator mode is auto-detected when `mode == Mercator` and
+    /// the raster renderer uses centered Mercator (same projection pipeline).
     pub fn render_terrain_layered(
         &mut self,
         gpu: &GpuContext,
         target: &wgpu::TextureView,
         viewport: &Viewport,
         layers: &[TerrainLayerData],
+        mode: x_planets_math::ProjectionMode,
     ) {
         if layers.is_empty() {
             return;
         }
 
-        // Invalidate mesh cache if exaggeration changed.
-        if (self.exaggeration - self.cached_exaggeration).abs() > 1e-9 {
+        // Invalidate mesh cache if exaggeration or projection changed.
+        if (self.exaggeration - self.cached_exaggeration).abs() > 1e-9
+            || self.cached_projection_mode != mode
+        {
             self.mesh_cache.clear();
             self.cached_exaggeration = self.exaggeration;
+            self.cached_projection_mode = mode;
+        }
+
+        // For centered Mercator (non-Globe Mercator), invalidate mesh cache
+        // every frame because the oblique center changes with viewport pan.
+        let is_centered = mode != x_planets_math::ProjectionMode::Globe;
+        if is_centered {
+            // Centered Mercator meshes depend on the viewport center,
+            // which changes as the user pans.  Must rebuild every frame.
+            self.mesh_cache.clear();
         }
 
         let height_scale = compute_height_scale(self.exaggeration);
@@ -471,10 +588,11 @@ impl TerrainRenderer {
         let uniforms = viewport.to_uniforms();
         gpu.update_buffer(&self.viewport_buffer, &uniforms);
 
-        // Compute f64 VP for per-tile MVP (eliminates high-zoom jitter).
-        // Use terrain-specific VP centered on the actual geographic center,
-        // NOT the fixed (0.5, 0.5) used by the raster renderer's centered Mercator.
-        let vp_f64 = viewport.to_terrain_view_proj_f64();
+        // Compute f64 VP using the same projection as the raster renderer.
+        let vp_f64 = viewport.to_view_proj_f64_projected(mode);
+
+        let center_lat_rad = viewport.center.lat.to_radians();
+        let center_lon_rad = viewport.center.lon.to_radians();
 
         // Track which tiles are rendered this frame for cache eviction.
         let mut rendered_coords = HashSet::new();
@@ -485,7 +603,6 @@ impl TerrainRenderer {
 
         for layer in layers {
             // Phase 1: Ensure meshes are cached for all visible tiles.
-            // This is the expensive part — but only runs for NEW tiles.
             let tile_data: Vec<_> = layer
                 .tiles
                 .iter()
@@ -516,26 +633,49 @@ impl TerrainRenderer {
                 })
                 .collect();
 
-            // Build/fetch cached meshes
+            // Build/fetch cached meshes with projection-aware geometry.
             for &(rt, _, elev, elev_source, elev_uv, _) in &tile_data {
-                self.get_or_build_mesh(gpu, &rt.coord, elev, elev_uv, elev_source, height_scale);
+                let mesh_params = match mode {
+                    x_planets_math::ProjectionMode::Globe => {
+                        let tile_center_3d = crate::pipeline::tile_mesh::globe_tile_center(
+                            &rt.coord, rt.display_x,
+                        );
+                        TerrainMeshParams::Globe { tile_center_3d }
+                    }
+                    _ => {
+                        // Centered Mercator — use oblique Mercator reprojection
+                        let tile_center_2d = crate::pipeline::tile_mesh::centered_tile_center(
+                            &rt.coord, rt.display_x, center_lat_rad, center_lon_rad,
+                        );
+                        TerrainMeshParams::Centered {
+                            center_lat_rad,
+                            center_lon_rad,
+                            tile_center_2d,
+                        }
+                    }
+                };
+                self.get_or_build_mesh(gpu, &rt.coord, elev, elev_uv, elev_source, height_scale, &mesh_params);
                 rendered_coords.insert(rt.coord);
             }
 
             // Phase 2: Update uniform buffers + reuse/rebuild bind groups.
-            //
-            // Per-frame cost breakdown (steady-state, no new tiles):
-            //   - uniform_buffer: queue.write_buffer() only (zero alloc)
-            //   - bind_group:     REUSED from cache (zero alloc)
-            // Bind group is only rebuilt when imagery texture_coord changes
-            // (parent→child swap), which happens at most once per tile load.
             let render_coords: Vec<TileCoord> = tile_data
                 .iter()
                 .filter_map(|&(rt, tex_view, _, _, _, tile_opacity)| {
                     let cached = self.mesh_cache.get_mut(&rt.coord)?;
 
-                    // Update uniform buffer in-place (no allocation).
-                    let tile_uniforms = tile_uniforms_with_uv(&rt.coord, tile_opacity, rt.uv_rect, &vp_f64);
+                    // Compute per-tile uniforms using the correct projection.
+                    let tile_uniforms = match mode {
+                        x_planets_math::ProjectionMode::Globe => {
+                            tile_uniforms_for_globe(rt, tile_opacity, &vp_f64)
+                        }
+                        _ => {
+                            tile_uniforms_for_centered(
+                                rt, tile_opacity, &vp_f64,
+                                center_lat_rad, center_lon_rad,
+                            )
+                        }
+                    };
                     gpu.update_buffer(&cached.uniform_buffer, &tile_uniforms);
 
                     // Rebuild bind group only when imagery texture changes.

@@ -429,6 +429,349 @@ pub fn build_terrain_mesh_from_qm(
 }
 
 // ───────────────────────────────────────────────────────────────────
+// Stage 4b-centered: Terrain mesh in oblique (centered) Mercator space
+// ───────────────────────────────────────────────────────────────────
+
+/// Build a displaced terrain mesh in oblique (viewport-centered) Mercator space.
+///
+/// Same elevation sampling as [`build_terrain_mesh`], but vertex XY positions are
+/// projected through `oblique_mercator(lat, lon, center)` — matching the raster
+/// renderer's `tile_centered_mesh`.  The tile center in oblique Mercator space
+/// is subtracted (RTE) so positions stay near the origin for f32 precision.
+///
+/// Z = elevation × `height_scale` (same as standard terrain mesh).
+///
+/// This ensures terrain meshes align with the raster tiles in centered Mercator
+/// projection mode.
+///
+/// Pure function.
+pub fn build_terrain_mesh_centered(
+    coord: &TileCoord,
+    elevation: &[f32],
+    src_width: u32,
+    src_height: u32,
+    height_scale: f32,
+    elev_uv_rect: [f32; 4],
+    center_lat_rad: f64,
+    center_lon_rad: f64,
+    tile_center_2d: glam::DVec2,
+) -> (Vec<TerrainVertex>, Vec<u32>) {
+    use std::f64::consts::PI;
+
+    let grid = TERRAIN_GRID_SIZE;
+    let verts_per_side = grid + 1;
+    let vert_count = (verts_per_side * verts_per_side) as usize;
+    let mut indices = Vec::with_capacity((grid * grid * 6) as usize);
+
+    let n = coord.extent() as f64;
+
+    let eu_min = elev_uv_rect[0];
+    let ev_min = elev_uv_rect[1];
+    let eu_range = elev_uv_rect[2] - eu_min;
+    let ev_range = elev_uv_rect[3] - ev_min;
+
+    let mut positions = Vec::with_capacity(vert_count);
+    let mut tex_coords = Vec::with_capacity(vert_count);
+
+    for gy in 0..verts_per_side {
+        for gx in 0..verts_per_side {
+            let u = gx as f64 / grid as f64;
+            let v = gy as f64 / grid as f64;
+
+            // Global Mercator position [0,1]
+            let mx = (coord.x as f64 + u) / n;
+            let my = (coord.y as f64 + v) / n;
+
+            // Standard Mercator → lat/lon
+            let lon_rad = (mx * 2.0 - 1.0) * PI;
+            let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+
+            // Oblique (centered) Mercator
+            let centered = x_planets_math::oblique_mercator(
+                lat_rad, lon_rad, center_lat_rad, center_lon_rad,
+            );
+            let cx = if centered.x.is_finite() { centered.x } else { 0.5 };
+            let cy = if centered.y.is_finite() { centered.y } else { 0.5 };
+
+            // RTE: subtract tile center in 2D
+            let rx = (cx - tile_center_2d.x) as f32;
+            let ry = (cy - tile_center_2d.y) as f32;
+
+            // Sample elevation
+            let eu = eu_min + u as f32 * eu_range;
+            let ev = ev_min + v as f32 * ev_range;
+            let h = sample_elevation_bilinear(elevation, src_width, src_height, eu, ev);
+
+            positions.push([rx, ry, h * height_scale]);
+            tex_coords.push([u as f32, v as f32]);
+        }
+    }
+
+    // Normals — same reflected-sample approach as build_terrain_mesh
+    let mut normals = vec![[0.0f32, 0.0, 1.0]; vert_count];
+    let vs = verts_per_side as usize;
+    for gy in 0..vs {
+        for gx in 0..vs {
+            let idx = gy * vs + gx;
+            let p = positions[idx];
+            let right = if gx + 1 < vs { positions[idx + 1] } else {
+                let l = positions[idx - 1];
+                [2.0 * p[0] - l[0], 2.0 * p[1] - l[1], 2.0 * p[2] - l[2]]
+            };
+            let left = if gx > 0 { positions[idx - 1] } else {
+                let r = positions[idx + 1];
+                [2.0 * p[0] - r[0], 2.0 * p[1] - r[1], 2.0 * p[2] - r[2]]
+            };
+            let down = if gy + 1 < vs { positions[idx + vs] } else {
+                let u = positions[idx - vs];
+                [2.0 * p[0] - u[0], 2.0 * p[1] - u[1], 2.0 * p[2] - u[2]]
+            };
+            let up = if gy > 0 { positions[idx - vs] } else {
+                let d = positions[idx + vs];
+                [2.0 * p[0] - d[0], 2.0 * p[1] - d[1], 2.0 * p[2] - d[2]]
+            };
+            let dx = [right[0] - left[0], right[1] - left[1], right[2] - left[2]];
+            let dy = [down[0] - up[0], down[1] - up[1], down[2] - up[2]];
+            let nx = dx[1] * dy[2] - dx[2] * dy[1];
+            let ny = dx[2] * dy[0] - dx[0] * dy[2];
+            let nz = dx[0] * dy[1] - dx[1] * dy[0];
+            let len = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-10);
+            normals[idx] = [nx / len, ny / len, nz / len];
+        }
+    }
+
+    let mut vertices: Vec<TerrainVertex> = (0..vert_count)
+        .map(|i| TerrainVertex {
+            position: positions[i],
+            normal: normals[i],
+            tex_coord: tex_coords[i],
+        })
+        .collect();
+
+    // Surface triangle indices (same winding as build_terrain_mesh)
+    for gy in 0..grid {
+        for gx in 0..grid {
+            let tl = gy * verts_per_side + gx;
+            let tr = tl + 1;
+            let bl = tl + verts_per_side;
+            let br = bl + 1;
+            indices.push(tl);
+            indices.push(bl);
+            indices.push(tr);
+            indices.push(tr);
+            indices.push(bl);
+            indices.push(br);
+        }
+    }
+
+    // Skirt geometry — use a small fraction of the centered-space tile extent.
+    // The tile extent varies with oblique Mercator, so use the average position
+    // span as a reference.
+    let skirt_depth = {
+        let extent_x = (positions[verts_per_side as usize - 1][0] - positions[0][0]).abs();
+        let extent_y = (positions[(verts_per_side * (verts_per_side - 1)) as usize][1] - positions[0][1]).abs();
+        (extent_x.max(extent_y) * 0.05).max(1e-8)
+    };
+    let down_normal = [0.0f32, 0.0, -1.0];
+
+    let mut edge_strips: Vec<Vec<u32>> = Vec::new();
+    // Bottom edge
+    let mut strip = Vec::new();
+    for gx in 0..verts_per_side { strip.push(grid * verts_per_side + gx); }
+    edge_strips.push(strip);
+    // Top edge (reversed)
+    let mut strip = Vec::new();
+    for gx in (0..verts_per_side).rev() { strip.push(gx); }
+    edge_strips.push(strip);
+    // Right edge (reversed)
+    let mut strip = Vec::new();
+    for gy in (0..verts_per_side).rev() { strip.push(gy * verts_per_side + grid); }
+    edge_strips.push(strip);
+    // Left edge
+    let mut strip = Vec::new();
+    for gy in 0..verts_per_side { strip.push(gy * verts_per_side); }
+    edge_strips.push(strip);
+
+    for edge in &edge_strips {
+        for i in 0..edge.len() - 1 {
+            let top_a = edge[i] as usize;
+            let top_b = edge[i + 1] as usize;
+            let skirt_a = vertices.len() as u32;
+            let mut pa = positions[top_a];
+            pa[2] -= skirt_depth;
+            vertices.push(TerrainVertex { position: pa, normal: down_normal, tex_coord: tex_coords[top_a] });
+            let skirt_b = vertices.len() as u32;
+            let mut pb = positions[top_b];
+            pb[2] -= skirt_depth;
+            vertices.push(TerrainVertex { position: pb, normal: down_normal, tex_coord: tex_coords[top_b] });
+            indices.push(edge[i]);
+            indices.push(skirt_a);
+            indices.push(edge[i + 1]);
+            indices.push(skirt_a);
+            indices.push(skirt_b);
+            indices.push(edge[i + 1]);
+        }
+    }
+
+    (vertices, indices)
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Stage 4b-globe: Terrain mesh on the unit sphere
+// ───────────────────────────────────────────────────────────────────
+
+/// Build a displaced terrain mesh on the unit sphere.
+///
+/// Same elevation sampling as [`build_terrain_mesh`], but vertex positions are
+/// placed on the unit sphere (like `tile_globe_mesh`) with radial displacement
+/// proportional to elevation.  The tile center in 3D sphere space is subtracted
+/// (RTE) so positions stay near the origin for f32 precision.
+///
+/// Elevation is converted to sphere-radius offset:
+///   `radius = 1.0 + height_metres * height_scale`
+/// where `height_scale` is from `compute_height_scale()`.
+///
+/// Pure function.
+pub fn build_terrain_mesh_globe(
+    coord: &TileCoord,
+    elevation: &[f32],
+    src_width: u32,
+    src_height: u32,
+    height_scale: f32,
+    elev_uv_rect: [f32; 4],
+    tile_center_3d: glam::DVec3,
+) -> (Vec<TerrainVertex>, Vec<u32>) {
+    use std::f64::consts::PI;
+
+    let grid = TERRAIN_GRID_SIZE;
+    let verts_per_side = grid + 1;
+    let vert_count = (verts_per_side * verts_per_side) as usize;
+
+    let n = coord.extent() as f64;
+
+    let eu_min = elev_uv_rect[0];
+    let ev_min = elev_uv_rect[1];
+    let eu_range = elev_uv_rect[2] - eu_min;
+    let ev_range = elev_uv_rect[3] - ev_min;
+
+    let mut positions = Vec::with_capacity(vert_count);
+    let mut tex_coords = Vec::with_capacity(vert_count);
+
+    for gy in 0..verts_per_side {
+        for gx in 0..verts_per_side {
+            let u = gx as f64 / grid as f64;
+            let v = gy as f64 / grid as f64;
+
+            // Global Mercator position [0,1]
+            let mx = (coord.x as f64 + u) / n;
+            let my = (coord.y as f64 + v) / n;
+
+            // Mercator → lat/lon (radians)
+            let lon_rad = (mx * 2.0 - 1.0) * PI;
+            let lat_rad = x_planets_math::mercator_y_to_lat_rad(my);
+
+            // Sample elevation
+            let eu = eu_min + u as f32 * eu_range;
+            let ev = ev_min + v as f32 * ev_range;
+            let h = sample_elevation_bilinear(elevation, src_width, src_height, eu, ev);
+
+            // Position on unit sphere with radial elevation displacement
+            let surface_pos = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
+            let radius = 1.0 + h as f64 * height_scale as f64;
+            let pos_3d = surface_pos * radius;
+
+            // RTE: subtract tile center
+            let rte = pos_3d - tile_center_3d;
+
+            positions.push([rte.x as f32, rte.y as f32, rte.z as f32]);
+            tex_coords.push([u as f32, v as f32]);
+        }
+    }
+
+    // Normals — compute from mesh geometry (area-weighted face normals)
+    // since the sphere curvature makes the flat-grid approach inappropriate.
+    // First build surface indices, then compute normals from those triangles.
+    let mut surface_indices = Vec::with_capacity((grid * grid * 6) as usize);
+    for gy in 0..grid {
+        for gx in 0..grid {
+            let tl = gy * verts_per_side + gx;
+            let tr = tl + 1;
+            let bl = tl + verts_per_side;
+            let br = bl + 1;
+            // CCW winding from outside the sphere (matching tile_globe_mesh)
+            surface_indices.push(tl);
+            surface_indices.push(bl);
+            surface_indices.push(tr);
+            surface_indices.push(tr);
+            surface_indices.push(bl);
+            surface_indices.push(br);
+        }
+    }
+
+    let normals = compute_normals_from_triangles(&positions, &surface_indices);
+
+    let mut vertices: Vec<TerrainVertex> = (0..vert_count)
+        .map(|i| TerrainVertex {
+            position: positions[i],
+            normal: normals[i],
+            tex_coord: tex_coords[i],
+        })
+        .collect();
+
+    let mut indices = surface_indices;
+
+    // Skirt geometry: push vertices toward the sphere center (like tile_globe_mesh).
+    let skirt_depth: f64 = 0.002; // fraction of unit sphere radius
+
+    let edge_strips: [Vec<u32>; 4] = [
+        (0..verts_per_side).collect(),
+        (0..verts_per_side).map(|i| grid * verts_per_side + i).collect(),
+        (0..verts_per_side).map(|j| j * verts_per_side).collect(),
+        (0..verts_per_side).map(|j| j * verts_per_side + grid).collect(),
+    ];
+
+    for strip in &edge_strips {
+        for k in 0..strip.len() - 1 {
+            let top_a = strip[k];
+            let top_b = strip[k + 1];
+
+            let skirt_a = vertices.len() as u32;
+            let va = &vertices[top_a as usize];
+            let pa = va.position;
+            vertices.push(TerrainVertex {
+                position: [
+                    pa[0] - (pa[0] as f64 * skirt_depth) as f32,
+                    pa[1] - (pa[1] as f64 * skirt_depth) as f32,
+                    pa[2] - (pa[2] as f64 * skirt_depth) as f32,
+                ],
+                normal: va.normal,
+                tex_coord: va.tex_coord,
+            });
+
+            let skirt_b = vertices.len() as u32;
+            let vb = &vertices[top_b as usize];
+            let pb = vb.position;
+            vertices.push(TerrainVertex {
+                position: [
+                    pb[0] - (pb[0] as f64 * skirt_depth) as f32,
+                    pb[1] - (pb[1] as f64 * skirt_depth) as f32,
+                    pb[2] - (pb[2] as f64 * skirt_depth) as f32,
+                ],
+                normal: vb.normal,
+                tex_coord: vb.tex_coord,
+            });
+
+            indices.extend_from_slice(&[
+                top_a, skirt_a, top_b,
+                top_b, skirt_a, skirt_b,
+            ]);
+        }
+    }
+
+    (vertices, indices)
+}
+
+// ───────────────────────────────────────────────────────────────────
 // Stage 4c-geo: Project QM mesh from EPSG:4326 to EPSG:3857
 // ───────────────────────────────────────────────────────────────────
 

@@ -434,6 +434,7 @@ impl NativeApp {
                             &view,
                             &ctrl.engine.viewport,
                             &render_output.terrain_layers,
+                            proj_mode,
                         );
                     }
                     if !render_output.terrain_overlay_layers.is_empty() {
@@ -442,6 +443,7 @@ impl NativeApp {
                             &view,
                             &ctrl.engine.viewport,
                             &render_output.terrain_overlay_layers,
+                            proj_mode,
                         );
                     }
                 }
