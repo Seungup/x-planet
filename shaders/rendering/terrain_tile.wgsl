@@ -1,9 +1,12 @@
 // Terrain Tile Rendering Shader
 //
 // Renders terrain mesh tiles with 3D displaced vertices and hillshade lighting.
-// Vertex shader: transforms RTE 3D tile vertices through per-tile MVP to clip space.
+// Vertex shader: transforms RTE 3D tile vertices through per-tile MVP to clip space,
+//                and computes unit-sphere position for small-circle clipping.
 // Fragment shader: samples the imagery texture draped onto the terrain,
 //                  blended with a directional light hillshade.
+//                  Includes small-circle clipping to discard fragments beyond the
+//                  visible hemisphere in centered Mercator mode.
 
 // --- Uniforms ---
 
@@ -45,7 +48,10 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) tex_coord: vec2<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) sphere_pos: vec3<f32>,  // Unit-sphere position for small-circle clipping
 };
+
+const PI: f32 = 3.14159265358979323846;
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
@@ -63,6 +69,16 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.tex_coord = input.tex_coord;
     output.normal = input.normal;
 
+    // Reconstruct unit-sphere position from standard Mercator bounds + tex_coord.
+    // This enables small-circle clipping in the fragment shader without adding
+    // extra per-vertex data.
+    let mx = mix(tile.bounds.x, tile.bounds.z, input.tex_coord.x);
+    let my = mix(tile.bounds.y, tile.bounds.w, input.tex_coord.y);
+    let lon = (mx * 2.0 - 1.0) * PI;
+    let lat = 2.0 * atan(exp(PI * (1.0 - 2.0 * my))) - PI * 0.5;
+    let cos_lat = cos(lat);
+    output.sphere_pos = vec3<f32>(cos_lat * cos(lon), cos_lat * sin(lon), sin(lat));
+
     return output;
 }
 
@@ -70,6 +86,14 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    // Small-circle clipping: discard fragments beyond the clip angle
+    // from the viewport center on the unit sphere.
+    // clip_sphere.xyz = center direction, clip_sphere.w = cos(clip_angle).
+    let cos_angle = dot(normalize(input.sphere_pos), viewport.clip_sphere.xyz);
+    if cos_angle < viewport.clip_sphere.w {
+        discard;
+    }
+
     // Remap tex_coord from [0,1] to the UV sub-rect (for fallback textures).
     let uv = mix(tile.uv_rect.xy, tile.uv_rect.zw, input.tex_coord);
     let color = textureSample(tile_texture, tile_sampler, uv);
