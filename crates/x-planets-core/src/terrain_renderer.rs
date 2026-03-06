@@ -264,10 +264,14 @@ impl TerrainRenderer {
                     }),
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleList,
-                        // Ccw because the VP matrix includes a flip_x (-1 on x-axis)
-                        // which reverses winding order in clip space.
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: Some(wgpu::Face::Back),
+                        // No back-face culling: the terrain pipeline serves both
+                        // centered Mercator (VP includes flip_x → CW becomes CCW)
+                        // and Globe (no flip_x → CCW stays CCW).  A single
+                        // front_face setting can't satisfy both modes, and the
+                        // fragment shader's small-circle clipping + depth buffer
+                        // already discard invisible fragments.
+                        // Matches the raster centered_pipeline approach.
+                        cull_mode: None,
                         ..Default::default()
                     },
                     depth_stencil: Some(wgpu::DepthStencilState {
