@@ -315,6 +315,7 @@ impl WebApp {
                 &view,
                 &self.controller.engine.viewport,
                 &all_terrain,
+                mode,
             );
         }
 
