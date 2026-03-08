@@ -26,7 +26,8 @@ use winit::{
 };
 use x_planets_core::engine::MapConfig;
 use x_planets_core::map_controller::LayerStateView;
-use x_planets_core::{MapController, Model3dRenderer, TerrainRenderer, TileRenderer};
+use x_planets_core::MapController;
+use x_planets_render::{Model3dRenderer, TerrainRenderer, TileRenderer};
 use x_planets_gpu::{GpuContext, TextureManager};
 use x_planets_math::TileCoord;
 
