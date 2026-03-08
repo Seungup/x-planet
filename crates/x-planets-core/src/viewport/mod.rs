@@ -67,6 +67,10 @@ pub struct Viewport {
     pub tile_budget: usize,
     /// Celestial body parameters (affects globe camera altitude, terrain scale, etc.).
     pub body: CelestialBody,
+    /// Frustum safety margin (fraction of extent). Larger values include more
+    /// off-screen tiles which helps when terrain displacement shifts geometry
+    /// into the viewport. Default 0.05 (5%). Terrain mode uses 0.15 (15%).
+    pub frustum_margin: f64,
 }
 
 impl Viewport {
@@ -80,6 +84,7 @@ impl Viewport {
             bearing: 0.0,
             tile_budget: 150,
             body: EARTH,
+            frustum_margin: 0.05,
         }
     }
 

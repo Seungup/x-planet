@@ -169,7 +169,11 @@ impl MapController {
     pub fn new(config: MapConfig, width: u32, height: u32) -> Self {
         let initial_zoom = config.zoom;
         let center = (config.center.lat, config.center.lon);
-        let engine = MapEngine::new(config, width, height);
+        let has_terrain = config.layers.iter().any(|l| matches!(l.kind, LayerKind::Terrain { .. }));
+        let mut engine = MapEngine::new(config, width, height);
+        if has_terrain {
+            engine.viewport.frustum_margin = 0.15;
+        }
         Self {
             engine,
             anim: AnimationController::new(initial_zoom),
@@ -543,6 +547,7 @@ impl MapController {
         if self.terrain.is_some() {
             // Turn OFF
             self.terrain = None;
+            self.engine.viewport.frustum_margin = 0.05;
             self.engine.request_redraw();
             log::info!("Terrain: OFF");
             false
@@ -562,6 +567,10 @@ impl MapController {
                 imagery_layer_name: imagery_name,
             });
 
+            // Widen frustum margin — terrain displacement can shift tiles
+            // into the viewport even when the flat ground-plane check says
+            // they're off-screen.
+            self.engine.viewport.frustum_margin = 0.15;
             self.engine.request_redraw();
             log::info!("Terrain: ON");
             true

@@ -9,6 +9,7 @@ use wasm_bindgen::JsCast;
 
 use x_planets_core::engine::LayerKind;
 use x_planets_core::map_controller::LayerStateView;
+use x_planets_core::tile_load_planner::{plan_tile_loads, LayerLoadState, PlannedRequestKind};
 use x_planets_core::MapController;
 use x_planets_render::{TerrainLayerData, TerrainRenderer, TerrainTileData, TileRenderer};
 use x_planets_gpu::{GpuContext, GpuTexture, TextureManager};
@@ -106,6 +107,49 @@ impl LayerStateView for WebLayerState {
 
     fn terrain_tile_data(&self, coord: &TileCoord) -> Option<&TerrainTileData> {
         self.terrain_data.get(coord)
+    }
+}
+
+impl LayerLoadState for WebLayerState {
+    fn kind(&self) -> &LayerKind {
+        &self.kind
+    }
+    fn min_zoom(&self) -> u8 {
+        0
+    }
+    fn max_zoom(&self) -> u8 {
+        22
+    }
+    fn has_texture(&self, coord: &TileCoord) -> bool {
+        self.tile_textures.contains(coord)
+    }
+    fn is_pending(&self, coord: &TileCoord) -> bool {
+        self.pending_coords.contains(coord)
+    }
+    fn is_failed_cooldown(&self, _coord: &TileCoord) -> bool {
+        // Web doesn't track per-coord cooldowns (failed tiles just get retried next frame).
+        false
+    }
+    fn has_terrain_data(&self, coord: &TileCoord) -> bool {
+        self.terrain_data.contains_key(coord)
+    }
+    fn is_elevation_pending(&self, coord: &TileCoord) -> bool {
+        self.pending_elevation_coords.contains(coord)
+    }
+    fn max_concurrent(&self) -> usize {
+        self.max_concurrent
+    }
+    fn pending_count(&self) -> usize {
+        self.pending_coords.len()
+    }
+    fn max_elevation_concurrent(&self) -> usize {
+        self.max_elevation_concurrent
+    }
+    fn elevation_pending_count(&self) -> usize {
+        self.pending_elevation_coords.len()
+    }
+    fn has_elevation_source(&self) -> bool {
+        self.elevation_url.is_some()
     }
 }
 
@@ -475,183 +519,198 @@ impl WebApp {
         }
     }
 
-    /// Request missing tiles for all layers.
+    /// Request missing tiles for all layers using the shared planner.
     fn request_tiles_for_all_layers(&mut self, visible: &[VisibleTile]) {
         let camera_center = x_planets_math::geo_to_mercator(&self.controller.engine.viewport.center);
+        let visible_set: HashSet<TileCoord> = visible.iter().map(|vt| vt.coord).collect();
 
         for ls in &mut self.layer_states {
-            let visible_set: HashSet<TileCoord> = visible.iter().map(|vt| vt.coord).collect();
-            ls.pending_coords.retain(|c| c.z <= 1 || visible_set.contains(c));
-            ls.pending_elevation_coords.retain(|c| visible_set.contains(c));
+            if matches!(ls.kind, LayerKind::Tiles3d) {
+                continue;
+            }
 
-            match &ls.kind {
-                LayerKind::Raster => {
-                    request_raster_tiles(ls, visible, camera_center);
-                    // Also request elevation tiles if terrain is enabled on this layer
-                    if let Some(elev_url) = ls.elevation_url.clone() {
-                        request_elevation_tiles(ls, visible, camera_center, &elev_url, ls.terrain_encoding);
+            // ── Core planner: what to load and what's still needed ──
+            let (needed, requests) = plan_tile_loads(ls, visible, &visible_set, camera_center);
+
+            // ── Abort stale raster requests ──
+            ls.pending_coords.retain(|c| needed.raster.contains(c));
+
+            // ── Abort stale elevation requests ──
+            ls.pending_elevation_coords
+                .retain(|c| needed.elevation.contains(c));
+
+            // ── Spawn raster/terrain tasks ──
+            let raster_slots = ls.max_concurrent.saturating_sub(ls.pending_coords.len());
+            let mut raster_count = 0usize;
+
+            // Determine elevation URL for this layer
+            let elev_url = match &ls.kind {
+                LayerKind::Terrain { .. } => Some(ls.url_template.clone()),
+                _ => ls.elevation_url.clone(),
+            };
+            let encoding = ls.terrain_encoding;
+
+            let elev_slots = ls
+                .max_elevation_concurrent
+                .saturating_sub(ls.pending_elevation_coords.len());
+            let mut elev_count = 0usize;
+
+            for req in &requests {
+                match req.kind {
+                    PlannedRequestKind::Raster => {
+                        if raster_count >= raster_slots {
+                            continue;
+                        }
+                        if ls.pending_coords.contains(&req.coord) {
+                            continue;
+                        }
+                        ls.pending_coords.insert(req.coord);
+                        raster_count += 1;
+
+                        let queue = Rc::clone(&ls.completed_queue);
+                        let failed = Rc::clone(&ls.failed_queue);
+                        let url = tile_url(&ls.url_template, &req.coord);
+                        let coord = req.coord;
+
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match fetch_bytes(&url).await {
+                                Ok(bytes) => {
+                                    let decoder = RasterTileDecoder::default();
+                                    match decoder.decode(coord, &bytes).await {
+                                        Ok(decoded) => {
+                                            queue.borrow_mut().push(CompletedTileResult::Raster {
+                                                coord,
+                                                width: decoded.width,
+                                                height: decoded.height,
+                                                pixels: decoded.pixels,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            log::warn!("Decode {}: {}", coord, e);
+                                            failed.borrow_mut().push(coord);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Fetch {}: {}", coord, e);
+                                    failed.borrow_mut().push(coord);
+                                }
+                            }
+                        });
+                    }
+                    PlannedRequestKind::Terrain => {
+                        // Config-file terrain layers use raster slots.
+                        if raster_count >= raster_slots {
+                            continue;
+                        }
+                        if ls.pending_coords.contains(&req.coord) {
+                            continue;
+                        }
+                        ls.pending_coords.insert(req.coord);
+                        raster_count += 1;
+
+                        let queue = Rc::clone(&ls.completed_queue);
+                        let failed = Rc::clone(&ls.failed_queue);
+                        let url = tile_url(&ls.url_template, &req.coord);
+                        let coord = req.coord;
+
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match fetch_bytes(&url).await {
+                                Ok(bytes) => {
+                                    let result = match encoding {
+                                        TerrainEncoding::MapboxRgb => {
+                                            TerrainRgbDecoder.decode(coord, &bytes).await
+                                        }
+                                        TerrainEncoding::Terrarium => {
+                                            TerrariumDecoder.decode(coord, &bytes).await
+                                        }
+                                        TerrainEncoding::QuantizedMesh => {
+                                            log::warn!("QM decoding not yet supported in web");
+                                            failed.borrow_mut().push(coord);
+                                            return;
+                                        }
+                                    };
+                                    match result {
+                                        Ok(decoded) => {
+                                            queue.borrow_mut().push(CompletedTileResult::Elevation {
+                                                coord,
+                                                elevation: decoded.elevation,
+                                                width: decoded.width,
+                                                height: decoded.height,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            log::warn!("Terrain decode {}: {}", coord, e);
+                                            failed.borrow_mut().push(coord);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Terrain fetch {}: {}", coord, e);
+                                    failed.borrow_mut().push(coord);
+                                }
+                            }
+                        });
+                    }
+                    PlannedRequestKind::Elevation => {
+                        if elev_count >= elev_slots {
+                            continue;
+                        }
+                        if ls.pending_elevation_coords.contains(&req.coord) {
+                            continue;
+                        }
+                        let Some(ref elev_url_template) = elev_url else {
+                            continue;
+                        };
+                        ls.pending_elevation_coords.insert(req.coord);
+                        elev_count += 1;
+
+                        let queue = Rc::clone(&ls.completed_queue);
+                        let failed = Rc::clone(&ls.failed_elevation_queue);
+                        let url = tile_url(elev_url_template, &req.coord);
+                        let coord = req.coord;
+
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match fetch_bytes(&url).await {
+                                Ok(bytes) => {
+                                    let result = match encoding {
+                                        TerrainEncoding::MapboxRgb => {
+                                            TerrainRgbDecoder.decode(coord, &bytes).await
+                                        }
+                                        TerrainEncoding::Terrarium => {
+                                            TerrariumDecoder.decode(coord, &bytes).await
+                                        }
+                                        TerrainEncoding::QuantizedMesh => {
+                                            log::warn!("QM decoding not yet supported in web");
+                                            failed.borrow_mut().push(coord);
+                                            return;
+                                        }
+                                    };
+                                    match result {
+                                        Ok(decoded) => {
+                                            queue.borrow_mut().push(CompletedTileResult::Elevation {
+                                                coord,
+                                                elevation: decoded.elevation,
+                                                width: decoded.width,
+                                                height: decoded.height,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            log::warn!("Elev decode {}: {}", coord, e);
+                                            failed.borrow_mut().push(coord);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Elev fetch {}: {}", coord, e);
+                                    failed.borrow_mut().push(coord);
+                                }
+                            }
+                        });
                     }
                 }
-                LayerKind::Terrain { encoding, .. } => {
-                    // Config-file terrain layers (backward compat)
-                    let enc = *encoding;
-                    request_elevation_tiles(ls, visible, camera_center, &ls.url_template.clone(), enc);
-                }
-                LayerKind::Tiles3d => {}
             }
         }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Tile loading — free functions to avoid borrow issues
-// ═══════════════════════════════════════════════════════════════════
-
-fn request_raster_tiles(
-    ls: &mut WebLayerState,
-    visible: &[VisibleTile],
-    camera_center: x_planets_math::DVec2,
-) {
-    let mut missing: Vec<(TileCoord, f64)> = Vec::new();
-
-    // Always eagerly load z=0 and z=1 base tiles
-    for z in 0..=1u8 {
-        let n = 1u32 << z;
-        for y in 0..n {
-            for x in 0..n {
-                let coord = TileCoord::new(z, x, y);
-                if !ls.tile_textures.contains(&coord) && !ls.pending_coords.contains(&coord) {
-                    missing.push((coord, 0.0));
-                }
-            }
-        }
-    }
-
-    // Deduplicate and sort by distance
-    let mut seen = HashSet::new();
-    let mut visible_missing: Vec<(TileCoord, f64)> = visible
-        .iter()
-        .filter(|vt| {
-            !ls.tile_textures.contains(&vt.coord)
-                && !ls.pending_coords.contains(&vt.coord)
-                && seen.insert(vt.coord)
-        })
-        .map(|vt| {
-            let center = vt.display_mercator_center();
-            let dist = (center - camera_center).length();
-            (vt.coord, dist)
-        })
-        .collect();
-    visible_missing.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    missing.extend(visible_missing);
-
-    let slots = ls.max_concurrent.saturating_sub(ls.pending_coords.len());
-    for (coord, _) in missing.into_iter().take(slots) {
-        ls.pending_coords.insert(coord);
-        let queue = Rc::clone(&ls.completed_queue);
-        let failed = Rc::clone(&ls.failed_queue);
-        let url = tile_url(&ls.url_template, &coord);
-
-        wasm_bindgen_futures::spawn_local(async move {
-            match fetch_bytes(&url).await {
-                Ok(bytes) => {
-                    let decoder = RasterTileDecoder::default();
-                    match decoder.decode(coord, &bytes).await {
-                        Ok(decoded) => {
-                            queue.borrow_mut().push(CompletedTileResult::Raster {
-                                coord,
-                                width: decoded.width,
-                                height: decoded.height,
-                                pixels: decoded.pixels,
-                            });
-                        }
-                        Err(e) => {
-                            log::warn!("Decode {}: {}", coord, e);
-                            failed.borrow_mut().push(coord);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Fetch {}: {}", coord, e);
-                    failed.borrow_mut().push(coord);
-                }
-            }
-        });
-    }
-}
-
-fn request_elevation_tiles(
-    ls: &mut WebLayerState,
-    visible: &[VisibleTile],
-    camera_center: x_planets_math::DVec2,
-    elev_url_template: &str,
-    encoding: TerrainEncoding,
-) {
-    let mut missing: Vec<(TileCoord, f64)> = Vec::new();
-
-    let mut seen = HashSet::new();
-    let mut visible_missing: Vec<(TileCoord, f64)> = visible
-        .iter()
-        .filter(|vt| {
-            !ls.terrain_data.contains_key(&vt.coord)
-                && !ls.pending_elevation_coords.contains(&vt.coord)
-                && seen.insert(vt.coord)
-        })
-        .map(|vt| {
-            let center = vt.display_mercator_center();
-            let dist = (center - camera_center).length();
-            (vt.coord, dist)
-        })
-        .collect();
-    visible_missing.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    missing.extend(visible_missing);
-
-    let slots = ls.max_elevation_concurrent.saturating_sub(ls.pending_elevation_coords.len());
-    for (coord, _) in missing.into_iter().take(slots) {
-        ls.pending_elevation_coords.insert(coord);
-        let queue = Rc::clone(&ls.completed_queue);
-        let failed = Rc::clone(&ls.failed_elevation_queue);
-        let url = tile_url(elev_url_template, &coord);
-
-        wasm_bindgen_futures::spawn_local(async move {
-            match fetch_bytes(&url).await {
-                Ok(bytes) => {
-                    let result = match encoding {
-                        TerrainEncoding::MapboxRgb => {
-                            TerrainRgbDecoder.decode(coord, &bytes).await
-                        }
-                        TerrainEncoding::Terrarium => {
-                            TerrariumDecoder.decode(coord, &bytes).await
-                        }
-                        TerrainEncoding::QuantizedMesh => {
-                            // QM tiles are handled differently (binary mesh, not heightmap image)
-                            // For now, skip — QM support requires a different pipeline
-                            log::warn!("Quantized Mesh decoding not yet supported in web");
-                            failed.borrow_mut().push(coord);
-                            return;
-                        }
-                    };
-                    match result {
-                        Ok(decoded) => {
-                            queue.borrow_mut().push(CompletedTileResult::Elevation {
-                                coord,
-                                elevation: decoded.elevation,
-                                width: decoded.width,
-                                height: decoded.height,
-                            });
-                        }
-                        Err(e) => {
-                            log::warn!("Elev decode {}: {}", coord, e);
-                            failed.borrow_mut().push(coord);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Elev fetch {}: {}", coord, e);
-                    failed.borrow_mut().push(coord);
-                }
-            }
-        });
     }
 }
 
