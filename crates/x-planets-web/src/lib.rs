@@ -194,9 +194,16 @@ mod web_impl {
         // ── Terrain ──
 
         /// Toggle terrain on/off. Returns the new state (true = terrain ON).
+        ///
+        /// Optional parameters:
+        /// - `url`: Tile URL template (default: AWS Terrarium)
+        /// - `encoding`: "terrarium" | "mapbox" | "quantized-mesh" (default: "terrarium")
         #[wasm_bindgen(js_name = "toggleTerrain")]
-        pub fn toggle_terrain(&self) -> bool {
-            self.app.borrow_mut().toggle_terrain()
+        pub fn toggle_terrain(&self, url: Option<String>, encoding: Option<String>) -> bool {
+            self.app.borrow_mut().toggle_terrain_with(
+                url.as_deref(),
+                encoding.as_deref(),
+            )
         }
 
         /// Whether terrain is currently enabled.

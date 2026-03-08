@@ -170,11 +170,25 @@ impl WebApp {
 
     /// Toggle terrain rendering on/off. Returns the new state.
     ///
+    /// `url` and `encoding` are optional.  When `None`, defaults to
+    /// AWS Terrarium tiles.  Supported encoding strings: "terrarium",
+    /// "mapbox", "quantized-mesh".
+    ///
     /// No layers are added or removed.  Elevation data is loaded on the
     /// raster imagery layer as a secondary data stream.
-    pub fn toggle_terrain(&mut self) -> bool {
-        let url = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
-        let enabled = self.controller.toggle_terrain(url, TerrainEncoding::Terrarium);
+    pub fn toggle_terrain_with(
+        &mut self,
+        url: Option<&str>,
+        encoding: Option<&str>,
+    ) -> bool {
+        let default_url = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
+        let url = url.unwrap_or(default_url);
+        let encoding = match encoding {
+            Some("mapbox") => TerrainEncoding::MapboxRgb,
+            Some("quantized-mesh") => TerrainEncoding::QuantizedMesh,
+            _ => TerrainEncoding::Terrarium,
+        };
+        let enabled = self.controller.toggle_terrain(url, encoding);
 
         if enabled {
             // Set elevation URL on the imagery layer so it starts loading elevation

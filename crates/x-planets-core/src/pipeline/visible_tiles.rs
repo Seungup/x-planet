@@ -57,6 +57,6 @@ pub fn compute_load_requests(
         })
         .collect();
 
-    requests.sort_by(|a, b| a.priority.partial_cmp(&b.priority).unwrap());
+    requests.sort_by(|a, b| a.priority.partial_cmp(&b.priority).unwrap_or(std::cmp::Ordering::Equal));
     requests
 }

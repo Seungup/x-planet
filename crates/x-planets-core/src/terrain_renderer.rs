@@ -84,7 +84,7 @@ pub struct TerrainRenderer {
     depth_format: wgpu::TextureFormat,
     surface_width: u32,
     surface_height: u32,
-    /// Elevation exaggeration factor (default: 20.0 for visible terrain in Mercator view).
+    /// Elevation exaggeration factor (default: 1.5).
     pub exaggeration: f64,
     /// Cached vertex/index buffers keyed by render coord.
     mesh_cache: HashMap<TileCoord, CachedMesh>,
@@ -435,7 +435,7 @@ impl TerrainRenderer {
             });
         }
 
-        self.mesh_cache.get(coord).unwrap()
+        self.mesh_cache.get(coord).expect("mesh_cache: just-inserted entry missing")
     }
 
     /// Build mesh using standard Mercator (original logic).

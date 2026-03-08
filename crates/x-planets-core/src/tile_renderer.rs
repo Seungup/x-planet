@@ -589,14 +589,14 @@ impl TileRenderer {
 
                 let prepared: Vec<PreparedTile> = renderable_tiles
                     .iter()
-                    .map(|rt| {
-                        let tex_view = layer.texture_views.get(&rt.texture_coord).unwrap();
+                    .filter_map(|rt| {
+                        let tex_view = layer.texture_views.get(&rt.texture_coord)?;
                         let tile_opacity = layer
                             .tile_opacity_overrides
                             .get(&rt.coord)
                             .copied()
                             .unwrap_or(layer.opacity);
-                        self.prepare_tile_globe(gpu, rt, tex_view, tile_opacity, &vp_f64)
+                        Some(self.prepare_tile_globe(gpu, rt, tex_view, tile_opacity, &vp_f64))
                     })
                     .collect();
 
@@ -725,14 +725,14 @@ impl TileRenderer {
 
                 let prepared: Vec<PreparedTile> = renderable_tiles
                     .iter()
-                    .map(|rt| {
-                        let tex_view = layer.texture_views.get(&rt.texture_coord).unwrap();
+                    .filter_map(|rt| {
+                        let tex_view = layer.texture_views.get(&rt.texture_coord)?;
                         let tile_opacity = layer
                             .tile_opacity_overrides
                             .get(&rt.coord)
                             .copied()
                             .unwrap_or(layer.opacity);
-                        self.prepare_tile_centered(
+                        Some(self.prepare_tile_centered(
                             gpu,
                             rt,
                             tex_view,
@@ -740,7 +740,7 @@ impl TileRenderer {
                             &vp_f64,
                             center_lat_rad,
                             center_lon_rad,
-                        )
+                        ))
                     })
                     .collect();
 
