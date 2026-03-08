@@ -7,6 +7,7 @@ description = "Native platform backend for x-planets (Windows, macOS, Linux)"
 
 [dependencies]
 x-planets-core = { workspace = true }
+x-planets-render = { workspace = true }
 x-planets-gpu = { workspace = true }
 x-planets-math = { workspace = true }
 x-planets-tiles = { workspace = true }

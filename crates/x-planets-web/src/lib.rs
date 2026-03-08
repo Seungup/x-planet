@@ -64,10 +64,10 @@ mod web_impl {
         let controller = x_planets_core::MapController::new(config, width, height);
 
         // ── TileRenderer ──
-        let renderer = x_planets_core::TileRenderer::new(&gpu);
+        let renderer = x_planets_render::TileRenderer::new(&gpu);
 
         // ── TerrainRenderer ──
-        let terrain_renderer = x_planets_core::TerrainRenderer::new(&gpu);
+        let terrain_renderer = x_planets_render::TerrainRenderer::new(&gpu);
 
         // ── TextureManager ──
         let tex_manager = x_planets_gpu::TextureManager::new(&gpu.device);

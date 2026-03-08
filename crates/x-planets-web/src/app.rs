@@ -9,7 +9,8 @@ use wasm_bindgen::JsCast;
 
 use x_planets_core::engine::LayerKind;
 use x_planets_core::map_controller::LayerStateView;
-use x_planets_core::{MapController, TerrainLayerData, TerrainRenderer, TerrainTileData, TileRenderer};
+use x_planets_core::MapController;
+use x_planets_render::{TerrainLayerData, TerrainRenderer, TerrainTileData, TileRenderer};
 use x_planets_gpu::{GpuContext, GpuTexture, TextureManager};
 use x_planets_math::{TileCoord, VisibleTile};
 use x_planets_tiles::{RasterTileDecoder, TerrainEncoding, TerrariumDecoder, TileCache, TileDecoder};

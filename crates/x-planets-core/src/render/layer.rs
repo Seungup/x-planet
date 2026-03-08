@@ -11,6 +11,9 @@ use crate::pipeline::RenderableTile;
 // ═══════════════════════════════════════════════════════════════════
 
 /// Per-layer data assembled each frame and handed to `TileRenderer::render_frame_layered`.
+///
+/// Only available with the `gpu` feature since it contains `wgpu::TextureView` references.
+#[cfg(feature = "gpu")]
 pub struct RenderLayerData<'a> {
     /// Layer name (for debug labels).
     pub name: &'a str,

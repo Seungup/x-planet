@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use x_planets_core::TerrainTileData;
+use x_planets_render::TerrainTileData;
 
 use crate::tile_source::TileResult;
 

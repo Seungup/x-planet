@@ -1,0 +1,15 @@
+[package]
+name = "x-planets-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPU renderers for x-planets: tile, terrain, and 3D model rendering via wgpu"
+
+[dependencies]
+x-planets-math = { workspace = true }
+x-planets-gpu = { workspace = true }
+x-planets-core = { workspace = true }
+wgpu = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+log = { workspace = true }

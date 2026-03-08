@@ -23,48 +23,11 @@ use crate::pipeline::{
     RenderableTile,
 };
 use crate::render::TerrainVertex;
+use crate::terrain_data::TerrainTileData;
 use crate::viewport::Viewport;
 use std::collections::{HashMap, HashSet};
 
 const TERRAIN_TILE_SHADER: &str = include_str!("../../../shaders/rendering/terrain_tile.wgsl");
-
-/// CPU-side terrain data for a tile.
-///
-/// Two variants:
-/// - `Heightmap`: regular elevation grid from Terrain RGB / Terrarium decoding.
-///   Mesh is built on-demand by [`build_terrain_mesh`].
-/// - `PrebuiltMesh`: pre-built triangle mesh from Quantized Mesh 1.0 decoding.
-///   Heights are stored in **metres** (not scaled); [`build_terrain_mesh_from_qm`]
-///   is called once to produce this variant and `height_scale` is applied in
-///   [`TerrainRenderer::get_or_build_mesh`] so exaggeration changes work without
-///   re-fetching tiles.
-pub enum TerrainTileData {
-    /// Heightmap elevation grid (Terrain RGB / Terrarium).
-    Heightmap {
-        elevation: Vec<f32>,
-        width: u32,
-        height: u32,
-    },
-    /// Pre-built triangle mesh (Quantized Mesh 1.0).
-    ///
-    /// `positions[i][2]` is elevation in **metres** (not scaled by height_scale).
-    /// Scaling is applied when building the GPU vertex buffer.
-    PrebuiltMesh {
-        /// Per-vertex data (position, normal, tex_coord).
-        /// `position[2]` is raw metres; normal is in unscaled mesh space.
-        vertices: Vec<crate::render::TerrainVertex>,
-        /// Triangle indices.
-        indices: Vec<u32>,
-        /// Regular grid heightmap rasterized from the QM mesh.
-        /// Used for over-zoom fallback: when a child tile beyond `max_zoom`
-        /// needs elevation from this parent tile, it can sub-sample this
-        /// heightmap via `elev_uv_rect` instead of rendering a flat placeholder.
-        /// Grid is `fallback_grid_size × fallback_grid_size`, values in metres.
-        fallback_heightmap: Vec<f32>,
-        /// Side length of the square fallback heightmap grid.
-        fallback_grid_size: u32,
-    },
-}
 
 /// Per-layer terrain data assembled each frame for rendering.
 pub struct TerrainLayerData<'a> {

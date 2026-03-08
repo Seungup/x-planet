@@ -7,7 +7,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use x_planets_core::engine::LayerKind;
 use x_planets_core::map_controller::LayerStateView;
-use x_planets_core::TerrainTileData;
+use x_planets_render::TerrainTileData;
 use x_planets_gpu::GpuTexture;
 use x_planets_math::TileCoord;
 use x_planets_tiles::{

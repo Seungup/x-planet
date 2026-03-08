@@ -6,6 +6,7 @@ members = [
     "crates/x-planets-projection",
     "crates/x-planets-tiles",
     "crates/x-planets-core",
+    "crates/x-planets-render",
     "crates/x-planets-native",
     "crates/x-planets-web",
     "crates/x-planets-examples",
@@ -64,6 +65,7 @@ x-planets-gpu = { path = "crates/x-planets-gpu" }
 x-planets-projection = { path = "crates/x-planets-projection" }
 x-planets-tiles = { path = "crates/x-planets-tiles" }
 x-planets-core = { path = "crates/x-planets-core" }
+x-planets-render = { path = "crates/x-planets-render" }
 x-planets-native = { path = "crates/x-planets-native" }
 x-planets-web = { path = "crates/x-planets-web" }
 

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
 
-use x_planets_core::{GpuModel3d, Model3dRenderer, Model3dVertex};
+use x_planets_render::{GpuModel3d, Model3dRenderer, Model3dVertex};
 use x_planets_gpu::GpuContext;
 use x_planets_tiles::tiles3d::decoder::Decoded3dTile;
 use x_planets_tiles::tiles3d::tileset::Tileset;

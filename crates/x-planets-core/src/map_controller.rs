@@ -20,8 +20,11 @@ use crate::interaction::{
     AnimationController, FADE_DURATION,
 };
 use crate::pipeline::{resolve_fallbacks, RenderableTile};
+#[cfg(feature = "gpu")]
 use crate::render::RenderLayerData;
-use crate::terrain_renderer::{TerrainLayerData, TerrainTileData};
+use crate::terrain_data::TerrainTileData;
+#[cfg(feature = "gpu")]
+use crate::terrain_renderer::TerrainLayerData;
 
 // ═══════════════════════════════════════════════════════════════════
 // LayerStateView — platform implements this to provide GPU cache state
@@ -44,10 +47,13 @@ pub trait LayerStateView {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// RenderOutput — what build_render_data() produces
+// RenderOutput — what build_render_data() produces (GPU feature only)
 // ═══════════════════════════════════════════════════════════════════
 
 /// Assembled render data for one frame (passed to renderers by the platform).
+///
+/// Only available with the `gpu` feature since it contains wgpu texture references.
+#[cfg(feature = "gpu")]
 pub struct RenderOutput<'a> {
     /// Raster tile layers (flat quads with crossfade overlays).
     pub raster_layers: Vec<RenderLayerData<'a>>,
@@ -371,7 +377,7 @@ impl MapController {
         to_register
     }
 
-    // ── Render data assembly ────────────────────────────────────
+    // ── Render data assembly (GPU feature only) ────────────────
 
     /// Build render data for all visible layers.
     ///
@@ -380,6 +386,9 @@ impl MapController {
     /// - `texture_fn`: closure that returns `&wgpu::TextureView` for a layer+coord
     ///
     /// Returns assembled `RenderOutput` ready to pass to renderers.
+    ///
+    /// Only available with the `gpu` feature.
+    #[cfg(feature = "gpu")]
     pub fn build_render_data<'a>(
         &'a self,
         layer_views: &[&'a dyn LayerStateView],
@@ -547,9 +556,10 @@ impl MapController {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Free functions for render data assembly (avoids borrow conflicts)
+// Free functions for render data assembly (GPU feature only)
 // ═══════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "gpu")]
 fn build_raster_layer<'a>(
     layer_name: &'a str,
     layer_opacity: f32,
@@ -601,6 +611,7 @@ fn build_raster_layer<'a>(
     (base, overlay)
 }
 
+#[cfg(feature = "gpu")]
 /// Split visible tiles into (flat, terrain) based on elevation data availability.
 ///
 /// A tile goes to the terrain list if the layer state has elevation data for it
@@ -633,6 +644,7 @@ fn split_by_elevation(
     (flat, terrain)
 }
 
+#[cfg(feature = "gpu")]
 fn build_terrain_layer<'a>(
     layer_name: &'a str,
     layer_opacity: f32,

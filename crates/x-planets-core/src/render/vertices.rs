@@ -1,4 +1,8 @@
 //! Vertex structs for tile, globe, and terrain rendering.
+//!
+//! The struct definitions are always available (pure `#[repr(C)]` + bytemuck POD).
+//! The `layout()` methods that return `wgpu::VertexBufferLayout` are only available
+//! when the `gpu` feature is enabled.
 
 /// Vertex layout for tile rendering.
 #[repr(C)]
@@ -8,6 +12,7 @@ pub struct TileVertex {
     pub tex_coord: [f32; 2],
 }
 
+#[cfg(feature = "gpu")]
 impl TileVertex {
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -41,6 +46,7 @@ pub struct GlobeTileVertex {
     pub sphere_pos: [f32; 3],
 }
 
+#[cfg(feature = "gpu")]
 impl GlobeTileVertex {
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -80,6 +86,7 @@ pub struct TerrainVertex {
     pub tex_coord: [f32; 2],
 }
 
+#[cfg(feature = "gpu")]
 impl TerrainVertex {
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
