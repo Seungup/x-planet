@@ -17,7 +17,7 @@ use x_planets_tiles::TerrainEncoding;
 use crate::engine::{LayerConfig, LayerKind, MapConfig, MapEngine};
 use crate::interaction::{
     build_crossfade_overlay, compute_crossfade, compute_fade_overrides, update_tile_visibility,
-    AnimationController, CameraAnimation, EasingMode, FADE_DURATION,
+    AnimationController, CameraAnimation, EasingMode,
 };
 use crate::pipeline::{resolve_fallbacks, RenderableTile};
 #[cfg(feature = "gpu")]
@@ -237,6 +237,44 @@ impl MapController {
 
     pub fn pitch_angle(&self) -> f64 {
         self.engine.viewport.pitch
+    }
+
+    // ── Camera Limits ──────────────────────────────────────────
+
+    pub fn min_zoom(&self) -> f64 {
+        self.engine.camera.min_zoom
+    }
+
+    pub fn set_min_zoom(&mut self, zoom: f64) {
+        self.engine.camera.min_zoom = zoom;
+    }
+
+    pub fn max_zoom(&self) -> f64 {
+        self.engine.camera.max_zoom
+    }
+
+    pub fn set_max_zoom(&mut self, zoom: f64) {
+        self.engine.camera.max_zoom = zoom;
+    }
+
+    pub fn max_pitch(&self) -> f64 {
+        self.engine.camera.max_pitch
+    }
+
+    pub fn set_max_pitch(&mut self, degrees: f64) {
+        self.engine.camera.max_pitch = degrees;
+        // Clamp current pitch to new limit
+        if self.engine.viewport.pitch > degrees {
+            self.engine.viewport.pitch = degrees;
+        }
+    }
+
+    pub fn tile_budget(&self) -> usize {
+        self.engine.viewport.tile_budget
+    }
+
+    pub fn set_tile_budget(&mut self, budget: usize) {
+        self.engine.viewport.tile_budget = budget;
     }
 
     /// Set bearing (rotation) directly in degrees.
@@ -828,7 +866,7 @@ impl MapController {
 
                 for (&coord, &start) in &self.departing_tiles {
                     let elapsed = now_secs - start;
-                    let fade_out = (1.0 - elapsed / FADE_DURATION).max(0.0) as f32;
+                    let fade_out = (1.0 - elapsed / self.anim.config.fade_duration).max(0.0) as f32;
                     if fade_out > 0.01 {
                         if let Some(tv) = texture_fn(first_raster_lv.name(), &coord) {
                             overlay_tiles.push(RenderableTile {

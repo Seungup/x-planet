@@ -14,6 +14,8 @@ pub struct CameraController {
     pub min_zoom: f64,
     /// Maximum zoom level.
     pub max_zoom: f64,
+    /// Maximum pitch angle in degrees.
+    pub max_pitch: f64,
 }
 
 impl CameraController {
@@ -23,6 +25,7 @@ impl CameraController {
             zoom_speed: 1.0,
             min_zoom: 0.0,
             max_zoom: 22.0,
+            max_pitch: 60.0,
         }
     }
 
@@ -72,9 +75,9 @@ impl CameraController {
             .clamp(effective_min, self.max_zoom);
     }
 
-    /// Set absolute pitch angle (clamped to 0-60 degrees).
+    /// Set absolute pitch angle (clamped to 0–max_pitch degrees).
     pub fn set_pitch(&self, viewport: &mut super::Viewport, degrees: f64) {
-        viewport.pitch = degrees.clamp(0.0, 60.0);
+        viewport.pitch = degrees.clamp(0.0, self.max_pitch);
     }
 
     /// Set absolute bearing (0-360 degrees, clockwise from north).

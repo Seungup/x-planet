@@ -5,6 +5,7 @@
 //! (native / wasm) owns the per-layer GPU state (textures, loaders, etc.).
 
 use crate::viewport::{CameraController, Viewport};
+use x_planets_math::ecef::{CelestialBody, EARTH};
 use x_planets_math::GeoCoord;
 use x_planets_projection::ProjectionRegistry;
 use x_planets_tiles::TerrainEncoding;
@@ -111,6 +112,16 @@ pub struct MapConfig {
     /// Terrain height exaggeration factor (default: 1.5).
     /// Higher values make mountains more prominent in the Mercator view.
     pub terrain_exaggeration: f64,
+    /// Minimum zoom level (default: 0.0).
+    pub min_zoom: f64,
+    /// Maximum zoom level (default: 22.0).
+    pub max_zoom: f64,
+    /// Maximum pitch angle in degrees (default: 60.0).
+    pub max_pitch: f64,
+    /// Maximum number of tiles rendered per frame (default: 150).
+    pub tile_budget: usize,
+    /// Celestial body parameters (default: Earth/WGS84).
+    pub body: CelestialBody,
 }
 
 impl Default for MapConfig {
@@ -124,6 +135,11 @@ impl Default for MapConfig {
             max_cached_tiles: 256,
             layers: Vec::new(),
             terrain_exaggeration: 1.5,
+            min_zoom: 0.0,
+            max_zoom: 22.0,
+            max_pitch: 60.0,
+            tile_budget: 150,
+            body: EARTH,
         }
     }
 }
@@ -155,6 +171,7 @@ impl MapEngine {
         let mut viewport = Viewport::new(width, height);
         viewport.center = config.center;
         viewport.zoom = config.zoom;
+        viewport.tile_budget = config.tile_budget;
 
         let layers = if config.layers.is_empty() {
             vec![TileLayer {
@@ -178,9 +195,14 @@ impl MapEngine {
                 .collect()
         };
 
+        let mut camera = CameraController::new();
+        camera.min_zoom = config.min_zoom;
+        camera.max_zoom = config.max_zoom;
+        camera.max_pitch = config.max_pitch;
+
         let mut engine = Self {
             viewport,
-            camera: CameraController::new(),
+            camera,
             projection_registry: ProjectionRegistry::new(),
             layers,
             active_projection: config.projection,

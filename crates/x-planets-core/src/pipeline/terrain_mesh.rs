@@ -275,8 +275,13 @@ pub(crate) fn sample_elevation_bilinear(
 ///
 /// Pure function.
 pub fn compute_height_scale(exaggeration: f64) -> f32 {
-    const EARTH_CIRCUMFERENCE_M: f64 = 40_075_000.0;
-    (exaggeration / EARTH_CIRCUMFERENCE_M) as f32
+    compute_height_scale_for(exaggeration, x_planets_math::ecef::EARTH.circumference)
+}
+
+/// Like [`compute_height_scale`] but accepts an explicit equatorial circumference
+/// so it works for any celestial body (Moon, Mars, etc.).
+pub fn compute_height_scale_for(exaggeration: f64, circumference: f64) -> f32 {
+    (exaggeration / circumference) as f32
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -309,6 +314,16 @@ pub fn compute_height_scale(exaggeration: f64) -> f32 {
 pub fn build_terrain_mesh_from_qm(
     coord: &TileCoord,
     qm: &x_planets_tiles::DecodedQuantizedMesh,
+) -> (Vec<TerrainVertex>, Vec<u32>) {
+    build_terrain_mesh_from_qm_with(coord, qm, x_planets_math::ecef::EARTH.circumference)
+}
+
+/// Like [`build_terrain_mesh_from_qm`] but accepts an explicit equatorial
+/// circumference for multi-planet support.
+pub fn build_terrain_mesh_from_qm_with(
+    coord: &TileCoord,
+    qm: &x_planets_tiles::DecodedQuantizedMesh,
+    circumference: f64,
 ) -> (Vec<TerrainVertex>, Vec<u32>) {
     use x_planets_tiles::quantized_mesh::decode_oct_normal;
 
@@ -373,7 +388,7 @@ pub fn build_terrain_mesh_from_qm(
     // scaling.  We use ~2 % of the tile's equatorial width in metres,
     // which gives a consistent 2-3 % depth relative to tile_w in the
     // final coordinate space regardless of exaggeration.
-    let tile_extent_m = 40_075_000.0_f64 / n;
+    let tile_extent_m = circumference / n;
     let skirt_depth = (tile_extent_m * 0.02) as f32;
     let down_normal = [0.0f32, 0.0, -1.0];
 

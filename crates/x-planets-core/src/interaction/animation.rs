@@ -39,6 +39,51 @@ pub const ZOOM_ANIM_SPEED: f64 = 16.0;
 pub const DRAG_SAMPLE_WINDOW: f64 = 0.1;
 
 // ═══════════════════════════════════════════════════════════════════
+// InteractionConfig — runtime-tunable interaction parameters
+// ═══════════════════════════════════════════════════════════════════
+
+/// Runtime-tunable interaction parameters.
+///
+/// Default values match the `pub const` values above.  Modify these on
+/// `AnimationController::config` to adjust interaction behaviour at runtime.
+#[derive(Debug, Clone)]
+pub struct InteractionConfig {
+    pub fade_duration: f64,
+    pub double_click_time: f64,
+    pub double_click_dist: f64,
+    pub pan_amount: f64,
+    pub zoom_step: f64,
+    pub keyboard_rotate: f64,
+    pub pitch_sensitivity: f64,
+    pub rotate_sensitivity: f64,
+    pub touch_grace_period: f64,
+    pub inertia_friction: f64,
+    pub inertia_min_speed: f64,
+    pub zoom_anim_speed: f64,
+    pub drag_sample_window: f64,
+}
+
+impl Default for InteractionConfig {
+    fn default() -> Self {
+        Self {
+            fade_duration: FADE_DURATION,
+            double_click_time: DOUBLE_CLICK_TIME,
+            double_click_dist: DOUBLE_CLICK_DIST,
+            pan_amount: PAN_AMOUNT,
+            zoom_step: ZOOM_STEP,
+            keyboard_rotate: KEYBOARD_ROTATE,
+            pitch_sensitivity: PITCH_SENSITIVITY,
+            rotate_sensitivity: ROTATE_SENSITIVITY,
+            touch_grace_period: TOUCH_GRACE_PERIOD,
+            inertia_friction: INERTIA_FRICTION,
+            inertia_min_speed: INERTIA_MIN_SPEED,
+            zoom_anim_speed: ZOOM_ANIM_SPEED,
+            drag_sample_window: DRAG_SAMPLE_WINDOW,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Utility
 // ═══════════════════════════════════════════════════════════════════
 
@@ -107,6 +152,9 @@ impl CameraAnimation {
 ///
 /// All timestamps are `f64` seconds (relative to an arbitrary epoch).
 pub struct AnimationController {
+    /// Runtime-tunable interaction parameters.
+    pub config: InteractionConfig,
+
     // ── Smooth zoom ──
     /// Target zoom level (accumulated from scroll/keyboard).
     pub zoom_target: f64,
@@ -137,6 +185,7 @@ pub struct AnimationController {
 impl AnimationController {
     pub fn new(initial_zoom: f64) -> Self {
         Self {
+            config: InteractionConfig::default(),
             zoom_target: initial_zoom,
             zoom_anchor: None,
             pan_velocity: (0.0, 0.0),
@@ -154,7 +203,7 @@ impl AnimationController {
         let zoom_active = (self.zoom_target - current_zoom).abs() > 0.001;
         let pan_active = {
             let (vx, vy) = self.pan_velocity;
-            (vx * vx + vy * vy).sqrt() > INERTIA_MIN_SPEED
+            (vx * vx + vy * vy).sqrt() > self.config.inertia_min_speed
         };
         let fades_active = !self.tile_fade_start.is_empty();
         let camera_active = self.camera_anim.as_ref().map_or(false, |a| !a.is_done());
@@ -204,7 +253,7 @@ impl AnimationController {
             .clamp(engine.camera.min_zoom, engine.camera.max_zoom);
         let diff = target - current;
         if diff.abs() > 0.001 {
-            let new_zoom = exp_decay(current, target, ZOOM_ANIM_SPEED, dt);
+            let new_zoom = exp_decay(current, target, self.config.zoom_anim_speed, dt);
             let delta = new_zoom - current;
             match self.zoom_anchor {
                 Some((mx, my)) => engine.zoom_at_for_mode(delta, mx, my, mode),
@@ -218,9 +267,9 @@ impl AnimationController {
         // ── Inertia pan ──
         let (vx, vy) = self.pan_velocity;
         let speed = (vx * vx + vy * vy).sqrt();
-        if speed > INERTIA_MIN_SPEED {
+        if speed > self.config.inertia_min_speed {
             engine.pan_for_mode(vx * dt, -(vy * dt), mode);
-            let friction = (-INERTIA_FRICTION * dt).exp();
+            let friction = (-self.config.inertia_friction * dt).exp();
             self.pan_velocity = (vx * friction, vy * friction);
         } else {
             self.pan_velocity = (0.0, 0.0);
@@ -230,14 +279,14 @@ impl AnimationController {
     /// Record a drag position sample for velocity estimation.
     pub fn record_drag(&mut self, pos: (f64, f64), time_secs: f64) {
         self.drag_samples
-            .retain(|(_, t)| time_secs - t < DRAG_SAMPLE_WINDOW);
+            .retain(|(_, t)| time_secs - t < self.config.drag_sample_window);
         self.drag_samples.push((pos, time_secs));
     }
 
     /// Compute pan velocity from recent drag samples (call on mouse-up/touch-end).
     pub fn compute_release_velocity(&mut self, time_secs: f64) {
         self.drag_samples
-            .retain(|(_, t)| time_secs - t < DRAG_SAMPLE_WINDOW);
+            .retain(|(_, t)| time_secs - t < self.config.drag_sample_window);
         if self.drag_samples.len() < 2 {
             self.pan_velocity = (0.0, 0.0);
             return;
@@ -266,12 +315,12 @@ impl AnimationController {
     pub fn check_double_click(&mut self, pos: (f64, f64), time_secs: f64) -> bool {
         let is_double = self
             .last_click_time
-            .map(|t| time_secs - t < DOUBLE_CLICK_TIME)
+            .map(|t| time_secs - t < self.config.double_click_time)
             .unwrap_or(false)
             && self
                 .last_click_pos
                 .map(|(lx, ly)| {
-                    ((pos.0 - lx).powi(2) + (pos.1 - ly).powi(2)).sqrt() < DOUBLE_CLICK_DIST
+                    ((pos.0 - lx).powi(2) + (pos.1 - ly).powi(2)).sqrt() < self.config.double_click_dist
                 })
                 .unwrap_or(false);
 
@@ -313,7 +362,7 @@ impl AnimationController {
     /// Garbage-collect finished fade entries.
     pub fn gc_fades(&mut self, now_secs: f64) {
         self.tile_fade_start
-            .retain(|_, start| now_secs - *start < FADE_DURATION + 0.1);
+            .retain(|_, start| now_secs - *start < self.config.fade_duration + 0.1);
     }
 }
 

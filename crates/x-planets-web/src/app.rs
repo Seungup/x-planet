@@ -62,21 +62,21 @@ pub(crate) struct WebLayerState {
 }
 
 impl WebLayerState {
-    fn new(name: String, kind: LayerKind, url_template: String) -> Self {
+    fn new(name: String, kind: LayerKind, url_template: String, max_cached: usize, max_concurrent: usize) -> Self {
         Self {
             name,
             kind,
             url_template,
-            tile_textures: TileCache::new(256),
+            tile_textures: TileCache::new(max_cached),
             terrain_data: HashMap::new(),
             pending_coords: HashSet::new(),
             completed_queue: Rc::new(RefCell::new(Vec::new())),
             failed_queue: Rc::new(RefCell::new(Vec::new())),
-            max_concurrent: 6,
+            max_concurrent,
             available_coords_cache: HashSet::new(),
             elevation_url: None,
             pending_elevation_coords: HashSet::new(),
-            max_elevation_concurrent: 4,
+            max_elevation_concurrent: max_concurrent.min(4),
             failed_elevation_queue: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -151,6 +151,8 @@ impl WebApp {
                 l.config.name.clone(),
                 l.config.kind.clone(),
                 l.config.tile_source_url.clone(),
+                l.config.max_cached_tiles,
+                l.config.max_concurrent_loads,
             ))
             .collect();
 
@@ -172,11 +174,13 @@ impl WebApp {
     }
 
     /// Add a new layer state for a dynamically added layer.
-    pub fn add_layer_state(&mut self, name: &str, url: &str) {
+    pub fn add_layer_state(&mut self, name: &str, url: &str, max_cached: usize, max_concurrent: usize) {
         self.layer_states.push(WebLayerState::new(
             name.to_string(),
             LayerKind::Raster,
             url.to_string(),
+            max_cached,
+            max_concurrent,
         ));
     }
 

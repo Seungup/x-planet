@@ -61,6 +61,18 @@ pub struct MapSection {
     /// Default: 20.0 (good for z=5–12 in Mercator view).
     #[serde(default = "default_terrain_exaggeration")]
     pub terrain_exaggeration: f64,
+    /// Minimum zoom level (default: 0.0).
+    #[serde(default)]
+    pub min_zoom: f64,
+    /// Maximum zoom level (default: 22.0).
+    #[serde(default = "default_max_zoom")]
+    pub max_zoom: f64,
+    /// Maximum pitch angle in degrees (default: 60.0).
+    #[serde(default = "default_max_pitch")]
+    pub max_pitch: f64,
+    /// Maximum tiles rendered per frame (default: 150).
+    #[serde(default = "default_tile_budget")]
+    pub tile_budget: usize,
 }
 
 impl Default for MapSection {
@@ -70,6 +82,10 @@ impl Default for MapSection {
             zoom: default_zoom(),
             projection: default_projection(),
             terrain_exaggeration: default_terrain_exaggeration(),
+            min_zoom: 0.0,
+            max_zoom: default_max_zoom(),
+            max_pitch: default_max_pitch(),
+            tile_budget: default_tile_budget(),
         }
     }
 }
@@ -85,6 +101,15 @@ fn default_projection() -> String {
 }
 fn default_terrain_exaggeration() -> f64 {
     1.5
+}
+fn default_max_zoom() -> f64 {
+    22.0
+}
+fn default_max_pitch() -> f64 {
+    60.0
+}
+fn default_tile_budget() -> usize {
+    150
 }
 
 #[derive(Deserialize)]
@@ -215,6 +240,10 @@ impl FileConfig {
             zoom: self.map.zoom,
             projection: self.map.projection,
             terrain_exaggeration: self.map.terrain_exaggeration,
+            min_zoom: self.map.min_zoom,
+            max_zoom: self.map.max_zoom,
+            max_pitch: self.map.max_pitch,
+            tile_budget: self.map.tile_budget,
             layers,
             ..Default::default()
         }

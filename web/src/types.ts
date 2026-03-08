@@ -64,6 +64,16 @@ export interface XPlanetsMap {
   // ── Viewport ──
   resize(width: number, height: number): void;
 
+  // ── Camera Limits ──
+  getMinZoom(): number;
+  setMinZoom(zoom: number): void;
+  getMaxZoom(): number;
+  setMaxZoom(zoom: number): void;
+  getMaxPitch(): number;
+  setMaxPitch(degrees: number): void;
+  getTileBudget(): number;
+  setTileBudget(budget: number): void;
+
   // ── Events ──
   on(event: "move", callback: (data: { lat: number; lon: number }) => void): void;
   on(event: "zoom", callback: (data: { zoom: number }) => void): void;
@@ -97,6 +107,10 @@ export interface XPlanetsConfig {
   center?: [number, number];
   zoom?: number;
   projection?: string;
+  minZoom?: number;
+  maxZoom?: number;
+  maxPitch?: number;
+  tileBudget?: number;
   layers?: Array<{
     name: string;
     url: string;

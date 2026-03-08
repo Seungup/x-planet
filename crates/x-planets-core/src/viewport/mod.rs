@@ -32,7 +32,8 @@ enum TileLodMode {
 /// At zoom 0 the camera is ~3.14 radii above the surface (sees whole globe).
 /// Each zoom level halves the altitude.
 fn globe_unit_altitude(zoom: f64) -> f64 {
-    (20_000_000.0 / 6_378_137.0) / 2.0_f64.powf(zoom)
+    use x_planets_math::ecef::EARTH;
+    ((EARTH.circumference / 2.0) / EARTH.ellipsoid.a) / 2.0_f64.powf(zoom)
 }
 
 /// Effective visible half-angle for globe tile selection and interaction.
@@ -62,6 +63,8 @@ pub struct Viewport {
     pub pitch: f64,
     /// Camera bearing in degrees, clockwise from north (0 = north up).
     pub bearing: f64,
+    /// Maximum number of tiles rendered per frame.
+    pub tile_budget: usize,
 }
 
 impl Viewport {
@@ -73,6 +76,7 @@ impl Viewport {
             zoom: 2.0,
             pitch: 0.0,
             bearing: 0.0,
+            tile_budget: 150,
         }
     }
 

@@ -345,10 +345,12 @@ mod web_impl {
                 kind: LayerKind::Raster,
                 ..Default::default()
             };
+            let max_cached = config.max_cached_tiles;
+            let max_concurrent = config.max_concurrent_loads;
             let mut app = self.app.borrow_mut();
             let idx = app.controller.add_layer(config);
             // Add corresponding WebLayerState
-            app.add_layer_state(name, url);
+            app.add_layer_state(name, url, max_cached, max_concurrent);
             idx
         }
 
@@ -383,6 +385,56 @@ mod web_impl {
         /// Resize the map viewport.
         pub fn resize(&self, width: u32, height: u32) {
             self.app.borrow_mut().controller.resize(width, height);
+        }
+
+        // ── Camera Limits ──
+
+        /// Get the minimum zoom level.
+        #[wasm_bindgen(js_name = "getMinZoom")]
+        pub fn get_min_zoom(&self) -> f64 {
+            self.app.borrow().controller.min_zoom()
+        }
+
+        /// Set the minimum zoom level.
+        #[wasm_bindgen(js_name = "setMinZoom")]
+        pub fn set_min_zoom(&self, zoom: f64) {
+            self.app.borrow_mut().controller.set_min_zoom(zoom);
+        }
+
+        /// Get the maximum zoom level.
+        #[wasm_bindgen(js_name = "getMaxZoom")]
+        pub fn get_max_zoom(&self) -> f64 {
+            self.app.borrow().controller.max_zoom()
+        }
+
+        /// Set the maximum zoom level.
+        #[wasm_bindgen(js_name = "setMaxZoom")]
+        pub fn set_max_zoom(&self, zoom: f64) {
+            self.app.borrow_mut().controller.set_max_zoom(zoom);
+        }
+
+        /// Get the maximum pitch angle in degrees.
+        #[wasm_bindgen(js_name = "getMaxPitch")]
+        pub fn get_max_pitch(&self) -> f64 {
+            self.app.borrow().controller.max_pitch()
+        }
+
+        /// Set the maximum pitch angle in degrees.
+        #[wasm_bindgen(js_name = "setMaxPitch")]
+        pub fn set_max_pitch(&self, degrees: f64) {
+            self.app.borrow_mut().controller.set_max_pitch(degrees);
+        }
+
+        /// Get the tile budget (max tiles per frame).
+        #[wasm_bindgen(js_name = "getTileBudget")]
+        pub fn get_tile_budget(&self) -> usize {
+            self.app.borrow().controller.tile_budget()
+        }
+
+        /// Set the tile budget (max tiles per frame).
+        #[wasm_bindgen(js_name = "setTileBudget")]
+        pub fn set_tile_budget(&self, budget: usize) {
+            self.app.borrow_mut().controller.set_tile_budget(budget);
         }
 
         // ── Events ──
@@ -523,6 +575,34 @@ mod web_impl {
         if let Ok(zoom) = js_sys::Reflect::get(val, &"zoom".into()) {
             if let Some(z) = zoom.as_f64() {
                 config.zoom = z;
+            }
+        }
+
+        // minZoom: number
+        if let Ok(v) = js_sys::Reflect::get(val, &"minZoom".into()) {
+            if let Some(n) = v.as_f64() {
+                config.min_zoom = n;
+            }
+        }
+
+        // maxZoom: number
+        if let Ok(v) = js_sys::Reflect::get(val, &"maxZoom".into()) {
+            if let Some(n) = v.as_f64() {
+                config.max_zoom = n;
+            }
+        }
+
+        // maxPitch: number
+        if let Ok(v) = js_sys::Reflect::get(val, &"maxPitch".into()) {
+            if let Some(n) = v.as_f64() {
+                config.max_pitch = n;
+            }
+        }
+
+        // tileBudget: number
+        if let Ok(v) = js_sys::Reflect::get(val, &"tileBudget".into()) {
+            if let Some(n) = v.as_f64() {
+                config.tile_budget = n as usize;
             }
         }
 
