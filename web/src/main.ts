@@ -1,36 +1,40 @@
 import "./style.css";
 import { setupControls } from "./controls.ts";
-import type { XPlanetsMap } from "./types.ts";
+import type { XPlanetsMap, XPlanetsConfig } from "./types.ts";
+
+/**
+ * Map configuration — all layer setup lives here in TypeScript.
+ *
+ * Edit this object to change the base imagery, add terrain sources,
+ * switch projections, etc. No Rust recompilation needed.
+ */
+const MAP_CONFIG: XPlanetsConfig = {
+  center: [37.5665, 126.978],
+  zoom: 5,
+  projection: "Web Mercator",
+  layers: [
+    {
+      name: "osm",
+      url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      kind: "raster",
+    },
+  ],
+};
 
 async function main(): Promise<void> {
-  // Load and initialize the WASM module.
-  // wasm-pack --target web generates an init() that fetches the .wasm file
-  // and calls #[wasm_bindgen(start)] which bootstraps GPU + rendering.
+  // Load the WASM module (just the runtime, no map creation yet).
   const { default: init } = await import("../pkg/x_planets_web.js");
   await init();
 
-  // The WASM start function spawns an async task that sets window.xplanets
-  // once GPU initialization completes. Wait for the ready event.
-  const map = await waitForReady();
+  // Create the map with our TS-defined config.
+  // @ts-expect-error XPlanets is exposed globally by the WASM module
+  const map: XPlanetsMap = await XPlanets.create(
+    "x-planets-canvas",
+    MAP_CONFIG,
+  );
 
-  // Create UI controls (buttons) driven by the typed map API.
+  // Create UI controls driven by the typed map API.
   setupControls(map);
-}
-
-function waitForReady(): Promise<XPlanetsMap> {
-  return new Promise((resolve) => {
-    // Already initialized (fast path).
-    if (window.xplanets) {
-      resolve(window.xplanets);
-      return;
-    }
-    // Wait for the Rust side to signal readiness.
-    window.addEventListener(
-      "xplanets-ready",
-      () => resolve(window.xplanets!),
-      { once: true },
-    );
-  });
 }
 
 main().catch(console.error);
