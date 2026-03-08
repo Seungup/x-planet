@@ -99,15 +99,20 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let color = textureSample(tile_texture, tile_sampler, uv);
 
     // -- Hillshade lighting --
-    // Sun direction: northwest, 45 degree elevation (classic cartographic hillshade)
+    // Sun direction: northwest, ~45° elevation (classic cartographic hillshade)
     let sun_dir = normalize(vec3<f32>(-0.5, -0.5, 0.7));
     let n = normalize(input.normal);
 
     // Lambertian diffuse
     let ndotl = max(dot(n, sun_dir), 0.0);
 
-    // Blend: ambient + diffuse.  Keeps 40% base brightness + 60% sun contribution.
-    let shade = 0.4 + 0.6 * ndotl;
+    // Normalize so flat terrain (normal = straight up) gets shade = 1.0.
+    // Without this, flat areas are uniformly darkened by ~18% because
+    // dot([0,0,1], sun_dir) ≈ 0.70, not 1.0.
+    // Slopes facing the sun get slightly brighter (capped at 1.15),
+    // slopes facing away get darker (floor at 0.3).
+    let flat_illumination = sun_dir.z;  // dot(vec3(0,0,1), sun_dir)
+    let shade = clamp(0.3 + 0.7 * ndotl / flat_illumination, 0.3, 1.15);
 
     // Apply tile opacity
     let opacity = tile.tile_meta.y;
