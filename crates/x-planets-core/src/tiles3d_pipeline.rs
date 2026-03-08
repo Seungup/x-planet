@@ -7,7 +7,7 @@
 //! Follows the Karpathy principle: no GPU, no I/O, independently testable.
 
 use glam::{DMat4, DVec3, DVec4, Mat4};
-use x_planets_math::ecef::{geodetic_to_ecef, WGS84};
+use x_planets_math::ecef::geodetic_to_ecef;
 use x_planets_tiles::tiles3d::traversal::TraversalCamera;
 
 use crate::viewport::Viewport;
@@ -26,10 +26,10 @@ pub fn viewport_to_traversal_camera(viewport: &Viewport) -> TraversalCamera {
     let lon_rad = viewport.center.lon.to_radians();
 
     // Camera altitude from zoom level (approximate).
-    let altitude = zoom_to_altitude(viewport.zoom);
+    let altitude = zoom_to_altitude_for(viewport.zoom, viewport.body.circumference);
 
     // Camera position in ECEF.
-    let position_ecef = geodetic_to_ecef(lat_rad, lon_rad, altitude, &WGS84);
+    let position_ecef = geodetic_to_ecef(lat_rad, lon_rad, altitude, &viewport.body.ellipsoid);
 
     // Build view-projection matrix.
     let view_proj = build_ecef_view_proj(viewport, position_ecef, lat_rad, lon_rad, altitude);
@@ -45,14 +45,24 @@ pub fn viewport_to_traversal_camera(viewport: &Viewport) -> TraversalCamera {
 /// At zoom 0 the camera sees the whole Earth (~20,000 km altitude).
 /// Each zoom level halves the visible area (doubles the resolution).
 pub fn zoom_to_altitude(zoom: f64) -> f64 {
-    // At zoom 0, roughly 20,000 km to see the whole earth.
+    zoom_to_altitude_for(zoom, x_planets_math::ecef::EARTH.circumference)
+}
+
+/// Like [`zoom_to_altitude`] but for an arbitrary body circumference.
+pub fn zoom_to_altitude_for(zoom: f64, circumference: f64) -> f64 {
+    // At zoom 0, roughly half-circumference altitude to see the whole body.
     // Each zoom level halves the distance.
-    20_000_000.0 / 2.0_f64.powf(zoom)
+    (circumference / 2.0) / 2.0_f64.powf(zoom)
 }
 
 /// Convert camera altitude in meters to approximate zoom level.
 pub fn altitude_to_zoom(altitude: f64) -> f64 {
-    (20_000_000.0 / altitude.max(1.0)).log2()
+    altitude_to_zoom_for(altitude, x_planets_math::ecef::EARTH.circumference)
+}
+
+/// Like [`altitude_to_zoom`] but for an arbitrary body circumference.
+pub fn altitude_to_zoom_for(altitude: f64, circumference: f64) -> f64 {
+    ((circumference / 2.0) / altitude.max(1.0)).log2()
 }
 
 /// Build an ECEF view-projection matrix for 3D Tiles rendering.
@@ -188,10 +198,10 @@ pub fn traversal_fov_y() -> f64 {
 pub fn build_tiles3d_uniforms(viewport: &Viewport) -> (x_planets_math::ViewportUniforms, DVec3) {
     let lat_rad = viewport.center.lat.to_radians();
     let lon_rad = viewport.center.lon.to_radians();
-    let altitude = zoom_to_altitude(viewport.zoom);
+    let altitude = zoom_to_altitude_for(viewport.zoom, viewport.body.circumference);
 
     // Camera ECEF position (returned for model matrix computation).
-    let camera_ecef = geodetic_to_ecef(lat_rad, lon_rad, altitude, &WGS84);
+    let camera_ecef = geodetic_to_ecef(lat_rad, lon_rad, altitude, &viewport.body.ellipsoid);
 
     // ── Local ENU basis ──
     let sin_lat = lat_rad.sin();
@@ -276,11 +286,13 @@ mod tests {
 
     #[test]
     fn test_zoom_to_altitude() {
-        // Zoom 0 → ~20,000 km
-        assert!((zoom_to_altitude(0.0) - 20_000_000.0).abs() < 1.0);
+        let half_circ = x_planets_math::ecef::EARTH.circumference / 2.0;
 
-        // Zoom 1 → ~10,000 km
-        assert!((zoom_to_altitude(1.0) - 10_000_000.0).abs() < 1.0);
+        // Zoom 0 → ~half circumference
+        assert!((zoom_to_altitude(0.0) - half_circ).abs() < 1.0);
+
+        // Zoom 1 → ~half of that
+        assert!((zoom_to_altitude(1.0) - half_circ / 2.0).abs() < 1.0);
 
         // Higher zoom → lower altitude
         assert!(zoom_to_altitude(10.0) < zoom_to_altitude(5.0));

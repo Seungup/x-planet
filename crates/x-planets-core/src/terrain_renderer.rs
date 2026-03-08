@@ -17,7 +17,7 @@ use x_planets_math::{TileCoord, TileUniforms, ViewportUniforms};
 
 use crate::pipeline::{
     build_terrain_mesh, build_terrain_mesh_centered, build_terrain_mesh_globe,
-    compute_height_scale, fallback_uv_rect,
+    compute_height_scale_for, fallback_uv_rect,
     tile_passes_angular_filter,
     tile_uniforms_for_centered, tile_uniforms_for_globe,
     RenderableTile,
@@ -84,7 +84,7 @@ pub struct TerrainRenderer {
     depth_format: wgpu::TextureFormat,
     surface_width: u32,
     surface_height: u32,
-    /// Elevation exaggeration factor (default: 20.0 for visible terrain in Mercator view).
+    /// Elevation exaggeration factor (default: 1.5).
     pub exaggeration: f64,
     /// Cached vertex/index buffers keyed by render coord.
     mesh_cache: HashMap<TileCoord, CachedMesh>,
@@ -435,7 +435,7 @@ impl TerrainRenderer {
             });
         }
 
-        self.mesh_cache.get(coord).unwrap()
+        self.mesh_cache.get(coord).expect("mesh_cache: just-inserted entry missing")
     }
 
     /// Build mesh using standard Mercator (original logic).
@@ -551,7 +551,7 @@ impl TerrainRenderer {
             self.mesh_cache.clear();
         }
 
-        let height_scale = compute_height_scale(self.exaggeration);
+        let height_scale = compute_height_scale_for(self.exaggeration, viewport.body.circumference);
 
         // Update viewport uniforms
         let uniforms = viewport.to_uniforms();

@@ -17,7 +17,7 @@ use x_planets_tiles::TerrainEncoding;
 use crate::engine::{LayerConfig, LayerKind, MapConfig, MapEngine};
 use crate::interaction::{
     build_crossfade_overlay, compute_crossfade, compute_fade_overrides, update_tile_visibility,
-    AnimationController, FADE_DURATION,
+    AnimationController, CameraAnimation, EasingMode,
 };
 use crate::pipeline::{resolve_fallbacks, RenderableTile};
 #[cfg(feature = "gpu")]
@@ -25,6 +25,55 @@ use crate::render::RenderLayerData;
 use crate::terrain_data::TerrainTileData;
 #[cfg(feature = "gpu")]
 use crate::terrain_renderer::TerrainLayerData;
+
+// ═══════════════════════════════════════════════════════════════════
+// MapEvent — platform-agnostic event signals
+// ═══════════════════════════════════════════════════════════════════
+
+/// Events emitted by [`MapController`] when viewport state changes.
+///
+/// Platform code (web/native) can drain these each frame and dispatch them
+/// to registered callbacks (e.g. JS `on("move", fn)` handlers).
+#[derive(Debug, Clone)]
+pub enum MapEvent {
+    Move { lat: f64, lon: f64 },
+    Zoom { zoom: f64 },
+    Pitch { pitch: f64 },
+    Bearing { bearing: f64 },
+    MoveEnd,
+    ZoomEnd,
+    Click { lat: f64, lon: f64, x: f64, y: f64 },
+}
+
+impl MapEvent {
+    /// Event name string for JS dispatch.
+    pub fn name(&self) -> &'static str {
+        match self {
+            MapEvent::Move { .. } => "move",
+            MapEvent::Zoom { .. } => "zoom",
+            MapEvent::Pitch { .. } => "pitch",
+            MapEvent::Bearing { .. } => "bearing",
+            MapEvent::MoveEnd => "moveend",
+            MapEvent::ZoomEnd => "zoomend",
+            MapEvent::Click { .. } => "click",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// LayerInfo — public read-only layer metadata
+// ═══════════════════════════════════════════════════════════════════
+
+/// Read-only layer metadata returned by [`MapController::get_layer_info`].
+#[derive(Debug, Clone)]
+pub struct LayerInfo {
+    pub name: String,
+    pub url: String,
+    pub opacity: f32,
+    pub visible: bool,
+    pub z_order: i32,
+    pub kind: String,
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // LayerStateView — platform implements this to provide GPU cache state
@@ -101,6 +150,17 @@ pub struct MapController {
 
     /// Terrain rendering state (rendering property, not a layer).
     pub terrain: Option<TerrainState>,
+
+    // ── Event tracking ──
+    pending_events: Vec<MapEvent>,
+    /// Previous frame viewport state for change detection.
+    prev_center: (f64, f64),
+    prev_zoom: f64,
+    prev_bearing: f64,
+    prev_pitch: f64,
+    /// Whether the camera was animating last frame (for *End events).
+    was_moving: bool,
+    was_zooming: bool,
 }
 
 impl MapController {
@@ -108,6 +168,7 @@ impl MapController {
 
     pub fn new(config: MapConfig, width: u32, height: u32) -> Self {
         let initial_zoom = config.zoom;
+        let center = (config.center.lat, config.center.lon);
         let engine = MapEngine::new(config, width, height);
         Self {
             engine,
@@ -115,6 +176,13 @@ impl MapController {
             prev_visible_available: HashSet::new(),
             departing_tiles: HashMap::new(),
             terrain: None,
+            pending_events: Vec::new(),
+            prev_center: center,
+            prev_zoom: initial_zoom,
+            prev_bearing: 0.0,
+            prev_pitch: 0.0,
+            was_moving: false,
+            was_zooming: false,
         }
     }
 
@@ -171,6 +239,148 @@ impl MapController {
         self.engine.viewport.pitch
     }
 
+    // ── Camera Limits ──────────────────────────────────────────
+
+    pub fn min_zoom(&self) -> f64 {
+        self.engine.camera.min_zoom
+    }
+
+    pub fn set_min_zoom(&mut self, zoom: f64) {
+        self.engine.camera.min_zoom = zoom;
+    }
+
+    pub fn max_zoom(&self) -> f64 {
+        self.engine.camera.max_zoom
+    }
+
+    pub fn set_max_zoom(&mut self, zoom: f64) {
+        self.engine.camera.max_zoom = zoom;
+    }
+
+    pub fn max_pitch(&self) -> f64 {
+        self.engine.camera.max_pitch
+    }
+
+    pub fn set_max_pitch(&mut self, degrees: f64) {
+        self.engine.camera.max_pitch = degrees;
+        // Clamp current pitch to new limit
+        if self.engine.viewport.pitch > degrees {
+            self.engine.viewport.pitch = degrees;
+        }
+    }
+
+    pub fn tile_budget(&self) -> usize {
+        self.engine.viewport.tile_budget
+    }
+
+    pub fn set_tile_budget(&mut self, budget: usize) {
+        self.engine.viewport.tile_budget = budget;
+    }
+
+    /// Set bearing (rotation) directly in degrees.
+    pub fn set_bearing(&mut self, degrees: f64) {
+        self.engine.camera.set_bearing(&mut self.engine.viewport, degrees);
+        self.engine.request_redraw();
+    }
+
+    /// Set pitch (tilt) directly in degrees.
+    pub fn set_pitch(&mut self, degrees: f64) {
+        self.engine.camera.set_pitch(&mut self.engine.viewport, degrees);
+        self.engine.request_redraw();
+    }
+
+    /// Animate the camera to a new position (smooth ease-in-out).
+    ///
+    /// `duration_secs` defaults to 2.0 if `None`.
+    pub fn fly_to(
+        &mut self,
+        lat: f64,
+        lon: f64,
+        zoom: f64,
+        duration_secs: Option<f64>,
+        bearing: Option<f64>,
+        pitch: Option<f64>,
+    ) {
+        self.start_camera_anim(lat, lon, zoom, duration_secs, bearing, pitch, EasingMode::FlyTo);
+    }
+
+    /// Animate the camera to a new position (linear interpolation).
+    ///
+    /// `duration_secs` defaults to 1.0 if `None`.
+    pub fn ease_to(
+        &mut self,
+        lat: f64,
+        lon: f64,
+        zoom: f64,
+        duration_secs: Option<f64>,
+        bearing: Option<f64>,
+        pitch: Option<f64>,
+    ) {
+        self.start_camera_anim(lat, lon, zoom, duration_secs, bearing, pitch, EasingMode::EaseTo);
+    }
+
+    /// Jump the camera to a new position instantly (no animation).
+    pub fn jump_to(&mut self, lat: f64, lon: f64, zoom: f64, bearing: Option<f64>, pitch: Option<f64>) {
+        self.anim.stop_animation();
+        self.set_center(lat, lon);
+        self.set_zoom(zoom);
+        if let Some(b) = bearing {
+            self.set_bearing(b);
+        }
+        if let Some(p) = pitch {
+            self.set_pitch(p);
+        }
+    }
+
+    /// Cancel any running camera animation.
+    pub fn stop_animation(&mut self) {
+        self.anim.stop_animation();
+    }
+
+    fn start_camera_anim(
+        &mut self,
+        lat: f64,
+        lon: f64,
+        zoom: f64,
+        duration_secs: Option<f64>,
+        bearing: Option<f64>,
+        pitch: Option<f64>,
+        easing: EasingMode,
+    ) {
+        let default_dur = match easing {
+            EasingMode::FlyTo => 2.0,
+            EasingMode::EaseTo => 1.0,
+        };
+        let duration = duration_secs.unwrap_or(default_dur).max(0.01);
+
+        let target_bearing = bearing.unwrap_or(self.engine.viewport.bearing);
+        let target_pitch = pitch.unwrap_or(self.engine.viewport.pitch);
+
+        // Shortest-path bearing interpolation
+        let mut start_bearing = self.engine.viewport.bearing;
+        let delta_b = target_bearing - start_bearing;
+        if delta_b > 180.0 {
+            start_bearing += 360.0;
+        } else if delta_b < -180.0 {
+            start_bearing -= 360.0;
+        }
+
+        let anim = CameraAnimation {
+            start_center: self.engine.viewport.center,
+            target_center: GeoCoord::new(lat, lon),
+            start_zoom: self.engine.viewport.zoom,
+            target_zoom: zoom.clamp(self.engine.camera.min_zoom, self.engine.camera.max_zoom),
+            start_bearing,
+            target_bearing,
+            start_pitch: self.engine.viewport.pitch,
+            target_pitch,
+            duration,
+            elapsed: 0.0,
+            easing,
+        };
+        self.anim.start_camera_animation(anim);
+    }
+
     // ── Viewport ────────────────────────────────────────────────
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -183,6 +393,70 @@ impl MapController {
 
     pub fn height(&self) -> u32 {
         self.engine.viewport.height
+    }
+
+    // ── Coordinate conversion ─────────────────────────────────
+
+    /// Convert geographic (lat, lon) to screen pixel coordinates.
+    ///
+    /// Returns `None` if the point is outside the visible area.
+    pub fn project(&self, lat: f64, lon: f64) -> Option<(f64, f64)> {
+        let vp = &self.engine.viewport;
+        let merc = x_planets_math::geo_to_mercator(&GeoCoord::new(lat, lon));
+        let center_merc = x_planets_math::geo_to_mercator(&vp.center);
+
+        let scale = 2.0_f64.powf(vp.zoom);
+        let aspect = vp.width as f64 / vp.height as f64;
+
+        // Offset in Mercator space (handling wrap-around)
+        let mut dx = merc.x - center_merc.x;
+        if dx > 0.5 { dx -= 1.0; }
+        if dx < -0.5 { dx += 1.0; }
+        let dy = merc.y - center_merc.y;
+
+        // Apply bearing rotation
+        let bearing_rad = vp.bearing.to_radians();
+        let sin_b = bearing_rad.sin();
+        let cos_b = bearing_rad.cos();
+        let rx = cos_b * dx - sin_b * dy;
+        let ry = sin_b * dx + cos_b * dy;
+
+        // Convert to screen pixels
+        let sx = vp.width as f64 * 0.5 + rx * scale / aspect * vp.width as f64;
+        let sy = vp.height as f64 * 0.5 + ry * scale * vp.height as f64;
+
+        Some((sx, sy))
+    }
+
+    /// Convert screen pixel coordinates to geographic (lat, lon).
+    ///
+    /// Returns `None` if the point cannot be unprojected.
+    pub fn unproject(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let vp = &self.engine.viewport;
+        let center_merc = x_planets_math::geo_to_mercator(&vp.center);
+
+        let scale = 2.0_f64.powf(vp.zoom);
+        let aspect = vp.width as f64 / vp.height as f64;
+
+        // Screen → normalized offset
+        let dx_screen = (x - vp.width as f64 * 0.5) / vp.width as f64 * aspect / scale;
+        let dy_screen = (y - vp.height as f64 * 0.5) / vp.height as f64 / scale;
+
+        // Reverse bearing rotation
+        let bearing_rad = vp.bearing.to_radians();
+        let sin_b = bearing_rad.sin();
+        let cos_b = bearing_rad.cos();
+        let mx = cos_b * dx_screen + sin_b * dy_screen;
+        let my = -sin_b * dx_screen + cos_b * dy_screen;
+
+        let merc_x = (center_merc.x + mx).rem_euclid(1.0);
+        let merc_y = center_merc.y + my;
+        if merc_y < 0.0 || merc_y > 1.0 {
+            return None;
+        }
+
+        let geo = x_planets_math::mercator_to_geo(glam::DVec2::new(merc_x, merc_y));
+        Some((geo.lat, geo.lon))
     }
 
     // ── Projection ──────────────────────────────────────────────
@@ -235,6 +509,27 @@ impl MapController {
 
     pub fn layer_count(&self) -> usize {
         self.engine.layer_count()
+    }
+
+    /// Get all layer names in z-order (bottom to top).
+    pub fn layer_names(&self) -> Vec<String> {
+        self.engine.layers.iter().map(|l| l.config.name.clone()).collect()
+    }
+
+    /// Get layer info by name: (url, opacity, visible, z_order, kind).
+    pub fn get_layer_info(&self, name: &str) -> Option<LayerInfo> {
+        self.engine.get_layer(name).map(|l| LayerInfo {
+            name: l.config.name.clone(),
+            url: l.config.tile_source_url.clone(),
+            opacity: l.config.opacity,
+            visible: l.config.visible,
+            z_order: l.config.z_order,
+            kind: match &l.config.kind {
+                LayerKind::Raster => "raster".to_string(),
+                LayerKind::Terrain { .. } => "terrain".to_string(),
+                LayerKind::Tiles3d => "3dtiles".to_string(),
+            },
+        })
     }
 
     // ── Terrain high-level API ──────────────────────────────────
@@ -296,9 +591,60 @@ impl MapController {
     // ── Per-frame orchestration ─────────────────────────────────
 
     /// Advance animations (smooth zoom, inertia pan). Call once per frame.
+    ///
+    /// Also detects viewport state changes and pushes [`MapEvent`]s.
     pub fn tick(&mut self, dt_secs: f64) {
         let mode = self.rendering_mode();
         self.anim.tick_with_mode(&mut self.engine, dt_secs, mode);
+
+        // ── Detect state changes and emit events ──
+        let vp = &self.engine.viewport;
+        let cur_center = (vp.center.lat, vp.center.lon);
+        let cur_zoom = vp.zoom;
+        let cur_bearing = vp.bearing;
+        let cur_pitch = vp.pitch;
+
+        let is_moving = (cur_center.0 - self.prev_center.0).abs() > 1e-9
+            || (cur_center.1 - self.prev_center.1).abs() > 1e-9;
+        let is_zooming = (cur_zoom - self.prev_zoom).abs() > 1e-6;
+
+        if is_moving {
+            self.pending_events.push(MapEvent::Move { lat: cur_center.0, lon: cur_center.1 });
+        }
+        if is_zooming {
+            self.pending_events.push(MapEvent::Zoom { zoom: cur_zoom });
+        }
+        if (cur_bearing - self.prev_bearing).abs() > 1e-6 {
+            self.pending_events.push(MapEvent::Bearing { bearing: cur_bearing });
+        }
+        if (cur_pitch - self.prev_pitch).abs() > 1e-6 {
+            self.pending_events.push(MapEvent::Pitch { pitch: cur_pitch });
+        }
+
+        // Emit *End events when movement/zoom stops
+        if self.was_moving && !is_moving {
+            self.pending_events.push(MapEvent::MoveEnd);
+        }
+        if self.was_zooming && !is_zooming {
+            self.pending_events.push(MapEvent::ZoomEnd);
+        }
+
+        self.prev_center = cur_center;
+        self.prev_zoom = cur_zoom;
+        self.prev_bearing = cur_bearing;
+        self.prev_pitch = cur_pitch;
+        self.was_moving = is_moving;
+        self.was_zooming = is_zooming;
+    }
+
+    /// Drain all pending events since the last call.
+    pub fn drain_events(&mut self) -> Vec<MapEvent> {
+        std::mem::take(&mut self.pending_events)
+    }
+
+    /// Push a click event (called by platform input handler).
+    pub fn push_click(&mut self, lat: f64, lon: f64, x: f64, y: f64) {
+        self.pending_events.push(MapEvent::Click { lat, lon, x, y });
     }
 
     pub fn needs_redraw(&self) -> bool {
@@ -520,7 +866,7 @@ impl MapController {
 
                 for (&coord, &start) in &self.departing_tiles {
                     let elapsed = now_secs - start;
-                    let fade_out = (1.0 - elapsed / FADE_DURATION).max(0.0) as f32;
+                    let fade_out = (1.0 - elapsed / self.anim.config.fade_duration).max(0.0) as f32;
                     if fade_out > 0.01 {
                         if let Some(tv) = texture_fn(first_raster_lv.name(), &coord) {
                             overlay_tiles.push(RenderableTile {

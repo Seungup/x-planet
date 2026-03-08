@@ -55,6 +55,58 @@ pub const MOON: Ellipsoid = Ellipsoid::sphere(1_737_400.0);
 pub const MARS: Ellipsoid = Ellipsoid::from_a_f(3_396_190.0, 1.0 / 169.8944472);
 
 // ═══════════════════════════════════════════════════════════════════
+// CelestialBody — planet/moon parameters
+// ═══════════════════════════════════════════════════════════════════
+
+/// Parameters for a celestial body (planet, moon, etc.).
+///
+/// Groups the reference ellipsoid with derived values needed by the
+/// rendering pipeline (circumference, Mercator latitude limit).
+#[derive(Debug, Clone, Copy)]
+pub struct CelestialBody {
+    pub name: &'static str,
+    pub ellipsoid: Ellipsoid,
+    /// Equatorial circumference in meters (2 * PI * a).
+    pub circumference: f64,
+    /// Web Mercator latitude limit in degrees (default: 85.0511).
+    pub mercator_lat_limit: f64,
+}
+
+impl CelestialBody {
+    /// Create a body from an ellipsoid. Circumference is derived automatically.
+    pub const fn new(name: &'static str, ellipsoid: Ellipsoid, mercator_lat_limit: f64) -> Self {
+        // 2 * PI * a  (const-compatible approximation)
+        let circumference = 2.0 * std::f64::consts::PI * ellipsoid.a;
+        Self {
+            name,
+            ellipsoid,
+            circumference,
+            mercator_lat_limit,
+        }
+    }
+}
+
+/// Earth (WGS84 ellipsoid).
+pub const EARTH: CelestialBody = CelestialBody::new("Earth", WGS84, 85.0511);
+
+/// Moon (IAU reference sphere).
+pub const MOON_BODY: CelestialBody = CelestialBody::new("Moon", MOON, 85.0511);
+
+/// Mars (IAU reference ellipsoid).
+pub const MARS_BODY: CelestialBody = CelestialBody::new("Mars", MARS, 85.0511);
+
+impl CelestialBody {
+    /// Look up a body by name (case-insensitive). Returns `EARTH` for unknown names.
+    pub fn from_name(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
+            "moon" => MOON_BODY,
+            "mars" => MARS_BODY,
+            _ => EARTH,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Coordinate transforms
 // ═══════════════════════════════════════════════════════════════════
 

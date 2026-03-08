@@ -2,7 +2,7 @@
 
 use x_planets_math::{geo_to_mercator, mercator_to_geo, Frustum2D, GeoCoord, VisibleTile};
 
-use super::{globe_unit_altitude, globe_visible_half_angle, TileLodMode};
+use super::TileLodMode;
 
 impl super::Viewport {
     /// Select visible tiles for the current viewport using quadtree LOD.
@@ -145,7 +145,7 @@ impl super::Viewport {
 
     /// Globe-mode visible tile selection.
     fn visible_tiles_globe(&self) -> Vec<VisibleTile> {
-        let unit_altitude = globe_unit_altitude(self.zoom);
+        let unit_altitude = super::globe_unit_altitude(self.zoom, &self.body);
         let cap_half = (1.0 / (unit_altitude + 1.0)).acos();
 
         let tile_fov_half =
@@ -199,7 +199,7 @@ impl super::Viewport {
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
-        const TILE_BUDGET: usize = 150;
+        let tile_budget = self.tile_budget;
 
         let center_merc = geo_to_mercator(&self.center);
         let pitch_rad = self.pitch.to_radians();
@@ -212,7 +212,7 @@ impl super::Viewport {
         let sin_b = bearing_rad.sin();
         let cos_b = bearing_rad.cos();
 
-        let globe_h = globe_unit_altitude(self.zoom);
+        let globe_h = super::globe_unit_altitude(self.zoom, &self.body);
         let globe_r2 = 1.0 + (1.0 + globe_h).powi(2);
         let globe_2rh = 2.0 * (1.0 + globe_h);
         let max_drop = match mode {
@@ -334,7 +334,7 @@ impl super::Viewport {
 
             let should_subdivide = (vt.coord.z < ideal_z || contains_center)
                 && vt.coord.z < base_z
-                && (result.len() + heap.len() + 4) <= TILE_BUDGET;
+                && (result.len() + heap.len() + 4) <= tile_budget;
 
             if should_subdivide {
                 for child in vt.children() {
@@ -351,7 +351,7 @@ impl super::Viewport {
             }
         }
 
-        if result.len() > TILE_BUDGET {
+        if result.len() > tile_budget {
             if use_angular {
                 result.sort_by(|a, b| {
                     let ang_dist = |tc: glam::DVec2| -> f64 {
@@ -375,7 +375,7 @@ impl super::Viewport {
                     da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
-            result.truncate(TILE_BUDGET);
+            result.truncate(tile_budget);
         }
 
         result.sort_by_key(|vt| vt.coord.z);

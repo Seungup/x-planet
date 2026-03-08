@@ -2,7 +2,7 @@
 
 use x_planets_math::{geo_to_mercator, mercator_to_geo};
 
-use super::{globe_unit_altitude, globe_visible_half_angle};
+use super::globe_visible_half_angle;
 
 /// Controls camera movement (pan, zoom, pitch, bearing).
 pub struct CameraController {
@@ -14,6 +14,8 @@ pub struct CameraController {
     pub min_zoom: f64,
     /// Maximum zoom level.
     pub max_zoom: f64,
+    /// Maximum pitch angle in degrees.
+    pub max_pitch: f64,
 }
 
 impl CameraController {
@@ -23,6 +25,7 @@ impl CameraController {
             zoom_speed: 1.0,
             min_zoom: 0.0,
             max_zoom: 22.0,
+            max_pitch: 60.0,
         }
     }
 
@@ -72,9 +75,9 @@ impl CameraController {
             .clamp(effective_min, self.max_zoom);
     }
 
-    /// Set absolute pitch angle (clamped to 0-60 degrees).
+    /// Set absolute pitch angle (clamped to 0–max_pitch degrees).
     pub fn set_pitch(&self, viewport: &mut super::Viewport, degrees: f64) {
-        viewport.pitch = degrees.clamp(0.0, 60.0);
+        viewport.pitch = degrees.clamp(0.0, self.max_pitch);
     }
 
     /// Set absolute bearing (0-360 degrees, clockwise from north).
@@ -142,7 +145,7 @@ impl CameraController {
 
     /// Pan the viewport in globe mode using angular deltas.
     pub fn pan_globe(&self, viewport: &mut super::Viewport, dx: f64, dy: f64) {
-        let unit_altitude = globe_unit_altitude(viewport.zoom);
+        let unit_altitude = super::globe_unit_altitude(viewport.zoom, &viewport.body);
         let visible_half = globe_visible_half_angle(unit_altitude);
         let visible_deg = visible_half.to_degrees() * 2.0;
 
@@ -172,7 +175,7 @@ impl CameraController {
         screen_x: f64,
         screen_y: f64,
     ) {
-        let unit_altitude = globe_unit_altitude(viewport.zoom);
+        let unit_altitude = super::globe_unit_altitude(viewport.zoom, &viewport.body);
         let half_angle_old = globe_visible_half_angle(unit_altitude).to_degrees();
 
         let dx_norm = (screen_x - viewport.width as f64 * 0.5) / viewport.height as f64;
@@ -189,7 +192,7 @@ impl CameraController {
 
         self.zoom(viewport, delta);
 
-        let unit_altitude_new = globe_unit_altitude(viewport.zoom);
+        let unit_altitude_new = super::globe_unit_altitude(viewport.zoom, &viewport.body);
         let half_angle_new = globe_visible_half_angle(unit_altitude_new).to_degrees();
 
         let cos_lat = viewport.center.lat.to_radians().cos().max(0.05);

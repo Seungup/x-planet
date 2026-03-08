@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use x_planets_math::TileCoord;
+use x_planets_math::{GeoCoord, TileCoord};
 
 use crate::engine::MapEngine;
 
@@ -39,6 +39,51 @@ pub const ZOOM_ANIM_SPEED: f64 = 16.0;
 pub const DRAG_SAMPLE_WINDOW: f64 = 0.1;
 
 // ═══════════════════════════════════════════════════════════════════
+// InteractionConfig — runtime-tunable interaction parameters
+// ═══════════════════════════════════════════════════════════════════
+
+/// Runtime-tunable interaction parameters.
+///
+/// Default values match the `pub const` values above.  Modify these on
+/// `AnimationController::config` to adjust interaction behaviour at runtime.
+#[derive(Debug, Clone)]
+pub struct InteractionConfig {
+    pub fade_duration: f64,
+    pub double_click_time: f64,
+    pub double_click_dist: f64,
+    pub pan_amount: f64,
+    pub zoom_step: f64,
+    pub keyboard_rotate: f64,
+    pub pitch_sensitivity: f64,
+    pub rotate_sensitivity: f64,
+    pub touch_grace_period: f64,
+    pub inertia_friction: f64,
+    pub inertia_min_speed: f64,
+    pub zoom_anim_speed: f64,
+    pub drag_sample_window: f64,
+}
+
+impl Default for InteractionConfig {
+    fn default() -> Self {
+        Self {
+            fade_duration: FADE_DURATION,
+            double_click_time: DOUBLE_CLICK_TIME,
+            double_click_dist: DOUBLE_CLICK_DIST,
+            pan_amount: PAN_AMOUNT,
+            zoom_step: ZOOM_STEP,
+            keyboard_rotate: KEYBOARD_ROTATE,
+            pitch_sensitivity: PITCH_SENSITIVITY,
+            rotate_sensitivity: ROTATE_SENSITIVITY,
+            touch_grace_period: TOUCH_GRACE_PERIOD,
+            inertia_friction: INERTIA_FRICTION,
+            inertia_min_speed: INERTIA_MIN_SPEED,
+            zoom_anim_speed: ZOOM_ANIM_SPEED,
+            drag_sample_window: DRAG_SAMPLE_WINDOW,
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Utility
 // ═══════════════════════════════════════════════════════════════════
 
@@ -51,6 +96,54 @@ pub fn exp_decay(current: f64, target: f64, speed: f64, dt: f64) -> f64 {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// FlyTo / EaseTo animation
+// ═══════════════════════════════════════════════════════════════════
+
+/// Easing mode for camera transition animations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EasingMode {
+    /// Ease-in-out (smooth start and end, like Mapbox `flyTo`).
+    FlyTo,
+    /// Linear interpolation (constant speed, like Mapbox `easeTo`).
+    EaseTo,
+}
+
+/// State for an in-progress camera transition animation.
+#[derive(Clone, Debug)]
+pub struct CameraAnimation {
+    pub start_center: GeoCoord,
+    pub target_center: GeoCoord,
+    pub start_zoom: f64,
+    pub target_zoom: f64,
+    pub start_bearing: f64,
+    pub target_bearing: f64,
+    pub start_pitch: f64,
+    pub target_pitch: f64,
+    pub duration: f64,
+    pub elapsed: f64,
+    pub easing: EasingMode,
+}
+
+impl CameraAnimation {
+    /// Compute the interpolation factor `t` in [0, 1] based on elapsed/duration.
+    fn progress(&self) -> f64 {
+        let t = (self.elapsed / self.duration).clamp(0.0, 1.0);
+        match self.easing {
+            EasingMode::EaseTo => t,
+            EasingMode::FlyTo => {
+                // Smooth ease-in-out: 3t² - 2t³
+                t * t * (3.0 - 2.0 * t)
+            }
+        }
+    }
+
+    /// Whether the animation has finished.
+    pub fn is_done(&self) -> bool {
+        self.elapsed >= self.duration
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // AnimationController
 // ═══════════════════════════════════════════════════════════════════
 
@@ -59,6 +152,9 @@ pub fn exp_decay(current: f64, target: f64, speed: f64, dt: f64) -> f64 {
 ///
 /// All timestamps are `f64` seconds (relative to an arbitrary epoch).
 pub struct AnimationController {
+    /// Runtime-tunable interaction parameters.
+    pub config: InteractionConfig,
+
     // ── Smooth zoom ──
     /// Target zoom level (accumulated from scroll/keyboard).
     pub zoom_target: f64,
@@ -78,6 +174,9 @@ pub struct AnimationController {
     // ── Tile fade-in ──
     tile_fade_start: HashMap<TileCoord, f64>,
 
+    // ── Camera animation (flyTo / easeTo) ──
+    pub camera_anim: Option<CameraAnimation>,
+
     // ── Misc ──
     /// Last known mouse position (for zoom anchor fallback).
     pub last_mouse_pos: Option<(f64, f64)>,
@@ -86,6 +185,7 @@ pub struct AnimationController {
 impl AnimationController {
     pub fn new(initial_zoom: f64) -> Self {
         Self {
+            config: InteractionConfig::default(),
             zoom_target: initial_zoom,
             zoom_anchor: None,
             pan_velocity: (0.0, 0.0),
@@ -93,6 +193,7 @@ impl AnimationController {
             last_click_time: None,
             last_click_pos: None,
             tile_fade_start: HashMap::new(),
+            camera_anim: None,
             last_mouse_pos: None,
         }
     }
@@ -102,10 +203,11 @@ impl AnimationController {
         let zoom_active = (self.zoom_target - current_zoom).abs() > 0.001;
         let pan_active = {
             let (vx, vy) = self.pan_velocity;
-            (vx * vx + vy * vy).sqrt() > INERTIA_MIN_SPEED
+            (vx * vx + vy * vy).sqrt() > self.config.inertia_min_speed
         };
         let fades_active = !self.tile_fade_start.is_empty();
-        zoom_active || pan_active || fades_active
+        let camera_active = self.camera_anim.as_ref().map_or(false, |a| !a.is_done());
+        zoom_active || pan_active || fades_active || camera_active
     }
 
     /// Advance smooth zoom and inertia pan. Call once per frame with `dt` in seconds.
@@ -120,6 +222,30 @@ impl AnimationController {
         dt: f64,
         mode: x_planets_math::ProjectionMode,
     ) {
+        // ── Camera animation (flyTo / easeTo) ──
+        if let Some(ref mut anim) = self.camera_anim {
+            anim.elapsed += dt;
+            let t = anim.progress();
+
+            let lat = anim.start_center.lat + (anim.target_center.lat - anim.start_center.lat) * t;
+            let lon = anim.start_center.lon + (anim.target_center.lon - anim.start_center.lon) * t;
+            let zoom = anim.start_zoom + (anim.target_zoom - anim.start_zoom) * t;
+            let bearing = anim.start_bearing + (anim.target_bearing - anim.start_bearing) * t;
+            let pitch = anim.start_pitch + (anim.target_pitch - anim.start_pitch) * t;
+
+            engine.viewport.center = GeoCoord::new(lat, lon);
+            engine.viewport.zoom = zoom.clamp(engine.camera.min_zoom, engine.camera.max_zoom);
+            engine.camera.set_bearing(&mut engine.viewport, bearing);
+            engine.camera.set_pitch(&mut engine.viewport, pitch);
+            engine.request_redraw();
+
+            if anim.is_done() {
+                self.zoom_target = engine.viewport.zoom;
+                self.camera_anim = None;
+            }
+            return; // Camera animation overrides smooth zoom / inertia
+        }
+
         // ── Smooth zoom ──
         let current = engine.viewport.zoom;
         let target = self
@@ -127,7 +253,7 @@ impl AnimationController {
             .clamp(engine.camera.min_zoom, engine.camera.max_zoom);
         let diff = target - current;
         if diff.abs() > 0.001 {
-            let new_zoom = exp_decay(current, target, ZOOM_ANIM_SPEED, dt);
+            let new_zoom = exp_decay(current, target, self.config.zoom_anim_speed, dt);
             let delta = new_zoom - current;
             match self.zoom_anchor {
                 Some((mx, my)) => engine.zoom_at_for_mode(delta, mx, my, mode),
@@ -141,9 +267,9 @@ impl AnimationController {
         // ── Inertia pan ──
         let (vx, vy) = self.pan_velocity;
         let speed = (vx * vx + vy * vy).sqrt();
-        if speed > INERTIA_MIN_SPEED {
+        if speed > self.config.inertia_min_speed {
             engine.pan_for_mode(vx * dt, -(vy * dt), mode);
-            let friction = (-INERTIA_FRICTION * dt).exp();
+            let friction = (-self.config.inertia_friction * dt).exp();
             self.pan_velocity = (vx * friction, vy * friction);
         } else {
             self.pan_velocity = (0.0, 0.0);
@@ -153,14 +279,14 @@ impl AnimationController {
     /// Record a drag position sample for velocity estimation.
     pub fn record_drag(&mut self, pos: (f64, f64), time_secs: f64) {
         self.drag_samples
-            .retain(|(_, t)| time_secs - t < DRAG_SAMPLE_WINDOW);
+            .retain(|(_, t)| time_secs - t < self.config.drag_sample_window);
         self.drag_samples.push((pos, time_secs));
     }
 
     /// Compute pan velocity from recent drag samples (call on mouse-up/touch-end).
     pub fn compute_release_velocity(&mut self, time_secs: f64) {
         self.drag_samples
-            .retain(|(_, t)| time_secs - t < DRAG_SAMPLE_WINDOW);
+            .retain(|(_, t)| time_secs - t < self.config.drag_sample_window);
         if self.drag_samples.len() < 2 {
             self.pan_velocity = (0.0, 0.0);
             return;
@@ -189,12 +315,12 @@ impl AnimationController {
     pub fn check_double_click(&mut self, pos: (f64, f64), time_secs: f64) -> bool {
         let is_double = self
             .last_click_time
-            .map(|t| time_secs - t < DOUBLE_CLICK_TIME)
+            .map(|t| time_secs - t < self.config.double_click_time)
             .unwrap_or(false)
             && self
                 .last_click_pos
                 .map(|(lx, ly)| {
-                    ((pos.0 - lx).powi(2) + (pos.1 - ly).powi(2)).sqrt() < DOUBLE_CLICK_DIST
+                    ((pos.0 - lx).powi(2) + (pos.1 - ly).powi(2)).sqrt() < self.config.double_click_dist
                 })
                 .unwrap_or(false);
 
@@ -206,6 +332,19 @@ impl AnimationController {
             self.last_click_pos = Some(pos);
         }
         is_double
+    }
+
+    // ── Camera animation ──
+
+    /// Start a flyTo or easeTo camera animation.
+    pub fn start_camera_animation(&mut self, anim: CameraAnimation) {
+        self.pan_velocity = (0.0, 0.0); // Stop inertia
+        self.camera_anim = Some(anim);
+    }
+
+    /// Cancel any running camera animation immediately.
+    pub fn stop_animation(&mut self) {
+        self.camera_anim = None;
     }
 
     // ── Tile fade-in ──
@@ -223,7 +362,7 @@ impl AnimationController {
     /// Garbage-collect finished fade entries.
     pub fn gc_fades(&mut self, now_secs: f64) {
         self.tile_fade_start
-            .retain(|_, start| now_secs - *start < FADE_DURATION + 0.1);
+            .retain(|_, start| now_secs - *start < self.config.fade_duration + 0.1);
     }
 }
 

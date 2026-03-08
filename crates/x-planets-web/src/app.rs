@@ -62,21 +62,21 @@ pub(crate) struct WebLayerState {
 }
 
 impl WebLayerState {
-    fn new(name: String, kind: LayerKind, url_template: String) -> Self {
+    fn new(name: String, kind: LayerKind, url_template: String, max_cached: usize, max_concurrent: usize) -> Self {
         Self {
             name,
             kind,
             url_template,
-            tile_textures: TileCache::new(256),
+            tile_textures: TileCache::new(max_cached),
             terrain_data: HashMap::new(),
             pending_coords: HashSet::new(),
             completed_queue: Rc::new(RefCell::new(Vec::new())),
             failed_queue: Rc::new(RefCell::new(Vec::new())),
-            max_concurrent: 6,
+            max_concurrent,
             available_coords_cache: HashSet::new(),
             elevation_url: None,
             pending_elevation_coords: HashSet::new(),
-            max_elevation_concurrent: 4,
+            max_elevation_concurrent: max_concurrent.min(4),
             failed_elevation_queue: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -111,7 +111,7 @@ pub struct WebApp {
     renderer: TileRenderer,
     pub(crate) terrain_renderer: TerrainRenderer,
     tex_manager: TextureManager,
-    canvas: web_sys::HtmlCanvasElement,
+    pub(crate) canvas: web_sys::HtmlCanvasElement,
     pub dpr: f64,
     last_width: u32,
     last_height: u32,
@@ -121,6 +121,12 @@ pub struct WebApp {
 
     /// Previous frame timestamp (ms) for dt calculation.
     last_frame_ms: Option<f64>,
+
+    /// Registered JS event handlers: event_name → [callback, ...].
+    pub(crate) event_handlers: HashMap<String, Vec<js_sys::Function>>,
+
+    /// Whether the app has been destroyed (stops render loop).
+    pub(crate) destroyed: bool,
 }
 
 impl WebApp {
@@ -145,6 +151,8 @@ impl WebApp {
                 l.config.name.clone(),
                 l.config.kind.clone(),
                 l.config.tile_source_url.clone(),
+                l.config.max_cached_tiles,
+                l.config.max_concurrent_loads,
             ))
             .collect();
 
@@ -160,7 +168,20 @@ impl WebApp {
             last_height: height,
             layer_states,
             last_frame_ms: None,
+            event_handlers: HashMap::new(),
+            destroyed: false,
         }
+    }
+
+    /// Add a new layer state for a dynamically added layer.
+    pub fn add_layer_state(&mut self, name: &str, url: &str, max_cached: usize, max_concurrent: usize) {
+        self.layer_states.push(WebLayerState::new(
+            name.to_string(),
+            LayerKind::Raster,
+            url.to_string(),
+            max_cached,
+            max_concurrent,
+        ));
     }
 
     /// Resolve the active projection name to a `ProjectionMode` enum.
@@ -170,11 +191,25 @@ impl WebApp {
 
     /// Toggle terrain rendering on/off. Returns the new state.
     ///
+    /// `url` and `encoding` are optional.  When `None`, defaults to
+    /// AWS Terrarium tiles.  Supported encoding strings: "terrarium",
+    /// "mapbox", "quantized-mesh".
+    ///
     /// No layers are added or removed.  Elevation data is loaded on the
     /// raster imagery layer as a secondary data stream.
-    pub fn toggle_terrain(&mut self) -> bool {
-        let url = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
-        let enabled = self.controller.toggle_terrain(url, TerrainEncoding::Terrarium);
+    pub fn toggle_terrain_with(
+        &mut self,
+        url: Option<&str>,
+        encoding: Option<&str>,
+    ) -> bool {
+        let default_url = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
+        let url = url.unwrap_or(default_url);
+        let encoding = match encoding {
+            Some("mapbox") => TerrainEncoding::MapboxRgb,
+            Some("quantized-mesh") => TerrainEncoding::QuantizedMesh,
+            _ => TerrainEncoding::Terrarium,
+        };
+        let enabled = self.controller.toggle_terrain(url, encoding);
 
         if enabled {
             // Set elevation URL on the imagery layer so it starts loading elevation
@@ -208,7 +243,38 @@ impl WebApp {
         let g = f.clone();
 
         *g.borrow_mut() = Some(Closure::new(move |timestamp_ms: f64| {
+            // Render frame (holds borrow_mut, then releases it)
             app.borrow_mut().render_frame(timestamp_ms);
+
+            // Drain events and dispatch to JS callbacks OUTSIDE the borrow.
+            // This allows callbacks to call back into the map API (e.g. getZoom()).
+            let events_with_handlers = {
+                let mut app_ref = app.borrow_mut();
+                let events = app_ref.controller.drain_events();
+                if events.is_empty() {
+                    Vec::new()
+                } else {
+                    events.into_iter().filter_map(|event| {
+                        let name = event.name().to_string();
+                        app_ref.event_handlers.get(&name).map(|handlers| {
+                            (event, handlers.clone())
+                        })
+                    }).collect::<Vec<_>>()
+                }
+            }; // borrow_mut dropped here
+
+            for (event, handlers) in &events_with_handlers {
+                let js_data = map_event_to_js(event);
+                for handler in handlers {
+                    let _ = handler.call1(&JsValue::NULL, &js_data);
+                }
+            }
+
+            // Check if destroyed (stop loop)
+            if app.borrow().destroyed {
+                return; // Don't request next frame
+            }
+
             request_animation_frame(f.borrow().as_ref().unwrap());
         }));
 
@@ -600,4 +666,33 @@ fn request_animation_frame(f: &Closure<dyn FnMut(f64)>) {
         .unwrap()
         .request_animation_frame(f.as_ref().unchecked_ref())
         .unwrap();
+}
+
+/// Convert a [`MapEvent`] to a JS object for dispatch to callbacks.
+fn map_event_to_js(event: &x_planets_core::map_controller::MapEvent) -> JsValue {
+    use x_planets_core::map_controller::MapEvent;
+    let obj = js_sys::Object::new();
+    match event {
+        MapEvent::Move { lat, lon } => {
+            let _ = js_sys::Reflect::set(&obj, &"lat".into(), &(*lat).into());
+            let _ = js_sys::Reflect::set(&obj, &"lon".into(), &(*lon).into());
+        }
+        MapEvent::Zoom { zoom } => {
+            let _ = js_sys::Reflect::set(&obj, &"zoom".into(), &(*zoom).into());
+        }
+        MapEvent::Pitch { pitch } => {
+            let _ = js_sys::Reflect::set(&obj, &"pitch".into(), &(*pitch).into());
+        }
+        MapEvent::Bearing { bearing } => {
+            let _ = js_sys::Reflect::set(&obj, &"bearing".into(), &(*bearing).into());
+        }
+        MapEvent::Click { lat, lon, x, y } => {
+            let _ = js_sys::Reflect::set(&obj, &"lat".into(), &(*lat).into());
+            let _ = js_sys::Reflect::set(&obj, &"lon".into(), &(*lon).into());
+            let _ = js_sys::Reflect::set(&obj, &"x".into(), &(*x).into());
+            let _ = js_sys::Reflect::set(&obj, &"y".into(), &(*y).into());
+        }
+        MapEvent::MoveEnd | MapEvent::ZoomEnd => {}
+    }
+    obj.into()
 }
