@@ -20,87 +20,15 @@ mod web_impl {
     use x_planets_core::engine::{LayerConfig, LayerKind};
     use x_planets_tiles::TerrainEncoding;
 
-    /// Initialize the WASM module, then launch the map.
+    /// Initialize the WASM module (panic hook + logging only).
+    ///
+    /// The map is NOT created here.  Use `XPlanets.create()` from JavaScript
+    /// to create a map instance with your own configuration.
     #[wasm_bindgen(start)]
     pub fn wasm_init() {
         console_error_panic_hook::set_once();
-        console_log::init_with_level(log::Level::Info).unwrap();
-        log::info!("x-planets WASM module initialized");
-
-        wasm_bindgen_futures::spawn_local(async {
-            if let Err(e) = run().await {
-                log::error!("Fatal: {:?}", e);
-            }
-        });
-    }
-
-    async fn run() -> Result<(), JsValue> {
-        let window = web_sys::window().ok_or("No window")?;
-        let document = window.document().ok_or("No document")?;
-        let canvas = document
-            .get_element_by_id("x-planets-canvas")
-            .ok_or("Canvas not found")?
-            .dyn_into::<web_sys::HtmlCanvasElement>()?;
-
-        // ── DPR-aware canvas sizing ──
-        let dpr = window.device_pixel_ratio();
-        let css_w = canvas.client_width() as f64;
-        let css_h = canvas.client_height() as f64;
-        let width = (css_w * dpr).max(1.0) as u32;
-        let height = (css_h * dpr).max(1.0) as u32;
-        canvas.set_width(width);
-        canvas.set_height(height);
-
-        log::info!("Canvas: {}x{} (DPR: {:.1})", width, height, dpr);
-
-        // ── GPU ──
-        let surface_target = wgpu::SurfaceTarget::Canvas(canvas.clone());
-        let gpu = x_planets_gpu::GpuContext::new_with_window(surface_target, width, height)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("GPU init failed: {}", e)))?;
-
-        log::info!("GPU: {}", gpu.adapter_info().name);
-
-        // ── MapController (default config = OSM base layer) ──
-        let config = x_planets_core::engine::MapConfig::default();
-        let controller = x_planets_core::MapController::new(config, width, height);
-
-        // ── TileRenderer ──
-        let renderer = x_planets_render::TileRenderer::new(&gpu);
-
-        // ── TerrainRenderer ──
-        let terrain_renderer = x_planets_render::TerrainRenderer::new(&gpu);
-
-        // ── TextureManager ──
-        let tex_manager = x_planets_gpu::TextureManager::new(&gpu.device);
-
-        // ── WebApp ──
-        let app = WebApp::new(gpu, controller, renderer, terrain_renderer, tex_manager, canvas.clone(), dpr);
-        let app = std::rc::Rc::new(std::cell::RefCell::new(app));
-
-        // ── Input events ──
-        crate::input::register_events(&canvas, std::rc::Rc::clone(&app));
-
-        // ── Start render loop ──
-        WebApp::start_render_loop(std::rc::Rc::clone(&app));
-
-        // ── Expose JS API as window.xplanets ──
-        let xplanets = XPlanetsMap {
-            app: std::rc::Rc::clone(&app),
-        };
-        js_sys::Reflect::set(
-            &window,
-            &JsValue::from_str("xplanets"),
-            &xplanets.into(),
-        )?;
-
-        // ── Notify TypeScript that the API is ready ──
-        let event = web_sys::CustomEvent::new("xplanets-ready")
-            .map_err(|e| JsValue::from_str(&format!("Event error: {:?}", e)))?;
-        window.dispatch_event(&event)?;
-
-        log::info!("x-planets web started!");
-        Ok(())
+        console_log::init_with_level(log::Level::Info).ok();
+        log::info!("x-planets WASM module initialized — call XPlanets.create() to start");
     }
 
     // ═══════════════════════════════════════════════════════════════
