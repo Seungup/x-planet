@@ -123,10 +123,12 @@ pub(crate) fn centered_tile_center(
 ///
 /// Returns the threshold in degrees.
 pub fn centered_angular_threshold_deg(_zoom: f64) -> f64 {
-    // 88° gives ~3° of margin before the 90° singularity, while
-    // allowing all tiles within the 85° shader clip to be included
-    // plus a generous buffer for large low-zoom tiles.
-    88.0
+    // Match the shader's clip_sphere angle (85°) exactly.
+    // Tiles between 85°–90° produce degenerate oblique Mercator geometry
+    // and their fragments are discarded by the shader anyway.  Including
+    // them on the CPU side only creates floating/disconnected fragments
+    // at the viewport edges.
+    85.0
 }
 
 /// Returns `true` if a tile passes the angular-distance pre-filter

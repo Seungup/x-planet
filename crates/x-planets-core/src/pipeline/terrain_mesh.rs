@@ -730,9 +730,11 @@ pub fn build_terrain_mesh_globe(
             let ev = ev_min + v as f32 * ev_range;
             let h = sample_elevation_bilinear(elevation, src_width, src_height, eu, ev);
 
-            // Position on unit sphere with radial elevation displacement
+            // Position on unit sphere with radial elevation displacement.
+            // height_scale is calibrated for Mercator [0,1] space (circumference = 1).
+            // The unit sphere has circumference = 2π, so multiply by TAU to convert.
             let surface_pos = x_planets_math::geo_to_unit_sphere(lat_rad, lon_rad);
-            let radius = 1.0 + h as f64 * height_scale as f64;
+            let radius = 1.0 + h as f64 * height_scale as f64 * std::f64::consts::TAU;
             let pos_3d = surface_pos * radius;
 
             // RTE: subtract tile center
