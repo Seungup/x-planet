@@ -95,6 +95,17 @@ pub const MOON_BODY: CelestialBody = CelestialBody::new("Moon", MOON, 85.0511);
 /// Mars (IAU reference ellipsoid).
 pub const MARS_BODY: CelestialBody = CelestialBody::new("Mars", MARS, 85.0511);
 
+impl CelestialBody {
+    /// Look up a body by name (case-insensitive). Returns `EARTH` for unknown names.
+    pub fn from_name(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
+            "moon" => MOON_BODY,
+            "mars" => MARS_BODY,
+            _ => EARTH,
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Coordinate transforms
 // ═══════════════════════════════════════════════════════════════════

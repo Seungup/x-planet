@@ -17,7 +17,7 @@ use x_planets_math::{TileCoord, TileUniforms, ViewportUniforms};
 
 use crate::pipeline::{
     build_terrain_mesh, build_terrain_mesh_centered, build_terrain_mesh_globe,
-    compute_height_scale, fallback_uv_rect,
+    compute_height_scale_for, fallback_uv_rect,
     tile_passes_angular_filter,
     tile_uniforms_for_centered, tile_uniforms_for_globe,
     RenderableTile,
@@ -551,7 +551,7 @@ impl TerrainRenderer {
             self.mesh_cache.clear();
         }
 
-        let height_scale = compute_height_scale(self.exaggeration);
+        let height_scale = compute_height_scale_for(self.exaggeration, viewport.body.circumference);
 
         // Update viewport uniforms
         let uniforms = viewport.to_uniforms();

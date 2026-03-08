@@ -2,7 +2,7 @@
 
 use x_planets_math::{geo_to_mercator, mercator_to_geo, Frustum2D, GeoCoord, VisibleTile};
 
-use super::{globe_unit_altitude, TileLodMode};
+use super::TileLodMode;
 
 impl super::Viewport {
     /// Select visible tiles for the current viewport using quadtree LOD.
@@ -145,7 +145,7 @@ impl super::Viewport {
 
     /// Globe-mode visible tile selection.
     fn visible_tiles_globe(&self) -> Vec<VisibleTile> {
-        let unit_altitude = globe_unit_altitude(self.zoom);
+        let unit_altitude = super::globe_unit_altitude(self.zoom, &self.body);
         let cap_half = (1.0 / (unit_altitude + 1.0)).acos();
 
         let tile_fov_half =
@@ -212,7 +212,7 @@ impl super::Viewport {
         let sin_b = bearing_rad.sin();
         let cos_b = bearing_rad.cos();
 
-        let globe_h = globe_unit_altitude(self.zoom);
+        let globe_h = super::globe_unit_altitude(self.zoom, &self.body);
         let globe_r2 = 1.0 + (1.0 + globe_h).powi(2);
         let globe_2rh = 2.0 * (1.0 + globe_h);
         let max_drop = match mode {

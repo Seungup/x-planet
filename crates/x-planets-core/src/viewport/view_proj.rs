@@ -79,7 +79,7 @@ impl super::Viewport {
 
         // Camera altitude above sphere surface (unit-sphere radius = 1.0).
         // Accelerated descent at high zoom to match Mercator visible area.
-        let unit_altitude = super::globe_unit_altitude(self.zoom);
+        let unit_altitude = super::globe_unit_altitude(self.zoom, &self.body);
 
         // Local ENU (East-North-Up) basis at surface point
         let up_surface = surface_point.normalize();

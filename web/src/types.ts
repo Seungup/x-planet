@@ -111,6 +111,8 @@ export interface XPlanetsConfig {
   maxZoom?: number;
   maxPitch?: number;
   tileBudget?: number;
+  /** Celestial body: "Earth" (default), "Moon", or "Mars". */
+  body?: "Earth" | "Moon" | "Mars";
   layers?: Array<{
     name: string;
     url: string;

@@ -73,6 +73,9 @@ pub struct MapSection {
     /// Maximum tiles rendered per frame (default: 150).
     #[serde(default = "default_tile_budget")]
     pub tile_budget: usize,
+    /// Celestial body name: `"Earth"` (default), `"Moon"`, or `"Mars"`.
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 impl Default for MapSection {
@@ -86,6 +89,7 @@ impl Default for MapSection {
             max_zoom: default_max_zoom(),
             max_pitch: default_max_pitch(),
             tile_budget: default_tile_budget(),
+            body: None,
         }
     }
 }
@@ -244,6 +248,9 @@ impl FileConfig {
             max_zoom: self.map.max_zoom,
             max_pitch: self.map.max_pitch,
             tile_budget: self.map.tile_budget,
+            body: self.map.body.as_deref()
+                .map(x_planets_math::ecef::CelestialBody::from_name)
+                .unwrap_or(x_planets_math::ecef::EARTH),
             layers,
             ..Default::default()
         }

@@ -7,7 +7,7 @@
 //! Follows the Karpathy principle: no GPU, no I/O, independently testable.
 
 use glam::{DMat4, DVec3, DVec4, Mat4};
-use x_planets_math::ecef::{geodetic_to_ecef, WGS84};
+use x_planets_math::ecef::geodetic_to_ecef;
 use x_planets_tiles::tiles3d::traversal::TraversalCamera;
 
 use crate::viewport::Viewport;
@@ -26,10 +26,10 @@ pub fn viewport_to_traversal_camera(viewport: &Viewport) -> TraversalCamera {
     let lon_rad = viewport.center.lon.to_radians();
 
     // Camera altitude from zoom level (approximate).
-    let altitude = zoom_to_altitude(viewport.zoom);
+    let altitude = zoom_to_altitude_for(viewport.zoom, viewport.body.circumference);
 
     // Camera position in ECEF.
-    let position_ecef = geodetic_to_ecef(lat_rad, lon_rad, altitude, &WGS84);
+    let position_ecef = geodetic_to_ecef(lat_rad, lon_rad, altitude, &viewport.body.ellipsoid);
 
     // Build view-projection matrix.
     let view_proj = build_ecef_view_proj(viewport, position_ecef, lat_rad, lon_rad, altitude);
@@ -198,10 +198,10 @@ pub fn traversal_fov_y() -> f64 {
 pub fn build_tiles3d_uniforms(viewport: &Viewport) -> (x_planets_math::ViewportUniforms, DVec3) {
     let lat_rad = viewport.center.lat.to_radians();
     let lon_rad = viewport.center.lon.to_radians();
-    let altitude = zoom_to_altitude(viewport.zoom);
+    let altitude = zoom_to_altitude_for(viewport.zoom, viewport.body.circumference);
 
     // Camera ECEF position (returned for model matrix computation).
-    let camera_ecef = geodetic_to_ecef(lat_rad, lon_rad, altitude, &WGS84);
+    let camera_ecef = geodetic_to_ecef(lat_rad, lon_rad, altitude, &viewport.body.ellipsoid);
 
     // ── Local ENU basis ──
     let sin_lat = lat_rad.sin();

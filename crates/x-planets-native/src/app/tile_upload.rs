@@ -119,8 +119,9 @@ impl NativeApp {
 
                             let surface_idx_count = qm.indices.len();
                             let (vertices, indices) =
-                                x_planets_core::pipeline::build_terrain_mesh_from_qm(
+                                x_planets_core::pipeline::build_terrain_mesh_from_qm_with(
                                     &qm.coord, &qm,
+                                    self.controller.as_ref().unwrap().engine.viewport.body.circumference,
                                 );
 
                             // Step 1-2: Rasterize QM TIN → 4326 heightmap.
@@ -280,8 +281,9 @@ impl NativeApp {
                             // so exaggeration changes work without re-fetching.
                             let surface_idx_count = qm.indices.len();
                             let (vertices, indices) =
-                                x_planets_core::pipeline::build_terrain_mesh_from_qm(
+                                x_planets_core::pipeline::build_terrain_mesh_from_qm_with(
                                     &qm.coord, &qm,
+                                    self.controller.as_ref().unwrap().engine.viewport.body.circumference,
                                 );
                             // Rasterize QM mesh into a regular grid heightmap for
                             // over-zoom fallback: child tiles beyond max_zoom can

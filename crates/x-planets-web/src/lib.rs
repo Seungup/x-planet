@@ -638,6 +638,13 @@ mod web_impl {
             }
         }
 
+        // body: string ("Earth", "Moon", "Mars")
+        if let Ok(v) = js_sys::Reflect::get(val, &"body".into()) {
+            if let Some(name) = v.as_string() {
+                config.body = x_planets_math::ecef::CelestialBody::from_name(&name);
+            }
+        }
+
         config
     }
 }

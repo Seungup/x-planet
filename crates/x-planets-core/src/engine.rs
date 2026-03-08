@@ -172,6 +172,7 @@ impl MapEngine {
         viewport.center = config.center;
         viewport.zoom = config.zoom;
         viewport.tile_budget = config.tile_budget;
+        viewport.body = config.body;
 
         let layers = if config.layers.is_empty() {
             vec![TileLayer {
