@@ -106,13 +106,11 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Lambertian diffuse
     let ndotl = max(dot(n, sun_dir), 0.0);
 
-    // Normalize so flat terrain (normal = straight up) gets shade = 1.0.
-    // Without this, flat areas are uniformly darkened by ~18% because
-    // dot([0,0,1], sun_dir) ≈ 0.70, not 1.0.
-    // Slopes facing the sun get slightly brighter (capped at 1.15),
-    // slopes facing away get darker (floor at 0.3).
+    // "Always daytime" hillshade: flat terrain = 1.0 (no darkening),
+    // slopes get subtle relief shading with a high floor (0.6) so the
+    // map never looks dark.  Sun-facing slopes brighten up to 1.1.
     let flat_illumination = sun_dir.z;  // dot(vec3(0,0,1), sun_dir)
-    let shade = clamp(0.3 + 0.7 * ndotl / flat_illumination, 0.3, 1.15);
+    let shade = clamp(0.6 + 0.4 * ndotl / flat_illumination, 0.6, 1.1);
 
     // Apply tile opacity
     let opacity = tile.tile_meta.y;
