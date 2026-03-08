@@ -13,7 +13,7 @@ use x_planets_core::MapController;
 use x_planets_render::{TerrainLayerData, TerrainRenderer, TerrainTileData, TileRenderer};
 use x_planets_gpu::{GpuContext, GpuTexture, TextureManager};
 use x_planets_math::{TileCoord, VisibleTile};
-use x_planets_tiles::{RasterTileDecoder, TerrainEncoding, TerrariumDecoder, TileCache, TileDecoder};
+use x_planets_tiles::{RasterTileDecoder, TerrainEncoding, TerrainRgbDecoder, TerrariumDecoder, TileCache, TileDecoder};
 use wasm_bindgen_futures::JsFuture;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -54,6 +54,8 @@ pub(crate) struct WebLayerState {
     available_coords_cache: HashSet<TileCoord>,
     /// Elevation tile URL template (set when terrain is toggled on).
     pub elevation_url: Option<String>,
+    /// Terrain encoding for elevation decoding.
+    pub terrain_encoding: TerrainEncoding,
     /// Pending elevation tile fetches (separate from raster pending).
     pub pending_elevation_coords: HashSet<TileCoord>,
     pub max_elevation_concurrent: usize,
@@ -63,6 +65,11 @@ pub(crate) struct WebLayerState {
 
 impl WebLayerState {
     fn new(name: String, kind: LayerKind, url_template: String, max_cached: usize, max_concurrent: usize) -> Self {
+        // Extract encoding from the LayerKind if it's a terrain layer.
+        let terrain_encoding = match &kind {
+            LayerKind::Terrain { encoding, .. } => *encoding,
+            _ => TerrainEncoding::Terrarium,
+        };
         Self {
             name,
             kind,
@@ -75,6 +82,7 @@ impl WebLayerState {
             max_concurrent,
             available_coords_cache: HashSet::new(),
             elevation_url: None,
+            terrain_encoding,
             pending_elevation_coords: HashSet::new(),
             max_elevation_concurrent: max_concurrent.min(4),
             failed_elevation_queue: Rc::new(RefCell::new(Vec::new())),
@@ -174,10 +182,10 @@ impl WebApp {
     }
 
     /// Add a new layer state for a dynamically added layer.
-    pub fn add_layer_state(&mut self, name: &str, url: &str, max_cached: usize, max_concurrent: usize) {
+    pub fn add_layer_state(&mut self, name: &str, url: &str, kind: LayerKind, max_cached: usize, max_concurrent: usize) {
         self.layer_states.push(WebLayerState::new(
             name.to_string(),
-            LayerKind::Raster,
+            kind,
             url.to_string(),
             max_cached,
             max_concurrent,
@@ -212,13 +220,14 @@ impl WebApp {
         let enabled = self.controller.toggle_terrain(url, encoding);
 
         if enabled {
-            // Set elevation URL on the imagery layer so it starts loading elevation
+            // Set elevation URL and encoding on the imagery layer so it starts loading elevation
             let imagery_name = self.controller.terrain_imagery_name()
                 .unwrap_or("base").to_string();
             let terrain_url = self.controller.terrain_url()
                 .unwrap_or(url).to_string();
             if let Some(ls) = self.layer_states.iter_mut().find(|ls| ls.name == imagery_name) {
                 ls.elevation_url = Some(terrain_url);
+                ls.terrain_encoding = encoding;
             }
         } else {
             // Clear elevation data and pending on the imagery layer
@@ -480,12 +489,13 @@ impl WebApp {
                     request_raster_tiles(ls, visible, camera_center);
                     // Also request elevation tiles if terrain is enabled on this layer
                     if let Some(elev_url) = ls.elevation_url.clone() {
-                        request_elevation_tiles(ls, visible, camera_center, &elev_url);
+                        request_elevation_tiles(ls, visible, camera_center, &elev_url, ls.terrain_encoding);
                     }
                 }
-                LayerKind::Terrain { .. } => {
+                LayerKind::Terrain { encoding, .. } => {
                     // Config-file terrain layers (backward compat)
-                    request_elevation_tiles(ls, visible, camera_center, &ls.url_template.clone());
+                    let enc = *encoding;
+                    request_elevation_tiles(ls, visible, camera_center, &ls.url_template.clone(), enc);
                 }
                 LayerKind::Tiles3d => {}
             }
@@ -575,6 +585,7 @@ fn request_elevation_tiles(
     visible: &[VisibleTile],
     camera_center: x_planets_math::DVec2,
     elev_url_template: &str,
+    encoding: TerrainEncoding,
 ) {
     let mut missing: Vec<(TileCoord, f64)> = Vec::new();
 
@@ -605,8 +616,22 @@ fn request_elevation_tiles(
         wasm_bindgen_futures::spawn_local(async move {
             match fetch_bytes(&url).await {
                 Ok(bytes) => {
-                    let decoder = TerrariumDecoder;
-                    match decoder.decode(coord, &bytes).await {
+                    let result = match encoding {
+                        TerrainEncoding::MapboxRgb => {
+                            TerrainRgbDecoder.decode(coord, &bytes).await
+                        }
+                        TerrainEncoding::Terrarium => {
+                            TerrariumDecoder.decode(coord, &bytes).await
+                        }
+                        TerrainEncoding::QuantizedMesh => {
+                            // QM tiles are handled differently (binary mesh, not heightmap image)
+                            // For now, skip — QM support requires a different pipeline
+                            log::warn!("Quantized Mesh decoding not yet supported in web");
+                            failed.borrow_mut().push(coord);
+                            return;
+                        }
+                    };
+                    match result {
                         Ok(decoded) => {
                             queue.borrow_mut().push(CompletedTileResult::Elevation {
                                 coord,

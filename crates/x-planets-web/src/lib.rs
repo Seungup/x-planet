@@ -18,6 +18,7 @@ mod web_impl {
 
     use crate::app::WebApp;
     use x_planets_core::engine::{LayerConfig, LayerKind};
+    use x_planets_tiles::TerrainEncoding;
 
     /// Initialize the WASM module, then launch the map.
     #[wasm_bindgen(start)]
@@ -330,27 +331,33 @@ mod web_impl {
             self.app.borrow().controller.layer_count()
         }
 
-        /// Add a raster tile layer. Returns the layer index.
+        /// Add a tile layer. Returns the layer index.
         ///
         /// Parameters:
         /// - `name`: unique layer name
         /// - `url`: tile URL template with {z}/{x}/{y}
-        /// - `z_order`: stacking order (optional, default 0)
+        /// - `options`: optional JS object with:
+        ///   - `kind`: "raster" (default), "raster-dem" / "terrain", "3dtiles"
+        ///   - `encoding`: "terrarium" (default), "mapbox", "quantized-mesh"
+        ///   - `imageryLayer`: name of the raster layer to drape on terrain
+        ///   - `zOrder`: stacking order (default: auto)
+        ///   - `opacity`: 0.0–1.0 (default: 1.0)
         #[wasm_bindgen(js_name = "addLayer")]
-        pub fn add_layer(&self, name: &str, url: &str, z_order: Option<i32>) -> usize {
+        pub fn add_layer(&self, name: &str, url: &str, options: JsValue) -> usize {
+            let (kind, z_order, opacity) = parse_add_layer_options(&options);
             let config = LayerConfig {
                 name: name.to_string(),
                 tile_source_url: url.to_string(),
-                z_order: z_order.unwrap_or(0),
-                kind: LayerKind::Raster,
+                z_order,
+                opacity,
+                kind: kind.clone(),
                 ..Default::default()
             };
             let max_cached = config.max_cached_tiles;
             let max_concurrent = config.max_concurrent_loads;
             let mut app = self.app.borrow_mut();
             let idx = app.controller.add_layer(config);
-            // Add corresponding WebLayerState
-            app.add_layer_state(name, url, max_cached, max_concurrent);
+            app.add_layer_state(name, url, kind, max_cached, max_concurrent);
             idx
         }
 
@@ -553,6 +560,52 @@ mod web_impl {
         }
     }
 
+    /// Parse a `kind` string + `encoding` string into a [`LayerKind`].
+    fn parse_layer_kind(kind_str: Option<&str>, encoding_str: Option<&str>, imagery_layer: Option<String>) -> LayerKind {
+        let encoding = match encoding_str {
+            Some("mapbox") | Some("mapbox-rgb") => TerrainEncoding::MapboxRgb,
+            Some("quantized-mesh") | Some("qm") => TerrainEncoding::QuantizedMesh,
+            _ => TerrainEncoding::Terrarium,
+        };
+        match kind_str {
+            Some("raster-dem") | Some("terrain") => LayerKind::Terrain {
+                imagery_layer: imagery_layer.unwrap_or_else(|| "base".to_string()),
+                encoding,
+            },
+            Some("3dtiles") => LayerKind::Tiles3d,
+            _ => LayerKind::Raster,
+        }
+    }
+
+    /// Parse options for `addLayer()`.
+    fn parse_add_layer_options(opts: &JsValue) -> (LayerKind, i32, f32) {
+        if opts.is_undefined() || opts.is_null() {
+            // Backward compat: if opts is a number, treat as z_order (old API)
+            if let Some(z) = opts.as_f64() {
+                return (LayerKind::Raster, z as i32, 1.0);
+            }
+            return (LayerKind::Raster, 0, 1.0);
+        }
+        // Could be a plain number (old API: addLayer(name, url, zOrder))
+        if let Some(z) = opts.as_f64() {
+            return (LayerKind::Raster, z as i32, 1.0);
+        }
+
+        let kind_str = js_sys::Reflect::get(opts, &"kind".into())
+            .ok().and_then(|v| v.as_string());
+        let encoding_str = js_sys::Reflect::get(opts, &"encoding".into())
+            .ok().and_then(|v| v.as_string());
+        let imagery_layer = js_sys::Reflect::get(opts, &"imageryLayer".into())
+            .ok().and_then(|v| v.as_string());
+        let z_order = js_sys::Reflect::get(opts, &"zOrder".into())
+            .ok().and_then(|v| v.as_f64()).unwrap_or(0.0) as i32;
+        let opacity = js_sys::Reflect::get(opts, &"opacity".into())
+            .ok().and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+
+        let kind = parse_layer_kind(kind_str.as_deref(), encoding_str.as_deref(), imagery_layer);
+        (kind, z_order, opacity)
+    }
+
     /// Parse a JS config object into a [`MapConfig`].
     fn parse_js_config(val: &JsValue) -> x_planets_core::engine::MapConfig {
         let mut config = x_planets_core::engine::MapConfig::default();
@@ -606,7 +659,7 @@ mod web_impl {
             }
         }
 
-        // layers: [{ name, url, kind?, zOrder?, opacity? }]
+        // layers: [{ name, url, kind?, encoding?, imageryLayer?, zOrder?, opacity? }]
         if let Ok(layers) = js_sys::Reflect::get(val, &"layers".into()) {
             if let Some(arr) = layers.dyn_ref::<js_sys::Array>() {
                 let mut layer_configs = Vec::new();
@@ -620,14 +673,28 @@ mod web_impl {
                         .ok().and_then(|v| v.as_f64()).unwrap_or(i as f64) as i32;
                     let opacity = js_sys::Reflect::get(&item, &"opacity".into())
                         .ok().and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                    let kind_str = js_sys::Reflect::get(&item, &"kind".into())
+                        .ok().and_then(|v| v.as_string());
+                    let encoding_str = js_sys::Reflect::get(&item, &"encoding".into())
+                        .ok().and_then(|v| v.as_string());
+                    let imagery_layer = js_sys::Reflect::get(&item, &"imageryLayer".into())
+                        .ok().and_then(|v| v.as_string());
+
+                    let kind = parse_layer_kind(
+                        kind_str.as_deref(),
+                        encoding_str.as_deref(),
+                        imagery_layer,
+                    );
 
                     if !name.is_empty() && !url.is_empty() {
+                        let terrain_encoding_explicit = encoding_str.is_some();
                         layer_configs.push(LayerConfig {
                             name,
                             tile_source_url: url,
                             z_order,
                             opacity,
-                            kind: LayerKind::Raster,
+                            kind,
+                            terrain_encoding_explicit,
                             ..Default::default()
                         });
                     }

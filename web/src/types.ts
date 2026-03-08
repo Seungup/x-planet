@@ -47,13 +47,19 @@ export interface XPlanetsMap {
   getProjection(): string;
 
   // ── Terrain ──
-  toggleTerrain(url?: string, encoding?: string): boolean;
+  /**
+   * Toggle terrain on/off for the base raster layer.
+   * For full control, use `addLayer()` with `kind: "raster-dem"` instead.
+   * @param url Elevation tile URL template (default: AWS Terrarium)
+   * @param encoding "terrarium" (default), "mapbox", "quantized-mesh"
+   */
+  toggleTerrain(url?: string, encoding?: TerrainEncoding): boolean;
   terrainEnabled(): boolean;
   setTerrainExaggeration(value: number): void;
   getTerrainExaggeration(): number;
 
   // ── Layer Management ──
-  addLayer(name: string, url: string, zOrder?: number): number;
+  addLayer(name: string, url: string, options?: AddLayerOptions | number): number;
   getLayer(name: string): LayerInfo | null;
   getLayers(): string[];
   setLayerVisible(name: string, visible: boolean): boolean;
@@ -92,6 +98,26 @@ export interface XPlanetsMap {
   destroy(): void;
 }
 
+/** Layer kind identifiers. */
+export type LayerKind = "raster" | "raster-dem" | "terrain" | "3dtiles";
+
+/** Terrain elevation encoding format. */
+export type TerrainEncoding = "terrarium" | "mapbox" | "mapbox-rgb" | "quantized-mesh" | "qm";
+
+/** Options for `addLayer()`. */
+export interface AddLayerOptions {
+  /** Layer kind: "raster" (default), "raster-dem" / "terrain", "3dtiles". */
+  kind?: LayerKind;
+  /** Terrain encoding: "terrarium" (default), "mapbox", "quantized-mesh". */
+  encoding?: TerrainEncoding;
+  /** For terrain layers: name of the raster layer to drape imagery from. */
+  imageryLayer?: string;
+  /** Stacking order (lower = drawn first). */
+  zOrder?: number;
+  /** Opacity 0.0–1.0 (default: 1.0). */
+  opacity?: number;
+}
+
 /** Layer metadata returned by `getLayer()`. */
 export interface LayerInfo {
   name: string;
@@ -100,6 +126,20 @@ export interface LayerInfo {
   visible: boolean;
   zOrder: number;
   kind: string;
+}
+
+/** Layer configuration for initial setup. */
+export interface LayerConfig {
+  name: string;
+  url: string;
+  /** Layer kind: "raster" (default), "raster-dem" / "terrain", "3dtiles". */
+  kind?: LayerKind;
+  /** Terrain encoding: "terrarium" (default), "mapbox", "quantized-mesh". */
+  encoding?: TerrainEncoding;
+  /** For terrain layers: name of the raster layer to drape imagery from. */
+  imageryLayer?: string;
+  zOrder?: number;
+  opacity?: number;
 }
 
 /** Configuration for `XPlanets.create()`. */
@@ -113,13 +153,7 @@ export interface XPlanetsConfig {
   tileBudget?: number;
   /** Celestial body: "Earth" (default), "Moon", or "Mars". */
   body?: "Earth" | "Moon" | "Mars";
-  layers?: Array<{
-    name: string;
-    url: string;
-    kind?: string;
-    zOrder?: number;
-    opacity?: number;
-  }>;
+  layers?: LayerConfig[];
 }
 
 /** Factory for creating x-planets map instances via Promise-based init. */
