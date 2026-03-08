@@ -470,7 +470,16 @@ pub fn build_terrain_mesh_centered(
     let eu_range = elev_uv_rect[2] - eu_min;
     let ev_range = elev_uv_rect[3] - ev_min;
 
+    let tile_w = (1.0 / n) as f32;
+    let tile_h = tile_w;
+
     let mut positions = Vec::with_capacity(vert_count);
+    // Standard Mercator positions — used only for normal computation.
+    // The oblique projection distorts XY distances, making normals
+    // artificially steep for distant tiles and darkening the hillshade.
+    // By computing normals from undistorted Mercator coordinates we get
+    // consistent, geographically correct relief shading everywhere.
+    let mut merc_positions = Vec::with_capacity(vert_count);
     let mut tex_coords = Vec::with_capacity(vert_count);
 
     for gy in 0..verts_per_side {
@@ -503,31 +512,38 @@ pub fn build_terrain_mesh_centered(
             let h = sample_elevation_bilinear(elevation, src_width, src_height, eu, ev);
 
             positions.push([rx, ry, h * height_scale]);
+            // Standard Mercator position for normal calc (undistorted)
+            merc_positions.push([
+                (u as f32 - 0.5) * tile_w,
+                (v as f32 - 0.5) * tile_h,
+                h * height_scale,
+            ]);
             tex_coords.push([u as f32, v as f32]);
         }
     }
 
-    // Normals — same reflected-sample approach as build_terrain_mesh
+    // Normals — computed from standard Mercator positions (merc_positions)
+    // to avoid oblique projection distortion darkening the hillshade.
     let mut normals = vec![[0.0f32, 0.0, 1.0]; vert_count];
     let vs = verts_per_side as usize;
     for gy in 0..vs {
         for gx in 0..vs {
             let idx = gy * vs + gx;
-            let p = positions[idx];
-            let right = if gx + 1 < vs { positions[idx + 1] } else {
-                let l = positions[idx - 1];
+            let p = merc_positions[idx];
+            let right = if gx + 1 < vs { merc_positions[idx + 1] } else {
+                let l = merc_positions[idx - 1];
                 [2.0 * p[0] - l[0], 2.0 * p[1] - l[1], 2.0 * p[2] - l[2]]
             };
-            let left = if gx > 0 { positions[idx - 1] } else {
-                let r = positions[idx + 1];
+            let left = if gx > 0 { merc_positions[idx - 1] } else {
+                let r = merc_positions[idx + 1];
                 [2.0 * p[0] - r[0], 2.0 * p[1] - r[1], 2.0 * p[2] - r[2]]
             };
-            let down = if gy + 1 < vs { positions[idx + vs] } else {
-                let u = positions[idx - vs];
+            let down = if gy + 1 < vs { merc_positions[idx + vs] } else {
+                let u = merc_positions[idx - vs];
                 [2.0 * p[0] - u[0], 2.0 * p[1] - u[1], 2.0 * p[2] - u[2]]
             };
-            let up = if gy > 0 { positions[idx - vs] } else {
-                let d = positions[idx + vs];
+            let up = if gy > 0 { merc_positions[idx - vs] } else {
+                let d = merc_positions[idx + vs];
                 [2.0 * p[0] - d[0], 2.0 * p[1] - d[1], 2.0 * p[2] - d[2]]
             };
             let dx = [right[0] - left[0], right[1] - left[1], right[2] - left[2]];
@@ -557,15 +573,6 @@ pub fn build_terrain_mesh_centered(
     };
     // winding_cross > 0 → CW in y-down (normal), < 0 → inverted by projection.
     let flipped = winding_cross < 0.0;
-
-    // When flipped, negate normals so hillshade lighting is correct.
-    if flipped {
-        for n in &mut normals {
-            n[0] = -n[0];
-            n[1] = -n[1];
-            n[2] = -n[2];
-        }
-    }
 
     let mut vertices: Vec<TerrainVertex> = (0..vert_count)
         .map(|i| TerrainVertex {
