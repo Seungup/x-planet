@@ -27,6 +27,40 @@ use crate::terrain_data::TerrainTileData;
 use crate::terrain_renderer::TerrainLayerData;
 
 // ═══════════════════════════════════════════════════════════════════
+// MapEvent — platform-agnostic event signals
+// ═══════════════════════════════════════════════════════════════════
+
+/// Events emitted by [`MapController`] when viewport state changes.
+///
+/// Platform code (web/native) can drain these each frame and dispatch them
+/// to registered callbacks (e.g. JS `on("move", fn)` handlers).
+#[derive(Debug, Clone)]
+pub enum MapEvent {
+    Move { lat: f64, lon: f64 },
+    Zoom { zoom: f64 },
+    Pitch { pitch: f64 },
+    Bearing { bearing: f64 },
+    MoveEnd,
+    ZoomEnd,
+    Click { lat: f64, lon: f64, x: f64, y: f64 },
+}
+
+impl MapEvent {
+    /// Event name string for JS dispatch.
+    pub fn name(&self) -> &'static str {
+        match self {
+            MapEvent::Move { .. } => "move",
+            MapEvent::Zoom { .. } => "zoom",
+            MapEvent::Pitch { .. } => "pitch",
+            MapEvent::Bearing { .. } => "bearing",
+            MapEvent::MoveEnd => "moveend",
+            MapEvent::ZoomEnd => "zoomend",
+            MapEvent::Click { .. } => "click",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // LayerInfo — public read-only layer metadata
 // ═══════════════════════════════════════════════════════════════════
 
@@ -116,6 +150,17 @@ pub struct MapController {
 
     /// Terrain rendering state (rendering property, not a layer).
     pub terrain: Option<TerrainState>,
+
+    // ── Event tracking ──
+    pending_events: Vec<MapEvent>,
+    /// Previous frame viewport state for change detection.
+    prev_center: (f64, f64),
+    prev_zoom: f64,
+    prev_bearing: f64,
+    prev_pitch: f64,
+    /// Whether the camera was animating last frame (for *End events).
+    was_moving: bool,
+    was_zooming: bool,
 }
 
 impl MapController {
@@ -123,6 +168,7 @@ impl MapController {
 
     pub fn new(config: MapConfig, width: u32, height: u32) -> Self {
         let initial_zoom = config.zoom;
+        let center = (config.center.lat, config.center.lon);
         let engine = MapEngine::new(config, width, height);
         Self {
             engine,
@@ -130,6 +176,13 @@ impl MapController {
             prev_visible_available: HashSet::new(),
             departing_tiles: HashMap::new(),
             terrain: None,
+            pending_events: Vec::new(),
+            prev_center: center,
+            prev_zoom: initial_zoom,
+            prev_bearing: 0.0,
+            prev_pitch: 0.0,
+            was_moving: false,
+            was_zooming: false,
         }
     }
 
@@ -500,9 +553,60 @@ impl MapController {
     // ── Per-frame orchestration ─────────────────────────────────
 
     /// Advance animations (smooth zoom, inertia pan). Call once per frame.
+    ///
+    /// Also detects viewport state changes and pushes [`MapEvent`]s.
     pub fn tick(&mut self, dt_secs: f64) {
         let mode = self.rendering_mode();
         self.anim.tick_with_mode(&mut self.engine, dt_secs, mode);
+
+        // ── Detect state changes and emit events ──
+        let vp = &self.engine.viewport;
+        let cur_center = (vp.center.lat, vp.center.lon);
+        let cur_zoom = vp.zoom;
+        let cur_bearing = vp.bearing;
+        let cur_pitch = vp.pitch;
+
+        let is_moving = (cur_center.0 - self.prev_center.0).abs() > 1e-9
+            || (cur_center.1 - self.prev_center.1).abs() > 1e-9;
+        let is_zooming = (cur_zoom - self.prev_zoom).abs() > 1e-6;
+
+        if is_moving {
+            self.pending_events.push(MapEvent::Move { lat: cur_center.0, lon: cur_center.1 });
+        }
+        if is_zooming {
+            self.pending_events.push(MapEvent::Zoom { zoom: cur_zoom });
+        }
+        if (cur_bearing - self.prev_bearing).abs() > 1e-6 {
+            self.pending_events.push(MapEvent::Bearing { bearing: cur_bearing });
+        }
+        if (cur_pitch - self.prev_pitch).abs() > 1e-6 {
+            self.pending_events.push(MapEvent::Pitch { pitch: cur_pitch });
+        }
+
+        // Emit *End events when movement/zoom stops
+        if self.was_moving && !is_moving {
+            self.pending_events.push(MapEvent::MoveEnd);
+        }
+        if self.was_zooming && !is_zooming {
+            self.pending_events.push(MapEvent::ZoomEnd);
+        }
+
+        self.prev_center = cur_center;
+        self.prev_zoom = cur_zoom;
+        self.prev_bearing = cur_bearing;
+        self.prev_pitch = cur_pitch;
+        self.was_moving = is_moving;
+        self.was_zooming = is_zooming;
+    }
+
+    /// Drain all pending events since the last call.
+    pub fn drain_events(&mut self) -> Vec<MapEvent> {
+        std::mem::take(&mut self.pending_events)
+    }
+
+    /// Push a click event (called by platform input handler).
+    pub fn push_click(&mut self, lat: f64, lon: f64, x: f64, y: f64) {
+        self.pending_events.push(MapEvent::Click { lat, lon, x, y });
     }
 
     pub fn needs_redraw(&self) -> bool {

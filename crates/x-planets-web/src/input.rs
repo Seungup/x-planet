@@ -70,6 +70,8 @@ struct MouseDragState {
     right: Option<(f64, f64)>,
     /// Middle-button drag: last X position (rotate only)
     middle_x: Option<f64>,
+    /// Left-button mousedown position (CSS pixels) for click detection.
+    left_down_pos: Option<(f64, f64)>,
 }
 
 impl MouseDragState {
@@ -79,6 +81,7 @@ impl MouseDragState {
             left_pressed: false,
             right: None,
             middle_x: None,
+            left_down_pos: None,
         }
     }
 }
@@ -170,6 +173,7 @@ fn register_mouse_events(
                     app.controller.anim.begin_drag();
                     ms.left = Some(pos);
                     ms.left_pressed = true;
+                    ms.left_down_pos = Some(pos);
                 }
                 1 => {
                     ms.middle_x = Some(pos.0);
@@ -240,6 +244,21 @@ fn register_mouse_events(
             let mut ms = ms.borrow_mut();
             match e.button() {
                 0 => {
+                    // Click detection: if mousedown→mouseup distance < 5px, emit click event
+                    if let Some(down_pos) = ms.left_down_pos.take() {
+                        let x = e.offset_x() as f64;
+                        let y = e.offset_y() as f64;
+                        let dx = x - down_pos.0;
+                        let dy = y - down_pos.1;
+                        if dx * dx + dy * dy < 25.0 {
+                            // Unproject screen coords (physical pixels) to geographic
+                            let px = x * dpr;
+                            let py = y * dpr;
+                            if let Some((lat, lon)) = app.borrow().controller.unproject(px, py) {
+                                app.borrow_mut().controller.push_click(lat, lon, x, y);
+                            }
+                        }
+                    }
                     ms.left = None;
                     ms.left_pressed = false;
                     app.borrow_mut().controller.anim.compute_release_velocity(now_secs());

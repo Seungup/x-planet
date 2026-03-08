@@ -63,6 +63,23 @@ export interface XPlanetsMap {
 
   // ── Viewport ──
   resize(width: number, height: number): void;
+
+  // ── Events ──
+  on(event: "move", callback: (data: { lat: number; lon: number }) => void): void;
+  on(event: "zoom", callback: (data: { zoom: number }) => void): void;
+  on(event: "pitch", callback: (data: { pitch: number }) => void): void;
+  on(event: "bearing", callback: (data: { bearing: number }) => void): void;
+  on(event: "moveend", callback: () => void): void;
+  on(event: "zoomend", callback: () => void): void;
+  on(
+    event: "click",
+    callback: (data: { lat: number; lon: number; x: number; y: number }) => void,
+  ): void;
+  on(event: string, callback: (data: any) => void): void;
+  off(event: string, callback: (data: any) => void): void;
+
+  // ── Lifecycle ──
+  destroy(): void;
 }
 
 /** Layer metadata returned by `getLayer()`. */
@@ -75,6 +92,25 @@ export interface LayerInfo {
   kind: string;
 }
 
+/** Configuration for `XPlanets.create()`. */
+export interface XPlanetsConfig {
+  center?: [number, number];
+  zoom?: number;
+  projection?: string;
+  layers?: Array<{
+    name: string;
+    url: string;
+    kind?: string;
+    zOrder?: number;
+    opacity?: number;
+  }>;
+}
+
+/** Factory for creating x-planets map instances via Promise-based init. */
+export interface XPlanetsFactory {
+  create(canvasId: string, config?: XPlanetsConfig): Promise<XPlanetsMap>;
+}
+
 declare global {
   interface Window {
     xplanets?: XPlanetsMap;
@@ -83,4 +119,7 @@ declare global {
   interface WindowEventMap {
     "xplanets-ready": CustomEvent;
   }
+
+  /** Available after WASM module loads. */
+  const XPlanets: XPlanetsFactory;
 }

@@ -384,6 +384,181 @@ mod web_impl {
         pub fn resize(&self, width: u32, height: u32) {
             self.app.borrow_mut().controller.resize(width, height);
         }
+
+        // ── Events ──
+
+        /// Register an event listener. Supported events:
+        /// "move", "zoom", "pitch", "bearing", "moveend", "zoomend", "click"
+        pub fn on(&self, event: &str, callback: js_sys::Function) {
+            self.app.borrow_mut()
+                .event_handlers
+                .entry(event.to_string())
+                .or_default()
+                .push(callback);
+        }
+
+        /// Remove an event listener.
+        pub fn off(&self, event: &str, callback: js_sys::Function) {
+            if let Some(handlers) = self.app.borrow_mut().event_handlers.get_mut(event) {
+                handlers.retain(|f| f != &callback);
+            }
+        }
+
+        // ── Lifecycle ──
+
+        /// Destroy the map instance, stopping the render loop and cleaning up resources.
+        ///
+        /// After calling this, the map will no longer render and all event
+        /// listeners will be removed.
+        pub fn destroy(&self) {
+            let mut app = self.app.borrow_mut();
+            app.destroyed = true;
+            app.event_handlers.clear();
+            log::info!("x-planets map destroyed");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // XPlanets — Factory for Promise-based initialization
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Factory for creating x-planets map instances.
+    ///
+    /// ```javascript
+    /// const map = await XPlanets.create("my-canvas", { center: [37.5, 127], zoom: 10 });
+    /// map.on("move", console.log);
+    /// ```
+    #[wasm_bindgen]
+    pub struct XPlanets;
+
+    #[wasm_bindgen]
+    impl XPlanets {
+        /// Create a new x-planets map instance on the given canvas element.
+        ///
+        /// - `canvas_id`: The DOM id of the canvas element.
+        /// - `config`: Optional configuration object with:
+        ///   - `center`: `[lat, lon]` (default: [0, 0])
+        ///   - `zoom`: number (default: 2)
+        ///   - `projection`: string (default: "Web Mercator")
+        ///   - `layers`: array of `{ name, url, kind?, zOrder? }`
+        pub async fn create(canvas_id: &str, config: JsValue) -> Result<XPlanetsMap, JsValue> {
+            console_error_panic_hook::set_once();
+            console_log::init_with_level(log::Level::Info).ok();
+
+            let window = web_sys::window().ok_or("No window")?;
+            let document = window.document().ok_or("No document")?;
+            let canvas = document
+                .get_element_by_id(canvas_id)
+                .ok_or_else(|| JsValue::from_str(&format!("Canvas '{}' not found", canvas_id)))?
+                .dyn_into::<web_sys::HtmlCanvasElement>()?;
+
+            // DPR-aware canvas sizing
+            let dpr = window.device_pixel_ratio();
+            let css_w = canvas.client_width() as f64;
+            let css_h = canvas.client_height() as f64;
+            let width = (css_w * dpr).max(1.0) as u32;
+            let height = (css_h * dpr).max(1.0) as u32;
+            canvas.set_width(width);
+            canvas.set_height(height);
+
+            // GPU
+            let surface_target = wgpu::SurfaceTarget::Canvas(canvas.clone());
+            let gpu = x_planets_gpu::GpuContext::new_with_window(surface_target, width, height)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("GPU init failed: {}", e)))?;
+
+            // Parse JS config
+            let map_config = parse_js_config(&config);
+
+            // Set projection after creation if specified
+            let projection_name = if !config.is_undefined() && !config.is_null() {
+                js_sys::Reflect::get(&config, &"projection".into())
+                    .ok()
+                    .and_then(|v| v.as_string())
+            } else {
+                None
+            };
+
+            let mut controller = x_planets_core::MapController::new(map_config, width, height);
+            if let Some(proj) = projection_name {
+                controller.set_projection(&proj);
+            }
+
+            let renderer = x_planets_render::TileRenderer::new(&gpu);
+            let terrain_renderer = x_planets_render::TerrainRenderer::new(&gpu);
+            let tex_manager = x_planets_gpu::TextureManager::new(&gpu.device);
+
+            let app = WebApp::new(gpu, controller, renderer, terrain_renderer, tex_manager, canvas.clone(), dpr);
+            let app = std::rc::Rc::new(std::cell::RefCell::new(app));
+
+            // Input events
+            crate::input::register_events(&canvas, std::rc::Rc::clone(&app));
+
+            // Start render loop
+            WebApp::start_render_loop(std::rc::Rc::clone(&app));
+
+            Ok(XPlanetsMap { app })
+        }
+    }
+
+    /// Parse a JS config object into a [`MapConfig`].
+    fn parse_js_config(val: &JsValue) -> x_planets_core::engine::MapConfig {
+        let mut config = x_planets_core::engine::MapConfig::default();
+        if val.is_undefined() || val.is_null() {
+            return config;
+        }
+
+        // center: [lat, lon]
+        if let Ok(center) = js_sys::Reflect::get(val, &"center".into()) {
+            if let Some(arr) = center.dyn_ref::<js_sys::Array>() {
+                if arr.length() >= 2 {
+                    if let (Some(lat), Some(lon)) = (arr.get(0).as_f64(), arr.get(1).as_f64()) {
+                        config.center = x_planets_math::GeoCoord::new(lat, lon);
+                    }
+                }
+            }
+        }
+
+        // zoom: number
+        if let Ok(zoom) = js_sys::Reflect::get(val, &"zoom".into()) {
+            if let Some(z) = zoom.as_f64() {
+                config.zoom = z;
+            }
+        }
+
+        // layers: [{ name, url, kind?, zOrder?, opacity? }]
+        if let Ok(layers) = js_sys::Reflect::get(val, &"layers".into()) {
+            if let Some(arr) = layers.dyn_ref::<js_sys::Array>() {
+                let mut layer_configs = Vec::new();
+                for i in 0..arr.length() {
+                    let item = arr.get(i);
+                    let name = js_sys::Reflect::get(&item, &"name".into())
+                        .ok().and_then(|v| v.as_string()).unwrap_or_default();
+                    let url = js_sys::Reflect::get(&item, &"url".into())
+                        .ok().and_then(|v| v.as_string()).unwrap_or_default();
+                    let z_order = js_sys::Reflect::get(&item, &"zOrder".into())
+                        .ok().and_then(|v| v.as_f64()).unwrap_or(i as f64) as i32;
+                    let opacity = js_sys::Reflect::get(&item, &"opacity".into())
+                        .ok().and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+
+                    if !name.is_empty() && !url.is_empty() {
+                        layer_configs.push(LayerConfig {
+                            name,
+                            tile_source_url: url,
+                            z_order,
+                            opacity,
+                            kind: LayerKind::Raster,
+                            ..Default::default()
+                        });
+                    }
+                }
+                if !layer_configs.is_empty() {
+                    config.layers = layer_configs;
+                }
+            }
+        }
+
+        config
     }
 }
 
