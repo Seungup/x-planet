@@ -17,7 +17,7 @@ use x_planets_tiles::TerrainEncoding;
 use crate::engine::{LayerConfig, LayerKind, MapConfig, MapEngine};
 use crate::interaction::{
     build_crossfade_overlay, compute_crossfade, compute_fade_overrides, update_tile_visibility,
-    AnimationController, FADE_DURATION,
+    AnimationController, CameraAnimation, EasingMode, FADE_DURATION,
 };
 use crate::pipeline::{resolve_fallbacks, RenderableTile};
 #[cfg(feature = "gpu")]
@@ -25,6 +25,21 @@ use crate::render::RenderLayerData;
 use crate::terrain_data::TerrainTileData;
 #[cfg(feature = "gpu")]
 use crate::terrain_renderer::TerrainLayerData;
+
+// ═══════════════════════════════════════════════════════════════════
+// LayerInfo — public read-only layer metadata
+// ═══════════════════════════════════════════════════════════════════
+
+/// Read-only layer metadata returned by [`MapController::get_layer_info`].
+#[derive(Debug, Clone)]
+pub struct LayerInfo {
+    pub name: String,
+    pub url: String,
+    pub opacity: f32,
+    pub visible: bool,
+    pub z_order: i32,
+    pub kind: String,
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // LayerStateView — platform implements this to provide GPU cache state
@@ -171,6 +186,110 @@ impl MapController {
         self.engine.viewport.pitch
     }
 
+    /// Set bearing (rotation) directly in degrees.
+    pub fn set_bearing(&mut self, degrees: f64) {
+        self.engine.camera.set_bearing(&mut self.engine.viewport, degrees);
+        self.engine.request_redraw();
+    }
+
+    /// Set pitch (tilt) directly in degrees.
+    pub fn set_pitch(&mut self, degrees: f64) {
+        self.engine.camera.set_pitch(&mut self.engine.viewport, degrees);
+        self.engine.request_redraw();
+    }
+
+    /// Animate the camera to a new position (smooth ease-in-out).
+    ///
+    /// `duration_secs` defaults to 2.0 if `None`.
+    pub fn fly_to(
+        &mut self,
+        lat: f64,
+        lon: f64,
+        zoom: f64,
+        duration_secs: Option<f64>,
+        bearing: Option<f64>,
+        pitch: Option<f64>,
+    ) {
+        self.start_camera_anim(lat, lon, zoom, duration_secs, bearing, pitch, EasingMode::FlyTo);
+    }
+
+    /// Animate the camera to a new position (linear interpolation).
+    ///
+    /// `duration_secs` defaults to 1.0 if `None`.
+    pub fn ease_to(
+        &mut self,
+        lat: f64,
+        lon: f64,
+        zoom: f64,
+        duration_secs: Option<f64>,
+        bearing: Option<f64>,
+        pitch: Option<f64>,
+    ) {
+        self.start_camera_anim(lat, lon, zoom, duration_secs, bearing, pitch, EasingMode::EaseTo);
+    }
+
+    /// Jump the camera to a new position instantly (no animation).
+    pub fn jump_to(&mut self, lat: f64, lon: f64, zoom: f64, bearing: Option<f64>, pitch: Option<f64>) {
+        self.anim.stop_animation();
+        self.set_center(lat, lon);
+        self.set_zoom(zoom);
+        if let Some(b) = bearing {
+            self.set_bearing(b);
+        }
+        if let Some(p) = pitch {
+            self.set_pitch(p);
+        }
+    }
+
+    /// Cancel any running camera animation.
+    pub fn stop_animation(&mut self) {
+        self.anim.stop_animation();
+    }
+
+    fn start_camera_anim(
+        &mut self,
+        lat: f64,
+        lon: f64,
+        zoom: f64,
+        duration_secs: Option<f64>,
+        bearing: Option<f64>,
+        pitch: Option<f64>,
+        easing: EasingMode,
+    ) {
+        let default_dur = match easing {
+            EasingMode::FlyTo => 2.0,
+            EasingMode::EaseTo => 1.0,
+        };
+        let duration = duration_secs.unwrap_or(default_dur).max(0.01);
+
+        let target_bearing = bearing.unwrap_or(self.engine.viewport.bearing);
+        let target_pitch = pitch.unwrap_or(self.engine.viewport.pitch);
+
+        // Shortest-path bearing interpolation
+        let mut start_bearing = self.engine.viewport.bearing;
+        let delta_b = target_bearing - start_bearing;
+        if delta_b > 180.0 {
+            start_bearing += 360.0;
+        } else if delta_b < -180.0 {
+            start_bearing -= 360.0;
+        }
+
+        let anim = CameraAnimation {
+            start_center: self.engine.viewport.center,
+            target_center: GeoCoord::new(lat, lon),
+            start_zoom: self.engine.viewport.zoom,
+            target_zoom: zoom.clamp(self.engine.camera.min_zoom, self.engine.camera.max_zoom),
+            start_bearing,
+            target_bearing,
+            start_pitch: self.engine.viewport.pitch,
+            target_pitch,
+            duration,
+            elapsed: 0.0,
+            easing,
+        };
+        self.anim.start_camera_animation(anim);
+    }
+
     // ── Viewport ────────────────────────────────────────────────
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -183,6 +302,70 @@ impl MapController {
 
     pub fn height(&self) -> u32 {
         self.engine.viewport.height
+    }
+
+    // ── Coordinate conversion ─────────────────────────────────
+
+    /// Convert geographic (lat, lon) to screen pixel coordinates.
+    ///
+    /// Returns `None` if the point is outside the visible area.
+    pub fn project(&self, lat: f64, lon: f64) -> Option<(f64, f64)> {
+        let vp = &self.engine.viewport;
+        let merc = x_planets_math::geo_to_mercator(&GeoCoord::new(lat, lon));
+        let center_merc = x_planets_math::geo_to_mercator(&vp.center);
+
+        let scale = 2.0_f64.powf(vp.zoom);
+        let aspect = vp.width as f64 / vp.height as f64;
+
+        // Offset in Mercator space (handling wrap-around)
+        let mut dx = merc.x - center_merc.x;
+        if dx > 0.5 { dx -= 1.0; }
+        if dx < -0.5 { dx += 1.0; }
+        let dy = merc.y - center_merc.y;
+
+        // Apply bearing rotation
+        let bearing_rad = vp.bearing.to_radians();
+        let sin_b = bearing_rad.sin();
+        let cos_b = bearing_rad.cos();
+        let rx = cos_b * dx - sin_b * dy;
+        let ry = sin_b * dx + cos_b * dy;
+
+        // Convert to screen pixels
+        let sx = vp.width as f64 * 0.5 + rx * scale / aspect * vp.width as f64;
+        let sy = vp.height as f64 * 0.5 + ry * scale * vp.height as f64;
+
+        Some((sx, sy))
+    }
+
+    /// Convert screen pixel coordinates to geographic (lat, lon).
+    ///
+    /// Returns `None` if the point cannot be unprojected.
+    pub fn unproject(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let vp = &self.engine.viewport;
+        let center_merc = x_planets_math::geo_to_mercator(&vp.center);
+
+        let scale = 2.0_f64.powf(vp.zoom);
+        let aspect = vp.width as f64 / vp.height as f64;
+
+        // Screen → normalized offset
+        let dx_screen = (x - vp.width as f64 * 0.5) / vp.width as f64 * aspect / scale;
+        let dy_screen = (y - vp.height as f64 * 0.5) / vp.height as f64 / scale;
+
+        // Reverse bearing rotation
+        let bearing_rad = vp.bearing.to_radians();
+        let sin_b = bearing_rad.sin();
+        let cos_b = bearing_rad.cos();
+        let mx = cos_b * dx_screen + sin_b * dy_screen;
+        let my = -sin_b * dx_screen + cos_b * dy_screen;
+
+        let merc_x = (center_merc.x + mx).rem_euclid(1.0);
+        let merc_y = center_merc.y + my;
+        if merc_y < 0.0 || merc_y > 1.0 {
+            return None;
+        }
+
+        let geo = x_planets_math::mercator_to_geo(glam::DVec2::new(merc_x, merc_y));
+        Some((geo.lat, geo.lon))
     }
 
     // ── Projection ──────────────────────────────────────────────
@@ -235,6 +418,27 @@ impl MapController {
 
     pub fn layer_count(&self) -> usize {
         self.engine.layer_count()
+    }
+
+    /// Get all layer names in z-order (bottom to top).
+    pub fn layer_names(&self) -> Vec<String> {
+        self.engine.layers.iter().map(|l| l.config.name.clone()).collect()
+    }
+
+    /// Get layer info by name: (url, opacity, visible, z_order, kind).
+    pub fn get_layer_info(&self, name: &str) -> Option<LayerInfo> {
+        self.engine.get_layer(name).map(|l| LayerInfo {
+            name: l.config.name.clone(),
+            url: l.config.tile_source_url.clone(),
+            opacity: l.config.opacity,
+            visible: l.config.visible,
+            z_order: l.config.z_order,
+            kind: match &l.config.kind {
+                LayerKind::Raster => "raster".to_string(),
+                LayerKind::Terrain { .. } => "terrain".to_string(),
+                LayerKind::Tiles3d => "3dtiles".to_string(),
+            },
+        })
     }
 
     // ── Terrain high-level API ──────────────────────────────────

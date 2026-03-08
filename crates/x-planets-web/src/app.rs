@@ -163,6 +163,15 @@ impl WebApp {
         }
     }
 
+    /// Add a new layer state for a dynamically added layer.
+    pub fn add_layer_state(&mut self, name: &str, url: &str) {
+        self.layer_states.push(WebLayerState::new(
+            name.to_string(),
+            LayerKind::Raster,
+            url.to_string(),
+        ));
+    }
+
     /// Resolve the active projection name to a `ProjectionMode` enum.
     pub(crate) fn resolve_projection_mode(&self) -> x_planets_math::ProjectionMode {
         self.controller.rendering_mode()

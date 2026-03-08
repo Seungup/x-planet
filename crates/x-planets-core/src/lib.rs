@@ -24,7 +24,7 @@ pub mod verify_chain;
 pub mod viewport;
 
 pub use engine::{LayerConfig, LayerKind, MapEngine, TileLayer};
-pub use map_controller::{LayerStateView, MapController};
+pub use map_controller::{LayerInfo, LayerStateView, MapController};
 #[cfg(feature = "gpu")]
 pub use map_controller::RenderOutput;
 #[cfg(feature = "gpu")]

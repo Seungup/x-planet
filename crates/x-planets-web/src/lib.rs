@@ -17,6 +17,7 @@ mod web_impl {
     use wasm_bindgen::JsCast;
 
     use crate::app::WebApp;
+    use x_planets_core::engine::{LayerConfig, LayerKind};
 
     /// Initialize the WASM module, then launch the map.
     #[wasm_bindgen(start)]
@@ -170,6 +171,85 @@ mod web_impl {
             self.app.borrow().controller.pitch_angle()
         }
 
+        /// Set the bearing (rotation) in degrees.
+        #[wasm_bindgen(js_name = "setBearing")]
+        pub fn set_bearing(&self, degrees: f64) {
+            self.app.borrow_mut().controller.set_bearing(degrees);
+        }
+
+        /// Set the pitch (tilt) in degrees (0 = top-down, 60 = max tilt).
+        #[wasm_bindgen(js_name = "setPitch")]
+        pub fn set_pitch(&self, degrees: f64) {
+            self.app.borrow_mut().controller.set_pitch(degrees);
+        }
+
+        /// Smoothly animate the camera to a new position (ease-in-out).
+        ///
+        /// Parameters: lat, lon, zoom, duration (seconds, default 2.0),
+        /// bearing (degrees, optional), pitch (degrees, optional).
+        #[wasm_bindgen(js_name = "flyTo")]
+        pub fn fly_to(
+            &self,
+            lat: f64,
+            lon: f64,
+            zoom: f64,
+            duration: Option<f64>,
+            bearing: Option<f64>,
+            pitch: Option<f64>,
+        ) {
+            self.app.borrow_mut().controller.fly_to(lat, lon, zoom, duration, bearing, pitch);
+        }
+
+        /// Smoothly animate the camera to a new position (linear interpolation).
+        ///
+        /// Parameters: lat, lon, zoom, duration (seconds, default 1.0),
+        /// bearing (degrees, optional), pitch (degrees, optional).
+        #[wasm_bindgen(js_name = "easeTo")]
+        pub fn ease_to(
+            &self,
+            lat: f64,
+            lon: f64,
+            zoom: f64,
+            duration: Option<f64>,
+            bearing: Option<f64>,
+            pitch: Option<f64>,
+        ) {
+            self.app.borrow_mut().controller.ease_to(lat, lon, zoom, duration, bearing, pitch);
+        }
+
+        /// Jump the camera to a new position instantly (no animation).
+        #[wasm_bindgen(js_name = "jumpTo")]
+        pub fn jump_to(
+            &self,
+            lat: f64,
+            lon: f64,
+            zoom: f64,
+            bearing: Option<f64>,
+            pitch: Option<f64>,
+        ) {
+            self.app.borrow_mut().controller.jump_to(lat, lon, zoom, bearing, pitch);
+        }
+
+        /// Cancel any running camera animation.
+        #[wasm_bindgen(js_name = "stopAnimation")]
+        pub fn stop_animation(&self) {
+            self.app.borrow_mut().controller.stop_animation();
+        }
+
+        // ── Coordinate Conversion ──
+
+        /// Convert geographic (lat, lon) to screen pixel coordinates.
+        /// Returns [x, y] or null if outside the visible area.
+        pub fn project(&self, lat: f64, lon: f64) -> Option<Vec<f64>> {
+            self.app.borrow().controller.project(lat, lon).map(|(x, y)| vec![x, y])
+        }
+
+        /// Convert screen pixel coordinates to geographic (lat, lon).
+        /// Returns [lat, lon] or null if outside the map.
+        pub fn unproject(&self, x: f64, y: f64) -> Option<Vec<f64>> {
+            self.app.borrow().controller.unproject(x, y).map(|(lat, lon)| vec![lat, lon])
+        }
+
         // ── Projection ──
 
         /// Set the projection by name (e.g. "Web Mercator", "Globe", "Equirectangular").
@@ -248,6 +328,54 @@ mod web_impl {
         #[wasm_bindgen(js_name = "layerCount")]
         pub fn layer_count(&self) -> usize {
             self.app.borrow().controller.layer_count()
+        }
+
+        /// Add a raster tile layer. Returns the layer index.
+        ///
+        /// Parameters:
+        /// - `name`: unique layer name
+        /// - `url`: tile URL template with {z}/{x}/{y}
+        /// - `z_order`: stacking order (optional, default 0)
+        #[wasm_bindgen(js_name = "addLayer")]
+        pub fn add_layer(&self, name: &str, url: &str, z_order: Option<i32>) -> usize {
+            let config = LayerConfig {
+                name: name.to_string(),
+                tile_source_url: url.to_string(),
+                z_order: z_order.unwrap_or(0),
+                kind: LayerKind::Raster,
+                ..Default::default()
+            };
+            let mut app = self.app.borrow_mut();
+            let idx = app.controller.add_layer(config);
+            // Add corresponding WebLayerState
+            app.add_layer_state(name, url);
+            idx
+        }
+
+        /// Get layer info as a JS object. Returns null if not found.
+        ///
+        /// Object shape: { name, url, opacity, visible, zOrder, kind }
+        #[wasm_bindgen(js_name = "getLayer")]
+        pub fn get_layer(&self, name: &str) -> JsValue {
+            match self.app.borrow().controller.get_layer_info(name) {
+                Some(info) => {
+                    let obj = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(&obj, &"name".into(), &info.name.into());
+                    let _ = js_sys::Reflect::set(&obj, &"url".into(), &info.url.into());
+                    let _ = js_sys::Reflect::set(&obj, &"opacity".into(), &(info.opacity as f64).into());
+                    let _ = js_sys::Reflect::set(&obj, &"visible".into(), &info.visible.into());
+                    let _ = js_sys::Reflect::set(&obj, &"zOrder".into(), &info.z_order.into());
+                    let _ = js_sys::Reflect::set(&obj, &"kind".into(), &info.kind.into());
+                    obj.into()
+                }
+                None => JsValue::NULL,
+            }
+        }
+
+        /// Get all layer names in z-order (bottom to top).
+        #[wasm_bindgen(js_name = "getLayers")]
+        pub fn get_layers(&self) -> Vec<String> {
+            self.app.borrow().controller.layer_names()
         }
 
         // ── Viewport ──

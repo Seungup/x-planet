@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use x_planets_math::TileCoord;
+use x_planets_math::{GeoCoord, TileCoord};
 
 use crate::engine::MapEngine;
 
@@ -51,6 +51,54 @@ pub fn exp_decay(current: f64, target: f64, speed: f64, dt: f64) -> f64 {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// FlyTo / EaseTo animation
+// ═══════════════════════════════════════════════════════════════════
+
+/// Easing mode for camera transition animations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EasingMode {
+    /// Ease-in-out (smooth start and end, like Mapbox `flyTo`).
+    FlyTo,
+    /// Linear interpolation (constant speed, like Mapbox `easeTo`).
+    EaseTo,
+}
+
+/// State for an in-progress camera transition animation.
+#[derive(Clone, Debug)]
+pub struct CameraAnimation {
+    pub start_center: GeoCoord,
+    pub target_center: GeoCoord,
+    pub start_zoom: f64,
+    pub target_zoom: f64,
+    pub start_bearing: f64,
+    pub target_bearing: f64,
+    pub start_pitch: f64,
+    pub target_pitch: f64,
+    pub duration: f64,
+    pub elapsed: f64,
+    pub easing: EasingMode,
+}
+
+impl CameraAnimation {
+    /// Compute the interpolation factor `t` in [0, 1] based on elapsed/duration.
+    fn progress(&self) -> f64 {
+        let t = (self.elapsed / self.duration).clamp(0.0, 1.0);
+        match self.easing {
+            EasingMode::EaseTo => t,
+            EasingMode::FlyTo => {
+                // Smooth ease-in-out: 3t² - 2t³
+                t * t * (3.0 - 2.0 * t)
+            }
+        }
+    }
+
+    /// Whether the animation has finished.
+    pub fn is_done(&self) -> bool {
+        self.elapsed >= self.duration
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // AnimationController
 // ═══════════════════════════════════════════════════════════════════
 
@@ -78,6 +126,9 @@ pub struct AnimationController {
     // ── Tile fade-in ──
     tile_fade_start: HashMap<TileCoord, f64>,
 
+    // ── Camera animation (flyTo / easeTo) ──
+    pub camera_anim: Option<CameraAnimation>,
+
     // ── Misc ──
     /// Last known mouse position (for zoom anchor fallback).
     pub last_mouse_pos: Option<(f64, f64)>,
@@ -93,6 +144,7 @@ impl AnimationController {
             last_click_time: None,
             last_click_pos: None,
             tile_fade_start: HashMap::new(),
+            camera_anim: None,
             last_mouse_pos: None,
         }
     }
@@ -105,7 +157,8 @@ impl AnimationController {
             (vx * vx + vy * vy).sqrt() > INERTIA_MIN_SPEED
         };
         let fades_active = !self.tile_fade_start.is_empty();
-        zoom_active || pan_active || fades_active
+        let camera_active = self.camera_anim.as_ref().map_or(false, |a| !a.is_done());
+        zoom_active || pan_active || fades_active || camera_active
     }
 
     /// Advance smooth zoom and inertia pan. Call once per frame with `dt` in seconds.
@@ -120,6 +173,30 @@ impl AnimationController {
         dt: f64,
         mode: x_planets_math::ProjectionMode,
     ) {
+        // ── Camera animation (flyTo / easeTo) ──
+        if let Some(ref mut anim) = self.camera_anim {
+            anim.elapsed += dt;
+            let t = anim.progress();
+
+            let lat = anim.start_center.lat + (anim.target_center.lat - anim.start_center.lat) * t;
+            let lon = anim.start_center.lon + (anim.target_center.lon - anim.start_center.lon) * t;
+            let zoom = anim.start_zoom + (anim.target_zoom - anim.start_zoom) * t;
+            let bearing = anim.start_bearing + (anim.target_bearing - anim.start_bearing) * t;
+            let pitch = anim.start_pitch + (anim.target_pitch - anim.start_pitch) * t;
+
+            engine.viewport.center = GeoCoord::new(lat, lon);
+            engine.viewport.zoom = zoom.clamp(engine.camera.min_zoom, engine.camera.max_zoom);
+            engine.camera.set_bearing(&mut engine.viewport, bearing);
+            engine.camera.set_pitch(&mut engine.viewport, pitch);
+            engine.request_redraw();
+
+            if anim.is_done() {
+                self.zoom_target = engine.viewport.zoom;
+                self.camera_anim = None;
+            }
+            return; // Camera animation overrides smooth zoom / inertia
+        }
+
         // ── Smooth zoom ──
         let current = engine.viewport.zoom;
         let target = self
@@ -206,6 +283,19 @@ impl AnimationController {
             self.last_click_pos = Some(pos);
         }
         is_double
+    }
+
+    // ── Camera animation ──
+
+    /// Start a flyTo or easeTo camera animation.
+    pub fn start_camera_animation(&mut self, anim: CameraAnimation) {
+        self.pan_velocity = (0.0, 0.0); // Stop inertia
+        self.camera_anim = Some(anim);
+    }
+
+    /// Cancel any running camera animation immediately.
+    pub fn stop_animation(&mut self) {
+        self.camera_anim = None;
     }
 
     // ── Tile fade-in ──
