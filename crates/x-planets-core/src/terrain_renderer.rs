@@ -95,6 +95,10 @@ pub struct TerrainRenderer {
     /// If projection changes, the entire cache is invalidated
     /// (mesh geometry is projection-dependent).
     cached_projection_mode: x_planets_math::ProjectionMode,
+    /// Viewport center (lat/lon radians) when the centered-Mercator mesh cache
+    /// was last valid.  Only invalidate when the center actually changes.
+    cached_center_lat_rad: f64,
+    cached_center_lon_rad: f64,
 }
 
 /// Projection-specific parameters for terrain mesh building.
@@ -313,6 +317,8 @@ impl TerrainRenderer {
             mesh_cache: HashMap::new(),
             cached_exaggeration: exaggeration,
             cached_projection_mode: x_planets_math::ProjectionMode::Mercator,
+            cached_center_lat_rad: f64::NAN,
+            cached_center_lon_rad: f64::NAN,
         }
     }
 
@@ -544,13 +550,22 @@ impl TerrainRenderer {
             self.cached_projection_mode = mode;
         }
 
-        // For centered Mercator (non-Globe), invalidate mesh cache every frame.
-        // The oblique Mercator projection bakes the viewport center into every
-        // vertex position, so any pan invalidates all cached geometry.
+        // For centered Mercator (non-Globe), the oblique Mercator projection
+        // bakes the viewport center into every vertex position.  Only invalidate
+        // the mesh cache when the center actually moves — not every frame.
         // (Globe mode vertices sit on a fixed unit sphere — only the MVP changes.)
+        let center_lat_rad = viewport.center.lat.to_radians();
+        let center_lon_rad = viewport.center.lon.to_radians();
         let is_centered = mode != x_planets_math::ProjectionMode::Globe;
         if is_centered {
-            self.mesh_cache.clear();
+            let center_moved =
+                (center_lat_rad - self.cached_center_lat_rad).abs() > 1e-12
+                || (center_lon_rad - self.cached_center_lon_rad).abs() > 1e-12;
+            if center_moved {
+                self.mesh_cache.clear();
+                self.cached_center_lat_rad = center_lat_rad;
+                self.cached_center_lon_rad = center_lon_rad;
+            }
         }
 
         let height_scale = compute_height_scale_for(self.exaggeration, viewport.body.circumference);
@@ -562,15 +577,14 @@ impl TerrainRenderer {
         // Compute f64 VP using the same projection as the raster renderer.
         let vp_f64 = viewport.to_view_proj_f64_projected(mode);
 
-        let center_lat_rad = viewport.center.lat.to_radians();
-        let center_lon_rad = viewport.center.lon.to_radians();
-
         // Track which tiles are rendered this frame for cache eviction.
         let mut rendered_coords = HashSet::new();
 
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+        let mut is_first_layer = true;
 
         for layer in layers {
             // Phase 1: Ensure meshes are cached for all visible tiles.
@@ -694,7 +708,15 @@ impl TerrainRenderer {
             }
 
             // Phase 3: Render pass — all buffers and bind groups live in mesh_cache.
+            // Clear depth only on the first terrain layer; subsequent layers (e.g.
+            // crossfade overlays) preserve depth from earlier layers to avoid
+            // z-fighting between base and overlay terrain tiles.
             {
+                let depth_load = if is_first_layer {
+                    wgpu::LoadOp::Clear(1.0)
+                } else {
+                    wgpu::LoadOp::Load
+                };
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("terrain-render-pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -708,13 +730,14 @@ impl TerrainRenderer {
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &self.depth_view,
                         depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Discard,
+                            load: depth_load,
+                            store: wgpu::StoreOp::Store,
                         }),
                         stencil_ops: None,
                     }),
                     ..Default::default()
                 });
+                is_first_layer = false;
 
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.viewport_bg, &[]);
