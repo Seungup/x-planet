@@ -39,29 +39,32 @@ impl super::Viewport {
         let half_h = scale * 1.1;
         let half_w = scale * aspect * 1.1;
 
-        let mut max_extent = (half_h * half_h + half_w * half_w).sqrt();
-
-        if self.pitch >= 1.0 {
-            let fov_half_tan = (std::f64::consts::FRAC_PI_3 * 0.5).tan();
-            let cam_h = scale / fov_half_tan;
-            let pitch_rad = self.pitch.to_radians();
-            let fov_half = std::f64::consts::FRAC_PI_3 * 0.5;
-            let bottom_angle = pitch_rad + fov_half;
-            let forward_dist = if bottom_angle < std::f64::consts::FRAC_PI_2 * 0.98 {
-                cam_h * bottom_angle.tan()
-            } else {
-                cam_h * 20.0
-            };
-            max_extent = max_extent.max(forward_dist);
-        }
-
         let center_lat_rad = self.center.lat.to_radians();
         let center_lon_rad = self.center.lon.to_radians();
         let center_sphere = x_planets_math::geo_to_unit_sphere(center_lat_rad, center_lon_rad);
         let threshold_deg: f64 = crate::pipeline::centered_angular_threshold_deg(self.zoom);
 
-        let forward_ext = if self.pitch >= 1.0 { max_extent } else { 0.0 };
+        // Compute forward extent in oblique Mercator space.
+        // The old method used flat camera geometry (cam_h * 20) which only
+        // covered ~13° of angular distance.  Instead, compute the oblique
+        // Mercator y-offset for the maximum visible angular distance.
+        let forward_ext = if self.pitch >= 1.0 {
+            let pitch_rad = self.pitch.to_radians();
+            let fov_half = std::f64::consts::FRAC_PI_3 * 0.5;
+            // Maximum angular distance from center the camera can see
+            let max_visible_angle = (pitch_rad + fov_half).min(threshold_deg.to_radians());
+            // Convert to oblique Mercator y-offset:
+            // In oblique Mercator, y = 0.5 - atanh(sin(θ))/(2π)
+            // so the offset from center (0.5) is atanh(sin(θ))/(2π)
+            let sin_vis = max_visible_angle.sin().min(0.998);
+            sin_vis.atanh() / (2.0 * std::f64::consts::PI)
+        } else {
+            0.0
+        };
 
+        // Use finer grid for pitched views (oblique Mercator is highly
+        // nonlinear at large distances from center).
+        let n_grid_y = if self.pitch >= 10.0 { 16_usize } else { 8_usize };
         let n_grid = 8_usize;
         let mut lat_min_deg = self.center.lat;
         let mut lat_max_deg = self.center.lat;
@@ -74,8 +77,8 @@ impl super::Viewport {
         let rect_top = 0.5 - half_h - forward_ext;
         let rect_bottom = 0.5 + half_h;
 
-        for iy in 0..=n_grid {
-            let ty = iy as f64 / n_grid as f64;
+        for iy in 0..=n_grid_y {
+            let ty = iy as f64 / n_grid_y as f64;
             let y = rect_top + (rect_bottom - rect_top) * ty;
             for ix in 0..=n_grid {
                 let tx = ix as f64 / n_grid as f64;
@@ -157,9 +160,36 @@ impl super::Viewport {
         let globe_zoom = (360.0 / tile_size_deg).log2()
             .floor()
             .clamp(0.0, 22.0) as u8;
-        let half_deg = cap_half.to_degrees().min(89.0);
-        let lat = self.center.lat;
-        let lon = self.center.lon;
+
+        // When pitched, the camera sees much further toward the horizon
+        // in the forward (bearing) direction.  Extend the tile selection
+        // toward the geometric horizon proportionally to pitch.
+        let effective_half = if self.pitch >= 1.0 {
+            let pitch_factor = (self.pitch / 60.0).clamp(0.0, 1.0);
+            tile_half + (cap_half - tile_half) * pitch_factor
+        } else {
+            tile_half
+        };
+        let half_deg = effective_half.to_degrees().min(89.0);
+
+        // For pitched views, offset the bounding box center in the bearing
+        // direction so coverage favours the forward (horizon) side over the
+        // area behind the camera.
+        let (lat_offset, lon_offset) = if self.pitch >= 5.0 {
+            let bearing_rad = self.bearing.to_radians();
+            let pitch_factor = (self.pitch / 60.0).clamp(0.0, 1.0);
+            let fwd_deg = (half_deg - tile_half.to_degrees()) * pitch_factor * 0.5;
+            // Forward in bearing direction: north component + east component
+            let dlat = fwd_deg * bearing_rad.cos();
+            let cos_lat = self.center.lat.to_radians().cos().max(0.05);
+            let dlon = fwd_deg * bearing_rad.sin() / cos_lat;
+            (dlat, dlon)
+        } else {
+            (0.0, 0.0)
+        };
+
+        let lat = self.center.lat + lat_offset;
+        let lon = self.center.lon + lon_offset;
 
         let lat_min = (lat - half_deg).max(-89.9);
         let lat_max = (lat + half_deg).min(89.9);
@@ -216,8 +246,14 @@ impl super::Viewport {
         let globe_r2 = 1.0 + (1.0 + globe_h).powi(2);
         let globe_2rh = 2.0 * (1.0 + globe_h);
         let max_drop = match mode {
-            TileLodMode::Globe => 2_u8,
-            _ => ((self.pitch / 20.0).ceil() as u8).min(2),
+            TileLodMode::Globe => {
+                // At high pitch, the LOD range between near (fine) and far
+                // (coarse) tiles is larger.  Allow up to 4 zoom-level drop.
+                if self.pitch >= 30.0 { 4_u8 }
+                else if self.pitch >= 10.0 { 3_u8 }
+                else { 2_u8 }
+            }
+            _ => ((self.pitch / 20.0).ceil() as u8).min(3),
         };
         let min_z = base_z.saturating_sub(max_drop);
 
@@ -332,9 +368,18 @@ impl super::Viewport {
                 false
             };
 
+            // For pitched views, allow exploration beyond the final budget
+            // so the post-loop truncation can pick the best distribution.
+            // A tighter check starves fine tiles near the camera when the
+            // frustum covers a large area.
+            let explore_budget = if self.pitch >= 10.0 {
+                tile_budget + tile_budget / 2
+            } else {
+                tile_budget
+            };
             let should_subdivide = (vt.coord.z < ideal_z || contains_center)
                 && vt.coord.z < base_z
-                && (result.len() + heap.len() + 4) <= tile_budget;
+                && (result.len() + heap.len() + 4) <= explore_budget;
 
             if should_subdivide {
                 for child in vt.children() {
@@ -391,6 +436,12 @@ impl super::Viewport {
 
             result = coarse;
             result.extend(fine);
+
+            // Hard cap: if coarse tiles alone exceed the budget (can happen
+            // at polar latitudes or extreme views), truncate to budget.
+            if result.len() > tile_budget {
+                result.truncate(tile_budget);
+            }
         }
 
         result.sort_by_key(|vt| vt.coord.z);
