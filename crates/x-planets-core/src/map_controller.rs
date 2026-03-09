@@ -817,27 +817,31 @@ impl MapController {
                         // Per-tile split: terrain-enabled raster imagery layer
                         let is_terrain_imagery = terrain_imagery_layer == Some(layer.config.name.as_str());
                         if is_terrain_imagery {
-                            // Split visible tiles: elevation available → terrain, rest → flat raster
-                            let (flat_visible, terrain_visible) =
-                                split_by_elevation(visible, *lv, *lv);
-
-                            // Flat raster for tiles without elevation
-                            if !flat_visible.is_empty() {
-                                let (base, overlay) = build_raster_layer(
-                                    &layer.config.name,
-                                    layer.config.opacity,
-                                    *lv,
-                                    texture_fn,
-                                    &flat_visible,
-                                    &fade_fn,
-                                );
-                                raster_layers.push(base);
-                                if let Some(ovl) = overlay {
-                                    raster_layers.push(ovl);
-                                }
+                            // Always render ALL tiles as flat raster first — this
+                            // provides a stable, flicker-free base layer.  Terrain
+                            // tiles are then rendered on top (LoadOp::Load) and
+                            // overdraw the raster underneath with displaced meshes.
+                            //
+                            // The old approach split tiles exclusively into flat vs
+                            // terrain sets, which caused flickering as elevation data
+                            // loaded asynchronously (tiles popping between renderers).
+                            let (base, overlay) = build_raster_layer(
+                                &layer.config.name,
+                                layer.config.opacity,
+                                *lv,
+                                texture_fn,
+                                visible,
+                                &fade_fn,
+                            );
+                            raster_layers.push(base);
+                            if let Some(ovl) = overlay {
+                                raster_layers.push(ovl);
                             }
 
-                            // Terrain mesh for tiles with elevation (single layer view)
+                            // Terrain overlay for tiles with elevation data
+                            let (_, terrain_visible) =
+                                split_by_elevation(visible, *lv, *lv);
+
                             if !terrain_visible.is_empty() {
                                 let (base, overlay) = build_terrain_layer(
                                     &layer.config.name,
