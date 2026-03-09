@@ -216,8 +216,8 @@ impl super::Viewport {
         let globe_r2 = 1.0 + (1.0 + globe_h).powi(2);
         let globe_2rh = 2.0 * (1.0 + globe_h);
         let max_drop = match mode {
-            TileLodMode::Globe => 3_u8,
-            _ => ((self.pitch / 15.0).ceil() as u8).min(4),
+            TileLodMode::Globe => 2_u8,
+            _ => ((self.pitch / 20.0).ceil() as u8).min(2),
         };
         let min_z = base_z.saturating_sub(max_drop);
 
@@ -252,7 +252,7 @@ impl super::Viewport {
             let d_fwd = dx * sin_b - dy * cos_b;
 
             if d_fwd > 0.0 && sin_p > 0.01 {
-                let perspective = cam_h / (cam_h + d_fwd * sin_p);
+                let perspective = cam_h / (cam_h + d_fwd * sin_p * 0.6);
                 (self.zoom + perspective.log2())
                     .round()
                     .clamp(min_z as f64, base_z as f64) as u8

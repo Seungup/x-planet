@@ -7,6 +7,8 @@ mod view_proj;
 
 pub use camera::CameraController;
 
+use std::cell::Cell;
+
 use x_planets_math::ecef::{CelestialBody, EARTH};
 use x_planets_math::GeoCoord;
 
@@ -77,6 +79,8 @@ pub struct Viewport {
     pub sun_direction: [f64; 3],
     /// Hillshade strength (0.0 = flat, 1.0 = full relief). Default: 1.0.
     pub hillshade_strength: f64,
+    /// Previous tile zoom level for hysteresis (prevents oscillation at zoom boundaries).
+    prev_tile_zoom: Cell<Option<u8>>,
 }
 
 impl Viewport {
@@ -94,12 +98,28 @@ impl Viewport {
             max_zoom: 22.0,
             sun_direction: [-0.5, -0.5, 0.7],
             hillshade_strength: 1.0,
+            prev_tile_zoom: Cell::new(None),
         }
     }
 
     /// Integer zoom level for tile fetching.
+    ///
+    /// Uses hysteresis (±0.4 threshold) to prevent tile oscillation at zoom
+    /// boundaries.  The previous tile zoom is sticky: it only changes when the
+    /// fractional zoom moves more than 0.4 away from the current integer level.
     pub fn tile_zoom(&self) -> u8 {
-        self.zoom.round().clamp(0.0, 22.0) as u8
+        let raw = self.zoom.round().clamp(0.0, 22.0) as u8;
+        let result = if let Some(prev) = self.prev_tile_zoom.get() {
+            if (self.zoom - prev as f64).abs() < 0.4 {
+                prev
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
+        self.prev_tile_zoom.set(Some(result));
+        result
     }
 }
 
