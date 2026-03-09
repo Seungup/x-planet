@@ -4,7 +4,7 @@ export interface XPlanetsMap {
   panBy(dx: number, dy: number): void;
   zoomTo(zoom: number): void;
   setCenter(lat: number, lon: number): void;
-  getCenter(): [number, number];
+  getCenter(): Float64Array;
   getZoom(): number;
   getBearing(): number;
   getPitch(): number;
@@ -38,8 +38,8 @@ export interface XPlanetsMap {
   stopAnimation(): void;
 
   // ── Coordinate Conversion ──
-  project(lat: number, lon: number): [number, number] | null;
-  unproject(x: number, y: number): [number, number] | null;
+  project(lat: number, lon: number): Float64Array | null;
+  unproject(x: number, y: number): Float64Array | null;
 
   // ── Projection ──
   setProjection(name: string): boolean;
