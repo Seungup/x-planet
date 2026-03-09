@@ -273,7 +273,7 @@ impl Model3dRenderer {
                         ..Default::default()
                     },
                     depth_stencil: Some(wgpu::DepthStencilState {
-                        format: wgpu::TextureFormat::Depth32Float,
+                        format: Self::depth_format(),
                         depth_write_enabled: true,
                         depth_compare: wgpu::CompareFunction::LessEqual,
                         stencil: wgpu::StencilState::default(),
@@ -322,7 +322,7 @@ impl Model3dRenderer {
             .as_ref()
             .map(|s| (s.config.width, s.config.height))
             .unwrap_or((800, 600));
-        let depth_format = wgpu::TextureFormat::Depth32Float;
+        let depth_format = Self::depth_format();
         let depth_view =
             Self::create_depth_texture(&gpu.device, surface_width, surface_height, depth_format);
 
@@ -348,6 +348,15 @@ impl Model3dRenderer {
             surface_height,
             white_texture_view,
         }
+    }
+
+    /// Platform-appropriate depth format.
+    /// Depth24Plus is safer on WebGL2 fallback; Depth32Float on native.
+    fn depth_format() -> wgpu::TextureFormat {
+        #[cfg(target_arch = "wasm32")]
+        { wgpu::TextureFormat::Depth24Plus }
+        #[cfg(not(target_arch = "wasm32"))]
+        { wgpu::TextureFormat::Depth32Float }
     }
 
     fn create_depth_texture(
