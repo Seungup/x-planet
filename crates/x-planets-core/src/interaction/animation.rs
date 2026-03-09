@@ -11,7 +11,7 @@ use crate::engine::MapEngine;
 // ═══════════════════════════════════════════════════════════════════
 
 /// Duration (seconds) for newly loaded tiles to fade from 0→1 opacity.
-pub const FADE_DURATION: f64 = 0.3;
+pub const FADE_DURATION: f64 = 0.5;
 /// Double-click time window (seconds).
 pub const DOUBLE_CLICK_TIME: f64 = 0.3;
 /// Double-click max distance (pixels).
@@ -445,12 +445,12 @@ mod tests {
         assert!((elapsed.unwrap() - 0.15).abs() < 0.001);
 
         // After fade
-        let elapsed = anim.tile_fade_elapsed(&coord, 1.5);
+        let elapsed = anim.tile_fade_elapsed(&coord, 1.0 + FADE_DURATION + 0.1);
         assert!(elapsed.unwrap() > FADE_DURATION);
 
         // GC removes old entries
-        anim.gc_fades(1.5);
-        assert!(anim.tile_fade_elapsed(&coord, 1.5).is_none());
+        anim.gc_fades(1.0 + FADE_DURATION + 0.2);
+        assert!(anim.tile_fade_elapsed(&coord, 1.0 + FADE_DURATION + 0.2).is_none());
     }
 
     #[test]
@@ -533,11 +533,11 @@ mod tests {
         let c1 = TileCoord::new(5, 10, 10);
         let c2 = TileCoord::new(5, 11, 10);
         anim.register_tile_loaded(c1, 1.0);
-        anim.register_tile_loaded(c2, 1.5);
+        anim.register_tile_loaded(c2, 2.0);
 
-        // At t=1.5, c1 has been loaded for 0.5s (past FADE_DURATION=0.3)
-        anim.gc_fades(1.5);
-        assert!(anim.tile_fade_elapsed(&c1, 1.5).is_none(), "c1 should be GC'd");
-        assert!(anim.tile_fade_elapsed(&c2, 1.5).is_some(), "c2 should remain");
+        // At t=2.0, c1 has been loaded for 1.0s (past FADE_DURATION + 0.1s grace)
+        anim.gc_fades(2.0);
+        assert!(anim.tile_fade_elapsed(&c1, 2.0).is_none(), "c1 should be GC'd");
+        assert!(anim.tile_fade_elapsed(&c2, 2.0).is_some(), "c2 should remain");
     }
 }

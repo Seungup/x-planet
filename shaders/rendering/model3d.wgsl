@@ -100,7 +100,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     let lit_color = base_color * lighting;
 
-    // Apply opacity
+    // Apply opacity (premultiplied alpha output)
     let opacity = model.params.x;
-    return vec4<f32>(lit_color, opacity);
+    return vec4<f32>(lit_color * opacity, opacity);
 }

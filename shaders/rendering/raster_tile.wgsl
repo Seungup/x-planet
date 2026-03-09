@@ -74,7 +74,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let uv = mix(tile.uv_rect.xy, tile.uv_rect.zw, input.tex_coord);
     let color = textureSample(tile_texture, tile_sampler, uv);
 
-    // Apply tile opacity
+    // Apply tile opacity (premultiplied alpha output)
     let opacity = tile.tile_meta.y;
-    return vec4<f32>(color.rgb, color.a * opacity);
+    return vec4<f32>(color.rgb * opacity, color.a * opacity);
 }
