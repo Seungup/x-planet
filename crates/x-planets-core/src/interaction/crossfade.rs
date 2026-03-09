@@ -7,6 +7,13 @@ use x_planets_math::{TileCoord, VisibleTile};
 use super::FADE_DURATION;
 use crate::pipeline::RenderableTile;
 
+/// Smooth Hermite interpolation (smoothstep): 3t² − 2t³.
+/// Produces ease-in-out curve that avoids perceptual pop at start/end.
+#[inline]
+fn smoothstep(t: f32) -> f32 {
+    t * t * (3.0 - 2.0 * t)
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Tile visibility tracking (shared between native and web)
 // ═══════════════════════════════════════════════════════════════════
@@ -121,7 +128,8 @@ where
                 };
                 if has_parent {
                     available_for_base.remove(&coord);
-                    let fade_t = ((elapsed / FADE_DURATION) as f32).clamp(1.0 / 60.0, 1.0);
+                    let linear_t = ((elapsed / FADE_DURATION) as f32).clamp(0.0, 1.0);
+                    let fade_t = smoothstep(linear_t);
                     crossfade_tiles.push((coord, fade_t, vt.display_x));
                 }
             }
@@ -149,7 +157,8 @@ where
         }
         if let Some(elapsed) = tile_fade_elapsed_fn(&rt.coord) {
             if elapsed < FADE_DURATION {
-                let t = ((elapsed / FADE_DURATION) as f32).clamp(1.0 / 60.0, 1.0);
+                let linear_t = ((elapsed / FADE_DURATION) as f32).clamp(0.0, 1.0);
+                let t = smoothstep(linear_t);
                 overrides.insert(rt.coord, layer_opacity * t);
             }
         }

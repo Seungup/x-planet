@@ -115,7 +115,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let shade = clamp((1.0 - 0.4 * strength) + 0.4 * strength * ndotl / flat_illumination,
                        1.0 - 0.4 * strength, 1.0 + 0.1 * strength);
 
-    // Apply tile opacity
+    // Apply tile opacity (premultiplied alpha output)
     let opacity = tile.tile_meta.y;
-    return vec4<f32>(color.rgb * shade, color.a * opacity);
+    let shaded = color.rgb * shade;
+    return vec4<f32>(shaded * opacity, color.a * opacity);
 }
