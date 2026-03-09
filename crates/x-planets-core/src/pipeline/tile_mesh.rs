@@ -123,12 +123,14 @@ pub(crate) fn centered_tile_center(
 ///
 /// Returns the threshold in degrees.
 pub fn centered_angular_threshold_deg(_zoom: f64) -> f64 {
-    // Match the shader's clip_sphere angle (85°) exactly.
-    // Tiles between 85°–90° produce degenerate oblique Mercator geometry
-    // and their fragments are discarded by the shader anyway.  Including
-    // them on the CPU side only creates floating/disconnected fragments
-    // at the viewport edges.
-    85.0
+    // Slightly larger than the shader's clip_sphere angle (85°).
+    // The GPU shader discards fragments beyond 85° via clip_sphere,
+    // but the CPU tile filter must include tiles that *straddle* the
+    // 85° boundary — otherwise the last row of tiles is missing and
+    // a dark gap appears between the terrain edge and the sky.
+    // 87° gives a 2° buffer: mesh geometry is still well-formed here,
+    // and any fragments beyond 85° are cleanly discarded by the shader.
+    87.0
 }
 
 /// Returns `true` if a tile passes the angular-distance pre-filter
