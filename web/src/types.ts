@@ -38,8 +38,8 @@ export interface XPlanetsMap {
   stopAnimation(): void;
 
   // ── Coordinate Conversion ──
-  project(lat: number, lon: number): Float64Array | null;
-  unproject(x: number, y: number): Float64Array | null;
+  project(lat: number, lon: number): Float64Array | undefined;
+  unproject(x: number, y: number): Float64Array | undefined;
 
   // ── Projection ──
   setProjection(name: string): boolean;
