@@ -64,8 +64,10 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     // No need to reconstruct absolute position — just multiply directly.
     output.clip_position = tile.mvp * vec4<f32>(input.position, 1.0);
 
-    // Depth bias: finer (higher zoom) tiles get smaller depth -> render on top.
-    let depth_bias = (viewport.terrain.x - tile.tile_meta.x) * 0.0001;
+    // Depth bias: finer (higher zoom) tiles render on top of coarser ones.
+    // Higher zoom → more bias subtracted → lower z → closer to camera.
+    // Must match the raster shader formula so LOD transitions are consistent.
+    let depth_bias = tile.tile_meta.x * 0.0001;
     output.clip_position.z = output.clip_position.z - depth_bias * output.clip_position.w;
 
     output.tex_coord = input.tex_coord;
