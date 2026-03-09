@@ -31,7 +31,6 @@ async function main(): Promise<void> {
   await init();
 
   // Create the map with our TS-defined config.
-  // @ts-expect-error XPlanets is exposed globally by the WASM module
   const map: XPlanetsMap = await XPlanets.create(
     "x-planets-canvas",
     MAP_CONFIG,
