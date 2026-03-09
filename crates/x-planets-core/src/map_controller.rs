@@ -1056,7 +1056,7 @@ fn build_terrain_layer<'a>(
     imagery_lv: &'a dyn LayerStateView,
     texture_fn: &dyn Fn(&str, &TileCoord) -> Option<&'a wgpu::TextureView>,
     visible: &[VisibleTile],
-    fade_fn: &dyn Fn(&TileCoord) -> Option<f64>,
+    _fade_fn: &dyn Fn(&TileCoord) -> Option<f64>,
 ) -> (TerrainLayerData<'a>, Option<TerrainLayerData<'a>>) {
     let available = imagery_lv.available_raster_coords();
 
@@ -1065,17 +1065,19 @@ fn build_terrain_layer<'a>(
         .filter_map(|coord| texture_fn(imagery_lv.name(), coord).map(|tv| (*coord, tv)))
         .collect();
 
-    let (available_for_base, crossfade_tiles) =
-        compute_crossfade(visible, available, fade_fn);
-
-    let renderable = resolve_fallbacks(visible, &available_for_base);
+    // Terrain skips crossfade entirely.  Unlike flat raster tiles, terrain
+    // meshes have 3D displaced geometry that differs between LOD levels.
+    // Crossfade alpha-blends two mismatched 3D surfaces → depth-test
+    // failures, holes, and shimmer.  The raster base layer (always rendered
+    // underneath) already provides smooth visual transitions, so terrain
+    // tiles can snap in at full opacity without visual popping.
+    let renderable = resolve_fallbacks(visible, available);
 
     // Elevation data with parent fallback
     let mut elevation_data: HashMap<TileCoord, (&'a TerrainTileData, TileCoord)> = HashMap::new();
     let all_needed: HashSet<TileCoord> = renderable
         .iter()
         .map(|rt| rt.coord)
-        .chain(crossfade_tiles.iter().map(|&(c, _, _)| c))
         .collect();
 
     for &coord in &all_needed {
@@ -1093,34 +1095,13 @@ fn build_terrain_layer<'a>(
         name: layer_name,
         opacity: layer_opacity,
         tiles: renderable,
-        imagery_views: imagery_views.clone(),
-        elevation_data: elevation_data.clone(),
+        imagery_views,
+        elevation_data,
         tile_opacity_overrides: HashMap::new(),
     };
 
-    let overlay = if !crossfade_tiles.is_empty() {
-        let (overlay_tiles, overlay_opacity) =
-            build_crossfade_overlay(&crossfade_tiles, layer_opacity);
-        let overlay_elev: HashMap<TileCoord, (&'a TerrainTileData, TileCoord)> =
-            crossfade_tiles
-                .iter()
-                .filter_map(|&(coord, _, _)| {
-                    elevation_data.get(&coord).map(|&v| (coord, v))
-                })
-                .collect();
-        Some(TerrainLayerData {
-            name: "terrain-crossfade",
-            opacity: layer_opacity,
-            tiles: overlay_tiles,
-            imagery_views,
-            elevation_data: overlay_elev,
-            tile_opacity_overrides: overlay_opacity,
-        })
-    } else {
-        None
-    };
-
-    (base, overlay)
+    // No overlay — terrain transitions are instant.
+    (base, None)
 }
 
 // ═══════════════════════════════════════════════════════════════════
