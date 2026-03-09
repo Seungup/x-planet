@@ -51,12 +51,6 @@ pub struct TileRenderer {
     surface_height: u32,
     /// Cached polar cap vertex/index buffers (never change after creation).
     cached_polar_caps: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
-    /// Cached centered Mercator mesh center (lat, lon radians).
-    /// Mesh is rebuilt only when center moves beyond threshold.
-    cached_centered_center: (f64, f64),
-    /// Cached centered Mercator mesh data: (vertex_buf, index_buf, tile_idx_counts, tile_coords).
-    /// Reused when viewport center hasn't changed significantly and tile set is the same.
-    cached_centered_mesh: Option<(wgpu::Buffer, wgpu::Buffer, Vec<u32>, Vec<x_planets_math::TileCoord>)>,
 }
 
 impl TileRenderer {
@@ -302,8 +296,6 @@ impl TileRenderer {
             surface_width,
             surface_height,
             cached_polar_caps: None,
-            cached_centered_center: (f64::NAN, f64::NAN),
-            cached_centered_mesh: None,
         }
     }
 
@@ -722,50 +714,23 @@ impl TileRenderer {
                     })
                     .collect();
 
-                // Check if we can reuse the cached centered mesh.
-                // Rebuild only when center moves beyond threshold or tile set changes.
-                let tile_coords: Vec<x_planets_math::TileCoord> = renderable_tiles
-                    .iter()
-                    .map(|rt| rt.coord)
-                    .collect();
+                let renderable_refs: Vec<RenderableTile> =
+                    renderable_tiles.iter().map(|rt| (*rt).clone()).collect();
+                let (centered_verts, centered_idxs, tile_idx_counts) =
+                    build_centered_tile_mesh(&renderable_refs, center_lat_rad, center_lon_rad);
 
-                const CENTER_THRESHOLD: f64 = 0.05; // ~3°
-                let center_changed =
-                    (center_lat_rad - self.cached_centered_center.0).abs() > CENTER_THRESHOLD
-                    || (center_lon_rad - self.cached_centered_center.1).abs() > CENTER_THRESHOLD;
-                let tiles_changed = self.cached_centered_mesh.as_ref().map_or(true, |c| c.3 != tile_coords);
-
-                let (vertex_buffer, index_buffer, tile_idx_counts);
-                if !center_changed && !tiles_changed {
-                    let cached = self.cached_centered_mesh.as_ref().unwrap();
-                    vertex_buffer = &cached.0;
-                    index_buffer = &cached.1;
-                    tile_idx_counts = cached.2.clone();
-                } else {
-                    let renderable_refs: Vec<RenderableTile> =
-                        renderable_tiles.iter().map(|rt| (*rt).clone()).collect();
-                    let (centered_verts, centered_idxs, idx_counts) =
-                        build_centered_tile_mesh(&renderable_refs, center_lat_rad, center_lon_rad);
-
-                    if centered_verts.is_empty() {
-                        continue;
-                    }
-
-                    let vb = gpu.create_vertex_buffer(
-                        &format!("centered-vertices-{}", layer.name),
-                        &centered_verts,
-                    );
-                    let ib = gpu.create_index_buffer(
-                        &format!("centered-indices-{}", layer.name),
-                        &centered_idxs,
-                    );
-                    self.cached_centered_center = (center_lat_rad, center_lon_rad);
-                    self.cached_centered_mesh = Some((vb, ib, idx_counts.clone(), tile_coords));
-                    let cached = self.cached_centered_mesh.as_ref().unwrap();
-                    vertex_buffer = &cached.0;
-                    index_buffer = &cached.1;
-                    tile_idx_counts = idx_counts;
+                if centered_verts.is_empty() {
+                    continue;
                 }
+
+                let vertex_buffer = gpu.create_vertex_buffer(
+                    &format!("centered-vertices-{}", layer.name),
+                    &centered_verts,
+                );
+                let index_buffer = gpu.create_index_buffer(
+                    &format!("centered-indices-{}", layer.name),
+                    &centered_idxs,
+                );
 
                 let prepared: Vec<PreparedTile> = renderable_tiles
                     .iter()
