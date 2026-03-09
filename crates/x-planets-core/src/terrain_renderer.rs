@@ -95,6 +95,10 @@ pub struct TerrainRenderer {
     /// If projection changes, the entire cache is invalidated
     /// (mesh geometry is projection-dependent).
     cached_projection_mode: x_planets_math::ProjectionMode,
+    /// Cached viewport center (lat, lon in radians) for centered Mercator.
+    /// Mesh cache is only invalidated when center moves beyond a threshold.
+    cached_center_lat_rad: f64,
+    cached_center_lon_rad: f64,
 }
 
 /// Projection-specific parameters for terrain mesh building.
@@ -313,6 +317,8 @@ impl TerrainRenderer {
             mesh_cache: HashMap::new(),
             cached_exaggeration: exaggeration,
             cached_projection_mode: x_planets_math::ProjectionMode::Mercator,
+            cached_center_lat_rad: f64::NAN,
+            cached_center_lon_rad: f64::NAN,
         }
     }
 
@@ -544,13 +550,25 @@ impl TerrainRenderer {
             self.cached_projection_mode = mode;
         }
 
-        // For centered Mercator (non-Globe Mercator), invalidate mesh cache
-        // every frame because the oblique center changes with viewport pan.
+        // For centered Mercator (non-Globe), invalidate mesh cache only when
+        // the viewport center moves beyond a threshold.  The oblique Mercator
+        // projection bakes the center into vertex positions, but small pans
+        // produce negligible mesh error — the per-tile MVP uniform (updated
+        // every frame) handles the fine adjustment.
         let is_centered = mode != x_planets_math::ProjectionMode::Globe;
         if is_centered {
-            // Centered Mercator meshes depend on the viewport center,
-            // which changes as the user pans.  Must rebuild every frame.
-            self.mesh_cache.clear();
+            let clat = viewport.center.lat.to_radians();
+            let clon = viewport.center.lon.to_radians();
+            // Threshold: ~0.05 rad ≈ 3° — meshes are rebuilt only on
+            // significant pans, not every frame.
+            const CENTER_THRESHOLD: f64 = 0.05;
+            if (clat - self.cached_center_lat_rad).abs() > CENTER_THRESHOLD
+                || (clon - self.cached_center_lon_rad).abs() > CENTER_THRESHOLD
+            {
+                self.mesh_cache.clear();
+                self.cached_center_lat_rad = clat;
+                self.cached_center_lon_rad = clon;
+            }
         }
 
         let height_scale = compute_height_scale_for(self.exaggeration, viewport.body.circumference);

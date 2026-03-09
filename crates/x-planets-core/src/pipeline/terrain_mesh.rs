@@ -157,7 +157,10 @@ pub fn build_terrain_mesh(
 
     // ── Skirt geometry ──
     // Extend vertical "walls" below each edge to hide gaps between tiles.
-    let skirt_depth = tile_w * 0.05; // 5% of tile width
+    // 10% of tile width, plus half the elevation range to cover LOD mismatches.
+    let z_min = positions.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
+    let z_max = positions.iter().map(|p| p[2]).fold(f32::NEG_INFINITY, f32::max);
+    let skirt_depth = (tile_w * 0.10).max((z_max - z_min) * 0.5).max(1e-8);
     let down_normal = [0.0f32, 0.0, -1.0];
 
     // Collect edge vertex indices: bottom, top, right, left edges
@@ -389,7 +392,10 @@ pub fn build_terrain_mesh_from_qm_with(
     // which gives a consistent 2-3 % depth relative to tile_w in the
     // final coordinate space regardless of exaggeration.
     let tile_extent_m = circumference / n;
-    let skirt_depth = (tile_extent_m * 0.02) as f32;
+    // 5% of tile width in metres, or half the height range — whichever is larger.
+    let z_min = vertices.iter().map(|v| v.position[2]).fold(f32::INFINITY, f32::min);
+    let z_max = vertices.iter().map(|v| v.position[2]).fold(f32::NEG_INFINITY, f32::max);
+    let skirt_depth = ((tile_extent_m * 0.05) as f32).max((z_max - z_min) * 0.5);
     let down_normal = [0.0f32, 0.0, -1.0];
 
     for edge_indices in [
@@ -625,13 +631,19 @@ pub fn build_terrain_mesh_centered(
         }
     }
 
-    // Skirt geometry — use a small fraction of the centered-space tile extent.
-    // The tile extent varies with oblique Mercator, so use the average position
-    // span as a reference.
+    // Skirt geometry — use a fraction of the centered-space tile extent,
+    // but also guarantee a minimum based on the elevation range to cover
+    // LOD boundaries where adjacent tiles have different resolution.
     let skirt_depth = {
         let extent_x = (positions[verts_per_side as usize - 1][0] - positions[0][0]).abs();
         let extent_y = (positions[(verts_per_side * (verts_per_side - 1)) as usize][1] - positions[0][1]).abs();
-        (extent_x.max(extent_y) * 0.05).max(1e-8)
+        let spatial = extent_x.max(extent_y) * 0.10; // 10% of tile extent
+        // Also consider elevation range: at LOD boundaries, height mismatches
+        // can exceed spatial skirt depth for mountainous tiles.
+        let z_min = positions.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
+        let z_max = positions.iter().map(|p| p[2]).fold(f32::NEG_INFINITY, f32::max);
+        let elev_range = (z_max - z_min) * 0.5;
+        spatial.max(elev_range).max(1e-6)
     };
     let down_normal = [0.0f32, 0.0, -1.0];
 
@@ -792,8 +804,10 @@ pub fn build_terrain_mesh_globe(
 
     let mut indices = surface_indices;
 
-    // Skirt geometry: push vertices toward the sphere center (like tile_globe_mesh).
-    let skirt_depth: f64 = 0.002; // fraction of unit sphere radius
+    // Skirt geometry: push vertices toward the sphere center.
+    // Positions are RTE (tile_center_3d subtracted), so we must reconstruct
+    // absolute positions, shrink toward origin, then re-subtract the center.
+    let skirt_depth: f64 = 0.005; // fraction of radius to push inward
 
     let edge_strips: [Vec<u32>; 4] = [
         (0..verts_per_side).collect(),
@@ -802,6 +816,19 @@ pub fn build_terrain_mesh_globe(
         (0..verts_per_side).map(|j| j * verts_per_side + grid).collect(),
     ];
 
+    // Helper: given an RTE position, reconstruct absolute, shrink toward
+    // the sphere center by `skirt_depth` fraction, then convert back to RTE.
+    let skirt_pos = |p: [f32; 3]| -> [f32; 3] {
+        let abs_x = p[0] as f64 + tile_center_3d.x;
+        let abs_y = p[1] as f64 + tile_center_3d.y;
+        let abs_z = p[2] as f64 + tile_center_3d.z;
+        [
+            (abs_x * (1.0 - skirt_depth) - tile_center_3d.x) as f32,
+            (abs_y * (1.0 - skirt_depth) - tile_center_3d.y) as f32,
+            (abs_z * (1.0 - skirt_depth) - tile_center_3d.z) as f32,
+        ]
+    };
+
     for strip in &edge_strips {
         for k in 0..strip.len() - 1 {
             let top_a = strip[k];
@@ -809,26 +836,16 @@ pub fn build_terrain_mesh_globe(
 
             let skirt_a = vertices.len() as u32;
             let va = &vertices[top_a as usize];
-            let pa = va.position;
             vertices.push(TerrainVertex {
-                position: [
-                    pa[0] - (pa[0] as f64 * skirt_depth) as f32,
-                    pa[1] - (pa[1] as f64 * skirt_depth) as f32,
-                    pa[2] - (pa[2] as f64 * skirt_depth) as f32,
-                ],
+                position: skirt_pos(va.position),
                 normal: va.normal,
                 tex_coord: va.tex_coord,
             });
 
             let skirt_b = vertices.len() as u32;
             let vb = &vertices[top_b as usize];
-            let pb = vb.position;
             vertices.push(TerrainVertex {
-                position: [
-                    pb[0] - (pb[0] as f64 * skirt_depth) as f32,
-                    pb[1] - (pb[1] as f64 * skirt_depth) as f32,
-                    pb[2] - (pb[2] as f64 * skirt_depth) as f32,
-                ],
+                position: skirt_pos(vb.position),
                 normal: vb.normal,
                 tex_coord: vb.tex_coord,
             });

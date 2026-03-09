@@ -49,6 +49,14 @@ pub struct TileRenderer {
     depth_format: wgpu::TextureFormat,
     surface_width: u32,
     surface_height: u32,
+    /// Cached polar cap vertex/index buffers (never change after creation).
+    cached_polar_caps: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    /// Cached centered Mercator mesh center (lat, lon radians).
+    /// Mesh is rebuilt only when center moves beyond threshold.
+    cached_centered_center: (f64, f64),
+    /// Cached centered Mercator mesh data: (vertex_buf, index_buf, tile_idx_counts, tile_coords).
+    /// Reused when viewport center hasn't changed significantly and tile set is the same.
+    cached_centered_mesh: Option<(wgpu::Buffer, wgpu::Buffer, Vec<u32>, Vec<x_planets_math::TileCoord>)>,
 }
 
 impl TileRenderer {
@@ -293,6 +301,9 @@ impl TileRenderer {
             depth_format,
             surface_width,
             surface_height,
+            cached_polar_caps: None,
+            cached_centered_center: (f64::NAN, f64::NAN),
+            cached_centered_mesh: None,
         }
     }
 
@@ -420,7 +431,7 @@ impl TileRenderer {
     /// `tiles` — renderable tiles (with fallback resolution).
     /// `texture_views` — map from TileCoord → GPU TextureView.
     pub fn render_frame(
-        &self,
+        &mut self,
         gpu: &GpuContext,
         target: &wgpu::TextureView,
         viewport: &Viewport,
@@ -444,7 +455,7 @@ impl TileRenderer {
     /// - First layer: `Clear` color + depth
     /// - Subsequent layers: `Load` color + `Clear` depth (avoids cross-layer z-fighting)
     pub fn render_frame_layered(
-        &self,
+        &mut self,
         gpu: &GpuContext,
         target: &wgpu::TextureView,
         viewport: &Viewport,
@@ -461,7 +472,7 @@ impl TileRenderer {
 
     /// Like [`render_frame_layered`] but uses the given projection for tile positioning.
     pub fn render_frame_layered_projected(
-        &self,
+        &mut self,
         gpu: &GpuContext,
         target: &wgpu::TextureView,
         viewport: &Viewport,
@@ -602,11 +613,15 @@ impl TileRenderer {
                     })
                     .collect();
 
-                // ── Polar cap buffers ──
-                let (cap_verts, cap_idxs) = build_polar_caps();
-                let cap_idx_count = cap_idxs.len() as u32;
-                let cap_vb = gpu.create_vertex_buffer("polar-cap-vertices", &cap_verts);
-                let cap_ib = gpu.create_index_buffer("polar-cap-indices", &cap_idxs);
+                // ── Polar cap buffers (cached — geometry never changes) ──
+                if self.cached_polar_caps.is_none() {
+                    let (cap_verts, cap_idxs) = build_polar_caps();
+                    let count = cap_idxs.len() as u32;
+                    let vb = gpu.create_vertex_buffer("polar-cap-vertices", &cap_verts);
+                    let ib = gpu.create_index_buffer("polar-cap-indices", &cap_idxs);
+                    self.cached_polar_caps = Some((vb, ib, count));
+                }
+                let (cap_vb, cap_ib, cap_idx_count) = self.cached_polar_caps.as_ref().unwrap();
                 // Cap uses VP directly (no per-tile model translation)
                 let cap_mvp = vp_f64.as_mat4();
                 let cap_uniforms = x_planets_math::TileUniforms {
@@ -676,7 +691,7 @@ impl TileRenderer {
                     pass.set_vertex_buffer(0, cap_vb.slice(..));
                     pass.set_index_buffer(cap_ib.slice(..), wgpu::IndexFormat::Uint32);
                     pass.set_bind_group(1, &cap_bg, &[]);
-                    pass.draw_indexed(0..cap_idx_count, 0, 0..1);
+                    pass.draw_indexed(0..*cap_idx_count, 0, 0..1);
                 }
             } else {
                 // ── Centered Mercator path: tessellated oblique Mercator mesh ──
@@ -707,23 +722,50 @@ impl TileRenderer {
                     })
                     .collect();
 
-                let renderable_refs: Vec<RenderableTile> =
-                    renderable_tiles.iter().map(|rt| (*rt).clone()).collect();
-                let (centered_verts, centered_idxs, tile_idx_counts) =
-                    build_centered_tile_mesh(&renderable_refs, center_lat_rad, center_lon_rad);
+                // Check if we can reuse the cached centered mesh.
+                // Rebuild only when center moves beyond threshold or tile set changes.
+                let tile_coords: Vec<x_planets_math::TileCoord> = renderable_tiles
+                    .iter()
+                    .map(|rt| rt.coord)
+                    .collect();
 
-                if centered_verts.is_empty() {
-                    continue;
+                const CENTER_THRESHOLD: f64 = 0.05; // ~3°
+                let center_changed =
+                    (center_lat_rad - self.cached_centered_center.0).abs() > CENTER_THRESHOLD
+                    || (center_lon_rad - self.cached_centered_center.1).abs() > CENTER_THRESHOLD;
+                let tiles_changed = self.cached_centered_mesh.as_ref().map_or(true, |c| c.3 != tile_coords);
+
+                let (vertex_buffer, index_buffer, tile_idx_counts);
+                if !center_changed && !tiles_changed {
+                    let cached = self.cached_centered_mesh.as_ref().unwrap();
+                    vertex_buffer = &cached.0;
+                    index_buffer = &cached.1;
+                    tile_idx_counts = cached.2.clone();
+                } else {
+                    let renderable_refs: Vec<RenderableTile> =
+                        renderable_tiles.iter().map(|rt| (*rt).clone()).collect();
+                    let (centered_verts, centered_idxs, idx_counts) =
+                        build_centered_tile_mesh(&renderable_refs, center_lat_rad, center_lon_rad);
+
+                    if centered_verts.is_empty() {
+                        continue;
+                    }
+
+                    let vb = gpu.create_vertex_buffer(
+                        &format!("centered-vertices-{}", layer.name),
+                        &centered_verts,
+                    );
+                    let ib = gpu.create_index_buffer(
+                        &format!("centered-indices-{}", layer.name),
+                        &centered_idxs,
+                    );
+                    self.cached_centered_center = (center_lat_rad, center_lon_rad);
+                    self.cached_centered_mesh = Some((vb, ib, idx_counts.clone(), tile_coords));
+                    let cached = self.cached_centered_mesh.as_ref().unwrap();
+                    vertex_buffer = &cached.0;
+                    index_buffer = &cached.1;
+                    tile_idx_counts = idx_counts;
                 }
-
-                let vertex_buffer = gpu.create_vertex_buffer(
-                    &format!("centered-vertices-{}", layer.name),
-                    &centered_verts,
-                );
-                let index_buffer = gpu.create_index_buffer(
-                    &format!("centered-indices-{}", layer.name),
-                    &centered_idxs,
-                );
 
                 let prepared: Vec<PreparedTile> = renderable_tiles
                     .iter()

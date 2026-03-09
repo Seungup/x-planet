@@ -418,7 +418,7 @@ impl NativeApp {
                 now_secs,
             );
 
-            let renderer = self.renderer.as_ref().unwrap();
+            let renderer = self.renderer.as_mut().unwrap();
             let gpu = self.gpu.as_ref().unwrap();
 
             let proj_mode = ctrl.rendering_mode();
