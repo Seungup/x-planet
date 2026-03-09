@@ -26,8 +26,8 @@ const MAP_CONFIG: XPlanetsConfig = {
 };
 
 async function main(): Promise<void> {
-  // Load the WASM module (just the runtime, no map creation yet).
-  const { default: init } = await import("../pkg/x_planets_web.js");
+  // Load the WASM module and import the XPlanets factory.
+  const { default: init, XPlanets } = await import("../pkg/x_planets_web.js");
   await init();
 
   // Create the map with our TS-defined config.
