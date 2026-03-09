@@ -15,6 +15,8 @@ struct ViewportUniforms {
     resolution: vec4<f32>,   // (width, height, 1/width, 1/height)
     camera: vec4<f32>,       // (center_x, center_y, zoom, pitch)
     clip_sphere: vec4<f32>,  // (center_x, center_y, center_z, cos_clip_angle)
+    terrain: vec4<f32>,      // (max_zoom, hillshade_strength, _pad, _pad)
+    sun_dir: vec4<f32>,      // (sun_x, sun_y, sun_z, _pad)
 };
 
 struct TileUniforms {
@@ -63,7 +65,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.clip_position = tile.mvp * vec4<f32>(input.position, 1.0);
 
     // Depth bias: finer (higher zoom) tiles get smaller depth -> render on top.
-    let depth_bias = (22.0 - tile.tile_meta.x) * 0.0001;
+    let depth_bias = (viewport.terrain.x - tile.tile_meta.x) * 0.0001;
     output.clip_position.z = output.clip_position.z - depth_bias * output.clip_position.w;
 
     output.tex_coord = input.tex_coord;
@@ -99,18 +101,19 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let color = textureSample(tile_texture, tile_sampler, uv);
 
     // -- Hillshade lighting --
-    // Sun direction: northwest, ~45° elevation (classic cartographic hillshade)
-    let sun_dir = normalize(vec3<f32>(-0.5, -0.5, 0.7));
+    // Sun direction from uniform (configurable from CPU side)
+    let sun = normalize(viewport.sun_dir.xyz);
     let n = normalize(input.normal);
 
     // Lambertian diffuse
-    let ndotl = max(dot(n, sun_dir), 0.0);
+    let ndotl = max(dot(n, sun), 0.0);
 
-    // "Always daytime" hillshade: flat terrain = 1.0 (no darkening),
-    // slopes get subtle relief shading with a high floor (0.6) so the
-    // map never looks dark.  Sun-facing slopes brighten up to 1.1.
-    let flat_illumination = sun_dir.z;  // dot(vec3(0,0,1), sun_dir)
-    let shade = clamp(0.6 + 0.4 * ndotl / flat_illumination, 0.6, 1.1);
+    // "Always daytime" hillshade controlled by hillshade_strength uniform.
+    // strength=1.0 → classic relief shading; strength=0.0 → flat (no shading).
+    let strength = viewport.terrain.y;
+    let flat_illumination = sun.z;  // dot(vec3(0,0,1), sun)
+    let shade = clamp((1.0 - 0.4 * strength) + 0.4 * strength * ndotl / flat_illumination,
+                       1.0 - 0.4 * strength, 1.0 + 0.1 * strength);
 
     // Apply tile opacity
     let opacity = tile.tile_meta.y;

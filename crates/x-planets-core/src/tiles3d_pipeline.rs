@@ -261,6 +261,13 @@ pub fn build_tiles3d_uniforms(viewport: &Viewport) -> (x_planets_math::ViewportU
         ],
         camera: [0.0, 0.0, viewport.zoom as f32, 0.0],
         clip_sphere: [0.0, 0.0, 1.0, -1.0], // no clipping (cos(-1) = all pass)
+        terrain: [viewport.max_zoom as f32, viewport.hillshade_strength as f32, 0.0, 0.0],
+        sun_dir: [
+            viewport.sun_direction[0] as f32,
+            viewport.sun_direction[1] as f32,
+            viewport.sun_direction[2] as f32,
+            0.0,
+        ],
     };
 
     (uniforms, camera_ecef)

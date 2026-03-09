@@ -8,7 +8,9 @@
 
 pub mod engine;
 pub mod interaction;
+pub mod layer_state;
 pub mod map_controller;
+pub mod tile_load_planner;
 #[cfg(feature = "gpu")]
 pub mod model3d_renderer;
 pub mod pipeline;

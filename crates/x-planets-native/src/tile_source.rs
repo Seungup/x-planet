@@ -7,6 +7,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use x_planets_core::engine::LayerKind;
 use x_planets_core::map_controller::LayerStateView;
+use x_planets_core::tile_load_planner::LayerLoadState;
 use x_planets_render::TerrainTileData;
 use x_planets_gpu::GpuTexture;
 use x_planets_math::TileCoord;
@@ -90,6 +91,48 @@ impl LayerStateView for NativeLayerState {
 
     fn terrain_tile_data(&self, coord: &TileCoord) -> Option<&TerrainTileData> {
         self.terrain_data.peek(coord)
+    }
+}
+
+impl LayerLoadState for NativeLayerState {
+    fn kind(&self) -> &LayerKind {
+        &self.kind
+    }
+    fn min_zoom(&self) -> u8 {
+        self.min_zoom
+    }
+    fn max_zoom(&self) -> u8 {
+        self.max_zoom
+    }
+    fn has_texture(&self, coord: &TileCoord) -> bool {
+        self.tile_textures.contains(coord)
+    }
+    fn is_pending(&self, coord: &TileCoord) -> bool {
+        self.pending_coords.contains(coord)
+    }
+    fn is_failed_cooldown(&self, coord: &TileCoord) -> bool {
+        self.failed_cooldowns.contains_key(coord)
+    }
+    fn has_terrain_data(&self, coord: &TileCoord) -> bool {
+        self.terrain_data.contains(coord)
+    }
+    fn is_elevation_pending(&self, coord: &TileCoord) -> bool {
+        self.pending_elevation_coords.contains(coord)
+    }
+    fn max_concurrent(&self) -> usize {
+        self.tile_loader.max_concurrent()
+    }
+    fn pending_count(&self) -> usize {
+        self.pending_coords.len()
+    }
+    fn max_elevation_concurrent(&self) -> usize {
+        self.max_elevation_concurrent
+    }
+    fn elevation_pending_count(&self) -> usize {
+        self.pending_elevation_coords.len()
+    }
+    fn has_elevation_source(&self) -> bool {
+        self.elevation_source.is_some()
     }
 }
 

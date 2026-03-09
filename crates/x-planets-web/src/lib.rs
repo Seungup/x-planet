@@ -204,15 +204,22 @@ mod web_impl {
 
         /// Toggle terrain on/off. Returns the new state (true = terrain ON).
         ///
-        /// Optional parameters:
-        /// - `url`: Tile URL template (default: AWS Terrarium)
-        /// - `encoding`: "terrarium" | "mapbox" | "quantized-mesh" (default: "terrarium")
+        /// Uses the terrain URL and encoding from the config (set via `MAP_CONFIG.terrain`
+        /// or `setTerrainSource()`).
         #[wasm_bindgen(js_name = "toggleTerrain")]
-        pub fn toggle_terrain(&self, url: Option<String>, encoding: Option<String>) -> bool {
-            self.app.borrow_mut().toggle_terrain_with(
-                url.as_deref(),
-                encoding.as_deref(),
-            )
+        pub fn toggle_terrain(&self) -> bool {
+            self.app.borrow_mut().toggle_terrain()
+        }
+
+        /// Set terrain elevation source URL and encoding at runtime.
+        ///
+        /// - `encoding`: "terrarium" | "mapbox" | "quantized-mesh" (default: "terrarium")
+        #[wasm_bindgen(js_name = "setTerrainSource")]
+        pub fn set_terrain_source(&self, url: String, encoding: Option<String>) {
+            self.app.borrow_mut().set_terrain_source(
+                &url,
+                encoding.as_deref().unwrap_or("terrarium"),
+            );
         }
 
         /// Whether terrain is currently enabled.
@@ -637,6 +644,42 @@ mod web_impl {
         if let Ok(v) = js_sys::Reflect::get(val, &"body".into()) {
             if let Some(name) = v.as_string() {
                 config.body = x_planets_math::ecef::CelestialBody::from_name(&name);
+            }
+        }
+
+        // terrain: { url, encoding?, sunDirection?, hillshadeStrength? }
+        if let Ok(terrain) = js_sys::Reflect::get(val, &"terrain".into()) {
+            if terrain.is_object() && !terrain.is_null() && !terrain.is_undefined() {
+                if let Ok(url) = js_sys::Reflect::get(&terrain, &"url".into()) {
+                    if let Some(url_str) = url.as_string() {
+                        config.terrain_url = url_str;
+                    }
+                }
+                if let Ok(enc) = js_sys::Reflect::get(&terrain, &"encoding".into()) {
+                    if let Some(enc_str) = enc.as_string() {
+                        config.terrain_encoding = match enc_str.as_str() {
+                            "mapbox" | "mapbox-rgb" => x_planets_tiles::TerrainEncoding::MapboxRgb,
+                            "quantized-mesh" | "qm" => x_planets_tiles::TerrainEncoding::QuantizedMesh,
+                            _ => x_planets_tiles::TerrainEncoding::Terrarium,
+                        };
+                    }
+                }
+                if let Ok(sun) = js_sys::Reflect::get(&terrain, &"sunDirection".into()) {
+                    if let Some(arr) = sun.dyn_ref::<js_sys::Array>() {
+                        if arr.length() >= 3 {
+                            if let (Some(x), Some(y), Some(z)) =
+                                (arr.get(0).as_f64(), arr.get(1).as_f64(), arr.get(2).as_f64())
+                            {
+                                config.sun_direction = [x, y, z];
+                            }
+                        }
+                    }
+                }
+                if let Ok(hs) = js_sys::Reflect::get(&terrain, &"hillshadeStrength".into()) {
+                    if let Some(v) = hs.as_f64() {
+                        config.hillshade_strength = v;
+                    }
+                }
             }
         }
 

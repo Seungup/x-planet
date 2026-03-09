@@ -67,6 +67,16 @@ pub struct Viewport {
     pub tile_budget: usize,
     /// Celestial body parameters (affects globe camera altitude, terrain scale, etc.).
     pub body: CelestialBody,
+    /// Frustum safety margin (fraction of extent). Larger values include more
+    /// off-screen tiles which helps when terrain displacement shifts geometry
+    /// into the viewport. Default 0.05 (5%). Terrain mode uses 0.15 (15%).
+    pub frustum_margin: f64,
+    /// Maximum zoom level (for depth-bias calculation in shaders). Default: 22.0.
+    pub max_zoom: f64,
+    /// Sun direction for hillshade lighting (normalized xyz). Default: [-0.5, -0.5, 0.7].
+    pub sun_direction: [f64; 3],
+    /// Hillshade strength (0.0 = flat, 1.0 = full relief). Default: 1.0.
+    pub hillshade_strength: f64,
 }
 
 impl Viewport {
@@ -80,6 +90,10 @@ impl Viewport {
             bearing: 0.0,
             tile_budget: 150,
             body: EARTH,
+            frustum_margin: 0.05,
+            max_zoom: 22.0,
+            sun_direction: [-0.5, -0.5, 0.7],
+            hillshade_strength: 1.0,
         }
     }
 

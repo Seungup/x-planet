@@ -11,6 +11,8 @@ struct ViewportUniforms {
     resolution: vec4<f32>,   // (width, height, 1/width, 1/height)
     camera: vec4<f32>,       // (center_x, center_y, zoom, pitch)
     clip_sphere: vec4<f32>,  // (center_x, center_y, center_z, cos_clip_angle)
+    terrain: vec4<f32>,      // (max_zoom, hillshade_strength, _pad, _pad)
+    sun_dir: vec4<f32>,      // (sun_x, sun_y, sun_z, _pad)
 };
 
 struct ModelUniforms {

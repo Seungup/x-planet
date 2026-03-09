@@ -122,6 +122,16 @@ pub struct MapConfig {
     pub tile_budget: usize,
     /// Celestial body parameters (default: Earth/WGS84).
     pub body: CelestialBody,
+    /// Default terrain elevation URL template.
+    /// Set from the web/native config; empty string means no terrain source configured.
+    pub terrain_url: String,
+    /// Default terrain encoding (used when toggling terrain on).
+    pub terrain_encoding: TerrainEncoding,
+    /// Sun direction for hillshade lighting (normalized).
+    /// Default: `[-0.5, -0.5, 0.7]` (northwest, ~45° elevation).
+    pub sun_direction: [f64; 3],
+    /// Hillshade strength: 0.0 = flat (no shading), 1.0 = full relief.
+    pub hillshade_strength: f64,
 }
 
 impl Default for MapConfig {
@@ -140,6 +150,10 @@ impl Default for MapConfig {
             max_pitch: 60.0,
             tile_budget: 150,
             body: EARTH,
+            terrain_url: String::new(),
+            terrain_encoding: TerrainEncoding::default(),
+            sun_direction: [-0.5, -0.5, 0.7],
+            hillshade_strength: 1.0,
         }
     }
 }
@@ -173,6 +187,9 @@ impl MapEngine {
         viewport.zoom = config.zoom;
         viewport.tile_budget = config.tile_budget;
         viewport.body = config.body;
+        viewport.max_zoom = config.max_zoom;
+        viewport.sun_direction = config.sun_direction;
+        viewport.hillshade_strength = config.hillshade_strength;
 
         let layers = if config.layers.is_empty() {
             vec![TileLayer {

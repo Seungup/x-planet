@@ -19,6 +19,10 @@ const MAP_CONFIG: XPlanetsConfig = {
       kind: "raster",
     },
   ],
+  terrain: {
+    url: "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
+    encoding: "terrarium",
+  },
 };
 
 async function main(): Promise<void> {

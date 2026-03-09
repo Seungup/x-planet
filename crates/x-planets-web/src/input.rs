@@ -330,7 +330,7 @@ fn register_keyboard_events(app: Rc<RefCell<WebApp>>) {
                 update_projection_button(&name);
             }
             "KeyT" => {
-                let enabled = app.toggle_terrain_with(None, None);
+                let enabled = app.toggle_terrain();
                 update_altitude_button(enabled);
             }
             "Home" => {

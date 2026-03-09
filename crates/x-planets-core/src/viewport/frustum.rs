@@ -120,9 +120,10 @@ impl super::Viewport {
             max_y = max_y.max(gy);
         }
 
-        // 5 % safety margin.  X is NOT clamped; Y is clamped to [0, 1].
-        let mx = (max_x - min_x) * 0.05;
-        let my = (max_y - min_y) * 0.05;
+        // Safety margin.  X is NOT clamped; Y is clamped to [0, 1].
+        let margin = self.frustum_margin;
+        let mx = (max_x - min_x) * margin;
+        let my = (max_y - min_y) * margin;
         min_x -= mx;
         max_x += mx;
         min_y = (min_y - my).clamp(0.0, 1.0);
