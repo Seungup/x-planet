@@ -157,10 +157,7 @@ pub fn build_terrain_mesh(
 
     // ── Skirt geometry ──
     // Extend vertical "walls" below each edge to hide gaps between tiles.
-    // 10% of tile width, plus half the elevation range to cover LOD mismatches.
-    let z_min = positions.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
-    let z_max = positions.iter().map(|p| p[2]).fold(f32::NEG_INFINITY, f32::max);
-    let skirt_depth = (tile_w * 0.10).max((z_max - z_min) * 0.5).max(1e-8);
+    let skirt_depth = tile_w * 0.05; // 5% of tile width
     let down_normal = [0.0f32, 0.0, -1.0];
 
     // Collect edge vertex indices: bottom, top, right, left edges
@@ -392,10 +389,7 @@ pub fn build_terrain_mesh_from_qm_with(
     // which gives a consistent 2-3 % depth relative to tile_w in the
     // final coordinate space regardless of exaggeration.
     let tile_extent_m = circumference / n;
-    // 5% of tile width in metres, or half the height range — whichever is larger.
-    let z_min = vertices.iter().map(|v| v.position[2]).fold(f32::INFINITY, f32::min);
-    let z_max = vertices.iter().map(|v| v.position[2]).fold(f32::NEG_INFINITY, f32::max);
-    let skirt_depth = ((tile_extent_m * 0.05) as f32).max((z_max - z_min) * 0.5);
+    let skirt_depth = (tile_extent_m * 0.02) as f32;
     let down_normal = [0.0f32, 0.0, -1.0];
 
     for edge_indices in [
@@ -631,19 +625,11 @@ pub fn build_terrain_mesh_centered(
         }
     }
 
-    // Skirt geometry — use a fraction of the centered-space tile extent,
-    // but also guarantee a minimum based on the elevation range to cover
-    // LOD boundaries where adjacent tiles have different resolution.
+    // Skirt geometry — use 5% of the centered-space tile extent.
     let skirt_depth = {
         let extent_x = (positions[verts_per_side as usize - 1][0] - positions[0][0]).abs();
         let extent_y = (positions[(verts_per_side * (verts_per_side - 1)) as usize][1] - positions[0][1]).abs();
-        let spatial = extent_x.max(extent_y) * 0.10; // 10% of tile extent
-        // Also consider elevation range: at LOD boundaries, height mismatches
-        // can exceed spatial skirt depth for mountainous tiles.
-        let z_min = positions.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
-        let z_max = positions.iter().map(|p| p[2]).fold(f32::NEG_INFINITY, f32::max);
-        let elev_range = (z_max - z_min) * 0.5;
-        spatial.max(elev_range).max(1e-6)
+        (extent_x.max(extent_y) * 0.05).max(1e-8)
     };
     let down_normal = [0.0f32, 0.0, -1.0];
 
