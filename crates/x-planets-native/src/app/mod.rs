@@ -144,15 +144,21 @@ impl NativeApp {
     /// No layers are added or removed.  Elevation data is loaded on the
     /// raster imagery layer as a secondary data stream.
     pub(super) fn toggle_terrain(&mut self) -> bool {
-        let url = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
         let ctrl = self.controller.as_mut().unwrap();
-        let enabled = ctrl.toggle_terrain(url, x_planets_tiles::TerrainEncoding::Terrarium);
+        // Ensure terrain source is configured (fallback to Terrarium if not set from config)
+        if ctrl.terrain_url().is_none() && !ctrl.terrain_enabled() {
+            ctrl.set_terrain_source(
+                "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
+                x_planets_tiles::TerrainEncoding::Terrarium,
+            );
+        }
+        let enabled = ctrl.toggle_terrain();
 
         if enabled {
             // Set elevation source on the imagery layer
             let imagery_name = ctrl.terrain_imagery_name()
                 .unwrap_or("base").to_string();
-            let terrain_url = ctrl.terrain_url().unwrap_or(url).to_string();
+            let terrain_url = ctrl.terrain_url().unwrap_or("").to_string();
             if let Some(ls) = self.layer_states.iter_mut().find(|ls| ls.name == imagery_name) {
                 ls.elevation_source = Some(std::sync::Arc::new(
                     crate::tile_source::NativeTileSource::new(terrain_url),

@@ -215,6 +215,8 @@ impl TileRenderer {
             resolution: [0.0; 4],
             camera: [0.0; 4],
             clip_sphere: [0.0; 4],
+            terrain: [0.0; 4],
+            sun_dir: [0.0; 4],
         };
         let viewport_buffer =
             gpu.create_uniform_buffer("viewport-uniforms", &viewport_uniforms);

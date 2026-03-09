@@ -151,6 +151,11 @@ pub struct MapController {
     /// Terrain rendering state (rendering property, not a layer).
     pub terrain: Option<TerrainState>,
 
+    /// Terrain elevation URL template (set from config, changeable at runtime).
+    terrain_source_url: String,
+    /// Terrain encoding (set from config, changeable at runtime).
+    terrain_source_encoding: TerrainEncoding,
+
     // ── Event tracking ──
     pending_events: Vec<MapEvent>,
     /// Previous frame viewport state for change detection.
@@ -170,6 +175,8 @@ impl MapController {
         let initial_zoom = config.zoom;
         let center = (config.center.lat, config.center.lon);
         let has_terrain = config.layers.iter().any(|l| matches!(l.kind, LayerKind::Terrain { .. }));
+        let terrain_url = config.terrain_url.clone();
+        let terrain_encoding = config.terrain_encoding;
         let mut engine = MapEngine::new(config, width, height);
         if has_terrain {
             engine.viewport.frustum_margin = 0.15;
@@ -180,6 +187,8 @@ impl MapController {
             prev_visible_available: HashSet::new(),
             departing_tiles: HashMap::new(),
             terrain: None,
+            terrain_source_url: terrain_url,
+            terrain_source_encoding: terrain_encoding,
             pending_events: Vec::new(),
             prev_center: center,
             prev_zoom: initial_zoom,
@@ -540,10 +549,13 @@ impl MapController {
 
     /// Toggle terrain on/off.  Returns the new state (true = terrain ON).
     ///
+    /// Uses the terrain URL and encoding from the `MapConfig` stored in the
+    /// engine.  Call [`set_terrain_source`] first if you need to change them.
+    ///
     /// Terrain is a rendering property, not a layer.  No layers are added or
     /// removed from the engine.  Platform code should start/stop loading
     /// elevation data on the raster layer when this returns true/false.
-    pub fn toggle_terrain(&mut self, url: &str, encoding: TerrainEncoding) -> bool {
+    pub fn toggle_terrain(&mut self) -> bool {
         if self.terrain.is_some() {
             // Turn OFF
             self.terrain = None;
@@ -552,6 +564,13 @@ impl MapController {
             log::info!("Terrain: OFF");
             false
         } else {
+            let url = self.terrain_source_url.clone();
+            let encoding = self.terrain_source_encoding;
+            if url.is_empty() {
+                log::warn!("Terrain toggle ignored: no terrain URL configured");
+                return false;
+            }
+
             // Turn ON — find the first raster layer to use as imagery
             let imagery_name = self
                 .engine
@@ -562,7 +581,7 @@ impl MapController {
                 .unwrap_or_else(|| "base".to_string());
 
             self.terrain = Some(TerrainState {
-                url: url.to_string(),
+                url,
                 encoding,
                 imagery_layer_name: imagery_name,
             });
@@ -575,6 +594,15 @@ impl MapController {
             log::info!("Terrain: ON");
             true
         }
+    }
+
+    /// Set the terrain elevation source URL and encoding.
+    ///
+    /// This configures which elevation tiles to fetch when terrain is toggled on.
+    /// If terrain is already enabled, the change takes effect on the next toggle cycle.
+    pub fn set_terrain_source(&mut self, url: &str, encoding: TerrainEncoding) {
+        self.terrain_source_url = url.to_string();
+        self.terrain_source_encoding = encoding;
     }
 
     /// Whether terrain is currently enabled.
@@ -1124,13 +1152,18 @@ mod tests {
     #[test]
     fn test_controller_terrain_toggle() {
         let mut ctrl = MapController::new(MapConfig::default(), 800, 600);
-        let url = "https://example.com/{z}/{x}/{y}.png";
 
         assert!(!ctrl.terrain_enabled());
         assert_eq!(ctrl.layer_count(), 1);
 
+        // Set terrain source first
+        ctrl.set_terrain_source(
+            "https://example.com/{z}/{x}/{y}.png",
+            TerrainEncoding::Terrarium,
+        );
+
         // Toggle ON — no layer added (terrain is a rendering property)
-        let on = ctrl.toggle_terrain(url, TerrainEncoding::Terrarium);
+        let on = ctrl.toggle_terrain();
         assert!(on);
         assert!(ctrl.terrain_enabled());
         assert_eq!(ctrl.layer_count(), 1); // unchanged
@@ -1139,10 +1172,19 @@ mod tests {
         assert_eq!(ctrl.terrain_encoding(), Some(TerrainEncoding::Terrarium));
 
         // Toggle OFF
-        let off = ctrl.toggle_terrain(url, TerrainEncoding::Terrarium);
+        let off = ctrl.toggle_terrain();
         assert!(!off);
         assert!(!ctrl.terrain_enabled());
         assert_eq!(ctrl.layer_count(), 1);
+    }
+
+    #[test]
+    fn test_controller_terrain_toggle_without_url() {
+        let mut ctrl = MapController::new(MapConfig::default(), 800, 600);
+        // No terrain source configured — toggle should return false
+        let on = ctrl.toggle_terrain();
+        assert!(!on);
+        assert!(!ctrl.terrain_enabled());
     }
 
     #[test]

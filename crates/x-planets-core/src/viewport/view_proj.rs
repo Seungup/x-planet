@@ -197,6 +197,13 @@ impl super::Viewport {
                 clip_center.z as f32,
                 cos_clip_angle,
             ],
+            terrain: [self.max_zoom as f32, self.hillshade_strength as f32, 0.0, 0.0],
+            sun_dir: [
+                self.sun_direction[0] as f32,
+                self.sun_direction[1] as f32,
+                self.sun_direction[2] as f32,
+                0.0,
+            ],
         }
     }
 }

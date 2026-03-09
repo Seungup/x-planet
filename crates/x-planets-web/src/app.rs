@@ -249,26 +249,17 @@ impl WebApp {
     ///
     /// No layers are added or removed.  Elevation data is loaded on the
     /// raster imagery layer as a secondary data stream.
-    pub fn toggle_terrain_with(
-        &mut self,
-        url: Option<&str>,
-        encoding: Option<&str>,
-    ) -> bool {
-        let default_url = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
-        let url = url.unwrap_or(default_url);
-        let encoding = match encoding {
-            Some("mapbox") => TerrainEncoding::MapboxRgb,
-            Some("quantized-mesh") => TerrainEncoding::QuantizedMesh,
-            _ => TerrainEncoding::Terrarium,
-        };
-        let enabled = self.controller.toggle_terrain(url, encoding);
+    pub fn toggle_terrain(&mut self) -> bool {
+        let enabled = self.controller.toggle_terrain();
 
         if enabled {
             // Set elevation URL and encoding on the imagery layer so it starts loading elevation
             let imagery_name = self.controller.terrain_imagery_name()
                 .unwrap_or("base").to_string();
             let terrain_url = self.controller.terrain_url()
-                .unwrap_or(url).to_string();
+                .unwrap_or("").to_string();
+            let encoding = self.controller.terrain_encoding()
+                .unwrap_or(TerrainEncoding::Terrarium);
             if let Some(ls) = self.layer_states.iter_mut().find(|ls| ls.name == imagery_name) {
                 ls.elevation_url = Some(terrain_url);
                 ls.terrain_encoding = encoding;
@@ -283,6 +274,16 @@ impl WebApp {
         }
 
         enabled
+    }
+
+    /// Set terrain elevation source URL and encoding at runtime.
+    pub fn set_terrain_source(&mut self, url: &str, encoding: &str) {
+        let enc = match encoding {
+            "mapbox" | "mapbox-rgb" => TerrainEncoding::MapboxRgb,
+            "quantized-mesh" | "qm" => TerrainEncoding::QuantizedMesh,
+            _ => TerrainEncoding::Terrarium,
+        };
+        self.controller.set_terrain_source(url, enc);
     }
 
     /// Cycle to the next projection and return its name.

@@ -18,6 +18,12 @@ pub struct ViewportUniforms {
     /// on the unit sphere.  The fragment shader discards pixels where
     /// dot(sphere_pos, clip_center.xyz) < clip_center.w.
     pub clip_sphere: [f32; 4],
+    /// Terrain rendering params: (max_zoom, hillshade_strength, _pad, _pad).
+    /// `max_zoom` drives depth-bias in shaders; `hillshade_strength` controls
+    /// how strong the hillshade effect is (0.0 = flat, 1.0 = full).
+    pub terrain: [f32; 4],
+    /// Normalised sun direction for hillshade lighting (x, y, z, _pad).
+    pub sun_dir: [f32; 4],
 }
 
 /// Per-tile uniforms uploaded to GPU.

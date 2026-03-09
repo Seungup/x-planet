@@ -1,12 +1,4 @@
-import type { XPlanetsMap, TerrainEncoding } from "./types.ts";
-
-/**
- * Terrain source configuration.
- * Change these to switch between Terrarium, Mapbox, or other DEM providers.
- */
-const TERRAIN_URL =
-  "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
-const TERRAIN_ENCODING: TerrainEncoding = "terrarium";
+import type { XPlanetsMap } from "./types.ts";
 
 /** Create the UI control buttons and wire them to the map API. */
 export function setupControls(map: XPlanetsMap): void {
@@ -51,7 +43,7 @@ function createAltitudeButton(map: XPlanetsMap): void {
 
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
-    const enabled = map.toggleTerrain(TERRAIN_URL, TERRAIN_ENCODING);
+    const enabled = map.toggleTerrain();
     updateAltButton(btn, enabled);
   });
 }

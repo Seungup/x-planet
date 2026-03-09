@@ -49,12 +49,12 @@ export interface XPlanetsMap {
   // ── Terrain ──
   /**
    * Toggle terrain on/off for the base raster layer.
-   * For full control, use `addLayer()` with `kind: "raster-dem"` instead.
-   * @param url Elevation tile URL template (default: AWS Terrarium)
-   * @param encoding "terrarium" (default), "mapbox", "quantized-mesh"
+   * Uses the terrain URL/encoding from the config or `setTerrainSource()`.
    */
-  toggleTerrain(url?: string, encoding?: TerrainEncoding): boolean;
+  toggleTerrain(): boolean;
   terrainEnabled(): boolean;
+  /** Set terrain elevation source at runtime. */
+  setTerrainSource(url: string, encoding?: TerrainEncoding): void;
   setTerrainExaggeration(value: number): void;
   getTerrainExaggeration(): number;
 
@@ -142,6 +142,18 @@ export interface LayerConfig {
   opacity?: number;
 }
 
+/** Terrain configuration for `XPlanetsConfig`. */
+export interface TerrainConfig {
+  /** Elevation tile URL template (e.g. `https://…/{z}/{x}/{y}.png`). */
+  url: string;
+  /** Encoding format. Default: "terrarium". */
+  encoding?: TerrainEncoding;
+  /** Sun direction [x, y, z] for hillshade. Default: [-0.5, -0.5, 0.7]. */
+  sunDirection?: [number, number, number];
+  /** Hillshade strength 0–1. Default: 1.0. */
+  hillshadeStrength?: number;
+}
+
 /** Configuration for `XPlanets.create()`. */
 export interface XPlanetsConfig {
   center?: [number, number];
@@ -154,6 +166,8 @@ export interface XPlanetsConfig {
   /** Celestial body: "Earth" (default), "Moon", or "Mars". */
   body?: "Earth" | "Moon" | "Mars";
   layers?: LayerConfig[];
+  /** Terrain elevation source configuration. */
+  terrain?: TerrainConfig;
 }
 
 /** Factory for creating x-planets map instances via Promise-based init. */
