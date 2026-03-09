@@ -179,6 +179,9 @@ pub struct WebApp {
 
     /// Whether the app has been destroyed (stops render loop).
     pub(crate) destroyed: bool,
+
+    /// Cached visible_tiles() result: (center_lat, center_lon, zoom, pitch, bearing, width, height, tiles)
+    cached_visible: Option<(f64, f64, f64, f64, f64, u32, u32, Vec<VisibleTile>)>,
 }
 
 impl WebApp {
@@ -222,6 +225,7 @@ impl WebApp {
             last_frame_ms: None,
             event_handlers: HashMap::new(),
             destroyed: false,
+            cached_visible: None,
         }
     }
 
@@ -355,7 +359,18 @@ impl WebApp {
         self.upload_completed_tiles(now_secs);
 
         // ── 3. Request missing tiles for all layers ──
-        let visible = self.controller.visible_tiles();
+        // Cache visible_tiles() result: skip recalculation if viewport hasn't changed.
+        let vp = &self.controller.engine.viewport;
+        let vp_key = (vp.center.lat, vp.center.lon, vp.zoom, vp.pitch, vp.bearing, vp.width, vp.height);
+        let visible = if self.cached_visible.as_ref().map_or(true, |c| {
+            (c.0, c.1, c.2, c.3, c.4, c.5, c.6) != vp_key
+        }) {
+            let v = self.controller.visible_tiles();
+            self.cached_visible = Some((vp_key.0, vp_key.1, vp_key.2, vp_key.3, vp_key.4, vp_key.5, vp_key.6, v.clone()));
+            v
+        } else {
+            self.cached_visible.as_ref().unwrap().7.clone()
+        };
         self.request_tiles_for_all_layers(&visible);
 
         // ── 4. Refresh available coords caches ──
@@ -479,6 +494,9 @@ impl WebApp {
     }
 
     fn upload_completed_tiles(&mut self, now_secs: f64) {
+        const MAX_UPLOADS_PER_FRAME: usize = 4;
+        let mut upload_count: usize = 0;
+
         for ls in &mut self.layer_states {
             // Drain failed raster fetch notifications
             for coord in ls.failed_queue.borrow_mut().drain(..) {
@@ -489,24 +507,31 @@ impl WebApp {
                 ls.pending_elevation_coords.remove(&coord);
             }
 
-            // Drain completed results
-            let completed: Vec<CompletedTileResult> =
-                ls.completed_queue.borrow_mut().drain(..).collect();
-            for result in completed {
+            // Process completed results with a per-frame upload budget.
+            // Raster uploads are expensive (GPU texture write), so we cap them.
+            // Elevation data is CPU-only (no GPU upload), so it's always processed.
+            let mut completed_ref = ls.completed_queue.borrow_mut();
+            let mut remaining = Vec::new();
+            for result in completed_ref.drain(..) {
                 match result {
                     CompletedTileResult::Raster { coord, width, height, pixels } => {
-                        ls.pending_coords.remove(&coord);
-                        let label = format!("tile-{}/{}/{}", coord.z, coord.x, coord.y);
-                        let gpu_tex = self.tex_manager.create_rgba_texture(
-                            &self.gpu.device,
-                            &self.gpu.queue,
-                            &label,
-                            width,
-                            height,
-                            &pixels,
-                        );
-                        ls.tile_textures.insert(coord, gpu_tex);
-                        self.controller.register_tile_loaded(coord, now_secs);
+                        if upload_count < MAX_UPLOADS_PER_FRAME {
+                            ls.pending_coords.remove(&coord);
+                            let label = format!("tile-{}/{}/{}", coord.z, coord.x, coord.y);
+                            let gpu_tex = self.tex_manager.create_rgba_texture(
+                                &self.gpu.device,
+                                &self.gpu.queue,
+                                &label,
+                                width,
+                                height,
+                                &pixels,
+                            );
+                            ls.tile_textures.insert(coord, gpu_tex);
+                            self.controller.register_tile_loaded(coord, now_secs);
+                            upload_count += 1;
+                        } else {
+                            remaining.push(CompletedTileResult::Raster { coord, width, height, pixels });
+                        }
                     }
                     CompletedTileResult::Elevation { coord, elevation, width, height } => {
                         ls.pending_elevation_coords.remove(&coord);
@@ -517,6 +542,11 @@ impl WebApp {
                     }
                 }
             }
+            // Put back any raster results that exceeded the budget
+            for r in remaining {
+                completed_ref.push(r);
+            }
+            drop(completed_ref);
         }
     }
 
