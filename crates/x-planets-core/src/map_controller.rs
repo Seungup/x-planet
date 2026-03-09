@@ -819,7 +819,7 @@ impl MapController {
                         if is_terrain_imagery {
                             // Split visible tiles: elevation available → terrain, rest → flat raster
                             let (flat_visible, terrain_visible) =
-                                split_by_elevation(visible, *lv);
+                                split_by_elevation(visible, *lv, *lv);
 
                             // Flat raster for tiles without elevation
                             if !flat_visible.is_empty() {
@@ -1001,8 +1001,10 @@ fn build_raster_layer<'a>(
 /// OR any of its ancestor tiles (parent fallback).  Otherwise it stays in flat.
 fn split_by_elevation(
     visible: &[VisibleTile],
-    lv: &dyn LayerStateView,
+    terrain_lv: &dyn LayerStateView,
+    imagery_lv: &dyn LayerStateView,
 ) -> (Vec<VisibleTile>, Vec<VisibleTile>) {
+    let available_raster = imagery_lv.available_raster_coords();
     let mut flat = Vec::new();
     let mut terrain = Vec::new();
     for vt in visible {
@@ -1010,7 +1012,7 @@ fn split_by_elevation(
             let mut c = Some(vt.coord);
             let mut found = false;
             while let Some(candidate) = c {
-                if lv.terrain_tile_data(&candidate).is_some() {
+                if terrain_lv.terrain_tile_data(&candidate).is_some() {
                     found = true;
                     break;
                 }
@@ -1018,7 +1020,22 @@ fn split_by_elevation(
             }
             found
         };
-        if has_elev {
+        // Only classify as terrain if imagery is also available (exact or parent fallback).
+        // Without this check, tiles with elevation but no imagery texture get skipped by
+        // the terrain renderer AND excluded from the raster pass, causing black holes.
+        let has_imagery = has_elev && {
+            let mut c = Some(vt.coord);
+            let mut found = false;
+            while let Some(candidate) = c {
+                if available_raster.contains(&candidate) {
+                    found = true;
+                    break;
+                }
+                c = candidate.parent();
+            }
+            found
+        };
+        if has_imagery {
             terrain.push(vt.clone());
         } else {
             flat.push(vt.clone());
