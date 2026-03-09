@@ -123,7 +123,7 @@ impl NativeApp {
                         .iter_mut()
                         .find(|s| s.name == layer_name)
                     {
-                        ts3d.pending_uris.remove(&content_uri);
+                        ts3d.gpu.pending_uris.remove(&content_uri);
                         match result {
                             Ok(decoded) => {
                                 log::debug!(
@@ -133,10 +133,12 @@ impl NativeApp {
                                     decoded.meshes.len(),
                                 );
                                 let gpu = self.gpu.as_ref().unwrap();
+                                let shared = self.shared_resources.as_ref().unwrap();
                                 let renderer =
                                     self.model3d_renderer.as_ref().unwrap();
-                                ts3d.upload_decoded_tile(
+                                ts3d.gpu.upload_decoded_tile(
                                     gpu,
+                                    shared,
                                     renderer,
                                     &content_uri,
                                     &decoded,
@@ -183,19 +185,19 @@ impl NativeApp {
                     tileset,
                     &ts3d.base_url,
                     &camera,
-                    &ts3d.loaded_uris,
+                    &ts3d.gpu.loaded_uris,
                     &config,
                 );
 
             // Spawn loads for missing tiles.
             for req in &traversal.load_requests {
-                if ts3d.pending_uris.contains(&req.content_uri) {
+                if ts3d.gpu.pending_uris.contains(&req.content_uri) {
                     continue;
                 }
-                if ts3d.pending_uris.len() >= ts3d.max_concurrent {
+                if ts3d.gpu.pending_uris.len() >= ts3d.gpu.max_concurrent {
                     break;
                 }
-                ts3d.pending_uris.insert(req.content_uri.clone());
+                ts3d.gpu.pending_uris.insert(req.content_uri.clone());
 
                 let client = ts3d.client.clone();
                 let tx = self.tiles3d_tx.clone();
@@ -229,30 +231,29 @@ impl NativeApp {
             }
 
             // Unload tiles no longer needed.
-            for uri in &traversal.unload_set {
-                ts3d.gpu_tiles.remove(uri);
-                ts3d.loaded_uris.remove(uri);
-            }
+            ts3d.gpu.unload_tiles(&traversal.unload_set);
 
             // Update transforms and render.
             if !traversal.render_set.is_empty() {
-                let gpu = self.gpu.as_ref().unwrap();
+                let gpu_ctx = self.gpu.as_ref().unwrap();
                 let (uniforms, camera_ecef) =
                     x_planets_core::tiles3d_pipeline::build_tiles3d_uniforms(
                         &engine.viewport,
                     );
 
-                ts3d.update_render_transforms(
-                    &gpu.queue,
+                ts3d.gpu.update_render_transforms(
+                    &gpu_ctx.queue,
                     &traversal.render_set,
                     camera_ecef,
                     1.0, // opacity
                 );
 
-                let models = ts3d.collect_render_models(&traversal.render_set);
+                let models = ts3d.gpu.collect_render_models(&traversal.render_set);
                 if let Some(model3d_renderer) = &self.model3d_renderer {
+                    let shared = self.shared_resources.as_ref().unwrap();
                     model3d_renderer.render_models_with_uniforms(
-                        gpu,
+                        gpu_ctx,
+                        shared,
                         view,
                         &uniforms,
                         &models,

@@ -11,7 +11,7 @@ use x_planets_core::engine::LayerKind;
 use x_planets_core::map_controller::LayerStateView;
 use x_planets_core::tile_load_planner::{plan_tile_loads, LayerLoadState, PlannedRequestKind};
 use x_planets_core::MapController;
-use x_planets_render::{TerrainLayerData, TerrainRenderer, TerrainTileData, TileRenderer};
+use x_planets_render::{SharedRenderResources, TerrainLayerData, TerrainRenderer, TerrainTileData, TileRenderer};
 use x_planets_gpu::{GpuContext, GpuTexture, TextureManager};
 use x_planets_math::{TileCoord, VisibleTile};
 use x_planets_tiles::{RasterTileDecoder, TerrainEncoding, TerrainRgbDecoder, TerrariumDecoder, TileCache, TileDecoder};
@@ -160,6 +160,7 @@ impl LayerLoadState for WebLayerState {
 pub struct WebApp {
     pub gpu: GpuContext,
     pub controller: MapController,
+    shared_resources: SharedRenderResources,
     renderer: TileRenderer,
     pub(crate) terrain_renderer: TerrainRenderer,
     tex_manager: TextureManager,
@@ -188,6 +189,7 @@ impl WebApp {
     pub fn new(
         gpu: GpuContext,
         controller: MapController,
+        shared_resources: SharedRenderResources,
         renderer: TileRenderer,
         terrain_renderer: TerrainRenderer,
         tex_manager: TextureManager,
@@ -214,6 +216,7 @@ impl WebApp {
         Self {
             gpu,
             controller,
+            shared_resources,
             renderer,
             terrain_renderer,
             tex_manager,
@@ -433,6 +436,7 @@ impl WebApp {
         // Always render raster base first
         self.renderer.render_frame_layered_projected(
             &self.gpu,
+            &self.shared_resources,
             &view,
             &self.controller.engine.viewport,
             &render_output.raster_layers,
@@ -448,6 +452,7 @@ impl WebApp {
                 .collect();
             self.terrain_renderer.render_terrain_layered(
                 &self.gpu,
+                &self.shared_resources,
                 &view,
                 &self.controller.engine.viewport,
                 &all_terrain,
@@ -485,8 +490,7 @@ impl WebApp {
             self.canvas.set_height(h);
             self.gpu.resize_surface(w, h);
             self.controller.resize(w, h);
-            self.renderer.resize(&self.gpu.device, w, h);
-            self.terrain_renderer.resize(&self.gpu.device, w, h);
+            self.shared_resources.resize(&self.gpu.device, w, h);
             self.last_width = w;
             self.last_height = h;
             log::info!("Resized: {}x{}", w, h);

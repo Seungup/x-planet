@@ -3,14 +3,11 @@
 //! Handles:
 //! - Cesium Ion 2-token authentication workflow
 //! - Google 3D Tiles session-based authentication
-//! - Per-layer state management (tileset, GPU models, load queue)
-
-use std::collections::{HashMap, HashSet};
+//! - Per-layer state management (delegates GPU ops to core's Tiles3dGpuState)
 
 use serde::Deserialize;
 
-use x_planets_render::{GpuModel3d, Model3dRenderer, Model3dVertex};
-use x_planets_gpu::GpuContext;
+use x_planets_render::Tiles3dGpuState;
 use x_planets_tiles::tiles3d::decoder::Decoded3dTile;
 use x_planets_tiles::tiles3d::tileset::Tileset;
 
@@ -155,18 +152,12 @@ pub enum Tiles3dMessage {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Per-layer state
+// Per-layer state (wraps core Tiles3dGpuState)
 // ═══════════════════════════════════════════════════════════════════
 
-/// A single GPU-uploaded tile content (one or more meshes).
-pub struct GpuTileContent {
-    /// GPU models (one per mesh in the decoded tile).
-    pub models: Vec<GpuModel3d>,
-    /// RTC centers for each mesh (needed for model matrix computation).
-    pub rtc_centers: Vec<Option<[f64; 3]>>,
-}
-
-/// Per-layer state for a 3D Tiles layer.
+/// Per-layer state for a 3D Tiles layer on native platform.
+///
+/// Combines platform-specific HTTP client with the core GPU state.
 pub struct Tiles3dLayerState {
     pub name: String,
     pub auth: Tiles3dAuthKind,
@@ -177,16 +168,10 @@ pub struct Tiles3dLayerState {
     pub base_url: String,
     /// Access token for tile requests (Cesium Ion bearer token).
     pub access_token: Option<String>,
-    /// GPU-uploaded tile contents, keyed by content URI.
-    pub gpu_tiles: HashMap<String, GpuTileContent>,
-    /// Content URIs that have been loaded and have GPU models.
-    pub loaded_uris: HashSet<String>,
-    /// Content URIs currently being fetched.
-    pub pending_uris: HashSet<String>,
     /// Whether the initialization task has been spawned.
     pub init_spawned: bool,
-    /// Maximum concurrent tile content loads.
-    pub max_concurrent: usize,
+    /// GPU state: uploaded tiles, loaded/pending URIs.
+    pub gpu: Tiles3dGpuState,
 }
 
 impl Tiles3dLayerState {
@@ -198,133 +183,12 @@ impl Tiles3dLayerState {
             tileset: None,
             base_url: String::new(),
             access_token: None,
-            gpu_tiles: HashMap::new(),
-            loaded_uris: HashSet::new(),
-            pending_uris: HashSet::new(),
             init_spawned: false,
-            max_concurrent: 6,
+            gpu: Tiles3dGpuState::new(),
         }
     }
 
     pub fn is_initialized(&self) -> bool {
         self.tileset.is_some()
-    }
-
-    /// Upload a decoded 3D tile to the GPU.
-    pub fn upload_decoded_tile(
-        &mut self,
-        gpu: &GpuContext,
-        renderer: &Model3dRenderer,
-        content_uri: &str,
-        decoded: &Decoded3dTile,
-    ) {
-        let mut models = Vec::new();
-        let mut rtc_centers = Vec::new();
-
-        for (i, mesh) in decoded.meshes.iter().enumerate() {
-            // Build vertex data.
-            let vertices: Vec<Model3dVertex> = (0..mesh.positions.len())
-                .map(|j| Model3dVertex {
-                    position: mesh.positions[j],
-                    normal: if j < mesh.normals.len() {
-                        mesh.normals[j]
-                    } else {
-                        [0.0, 1.0, 0.0]
-                    },
-                    tex_coord: if j < mesh.tex_coords.len() {
-                        mesh.tex_coords[j]
-                    } else {
-                        [0.0, 0.0]
-                    },
-                })
-                .collect();
-
-            if vertices.is_empty() || mesh.indices.is_empty() {
-                continue;
-            }
-
-            // Create texture if available.
-            let texture_view = mesh.texture_rgba.as_ref().and_then(|rgba| {
-                let w = mesh.texture_width;
-                let h = mesh.texture_height;
-                if w > 0 && h > 0 && rgba.len() == (w * h * 4) as usize {
-                    Some(Model3dRenderer::create_texture(
-                        gpu,
-                        &format!("{}-tex-{}", content_uri, i),
-                        w,
-                        h,
-                        rgba,
-                    ))
-                } else {
-                    None
-                }
-            });
-
-            // Upload with identity matrix (updated each frame).
-            let model = renderer.upload_mesh(
-                gpu,
-                &format!("{}-mesh-{}", content_uri, i),
-                &vertices,
-                &mesh.indices,
-                glam::Mat4::IDENTITY.to_cols_array(),
-                1.0,
-                texture_view.as_ref(),
-            );
-
-            models.push(model);
-            rtc_centers.push(mesh.rtc_center);
-        }
-
-        if !models.is_empty() {
-            self.gpu_tiles.insert(
-                content_uri.to_string(),
-                GpuTileContent {
-                    models,
-                    rtc_centers,
-                },
-            );
-            self.loaded_uris.insert(content_uri.to_string());
-        }
-    }
-
-    /// Update model transforms for all tiles in the render set.
-    ///
-    /// Computes ECEF-relative model matrices for each mesh.
-    pub fn update_render_transforms(
-        &self,
-        queue: &wgpu::Queue,
-        render_set: &[x_planets_tiles::tiles3d::traversal::TraversalTile],
-        camera_ecef: glam::DVec3,
-        opacity: f32,
-    ) {
-        for tile in render_set {
-            if let Some(content) = self.gpu_tiles.get(&tile.content_uri) {
-                for (model, rtc_center) in
-                    content.models.iter().zip(content.rtc_centers.iter())
-                {
-                    let model_matrix =
-                        x_planets_core::tiles3d_pipeline::build_model_matrix(*rtc_center, tile.transform);
-                    let relative =
-                        x_planets_core::tiles3d_pipeline::ecef_to_relative_world(model_matrix, camera_ecef);
-                    model.update_transform(queue, relative.to_cols_array(), opacity);
-                }
-            }
-        }
-    }
-
-    /// Collect all GPU model references for tiles in the render set.
-    pub fn collect_render_models(
-        &self,
-        render_set: &[x_planets_tiles::tiles3d::traversal::TraversalTile],
-    ) -> Vec<&GpuModel3d> {
-        let mut models = Vec::new();
-        for tile in render_set {
-            if let Some(content) = self.gpu_tiles.get(&tile.content_uri) {
-                for model in &content.models {
-                    models.push(model);
-                }
-            }
-        }
-        models
     }
 }

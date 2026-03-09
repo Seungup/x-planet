@@ -478,11 +478,12 @@ mod web_impl {
                 controller.set_projection(&proj);
             }
 
-            let renderer = x_planets_render::TileRenderer::new(&gpu);
-            let terrain_renderer = x_planets_render::TerrainRenderer::new(&gpu);
+            let shared_resources = x_planets_render::SharedRenderResources::new(&gpu);
+            let renderer = x_planets_render::TileRenderer::new(&gpu, &shared_resources);
+            let terrain_renderer = x_planets_render::TerrainRenderer::new(&gpu, &shared_resources);
             let tex_manager = x_planets_gpu::TextureManager::new(&gpu.device);
 
-            let app = WebApp::new(gpu, controller, renderer, terrain_renderer, tex_manager, canvas.clone(), dpr);
+            let app = WebApp::new(gpu, controller, shared_resources, renderer, terrain_renderer, tex_manager, canvas.clone(), dpr);
             let app = std::rc::Rc::new(std::cell::RefCell::new(app));
 
             // Input events

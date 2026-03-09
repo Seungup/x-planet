@@ -27,7 +27,7 @@ use winit::{
 use x_planets_core::engine::MapConfig;
 use x_planets_core::map_controller::LayerStateView;
 use x_planets_core::MapController;
-use x_planets_render::{Model3dRenderer, TerrainRenderer, TileRenderer};
+use x_planets_render::{Model3dRenderer, SharedRenderResources, TerrainRenderer, TileRenderer};
 use x_planets_gpu::{GpuContext, TextureManager};
 use x_planets_math::TileCoord;
 
@@ -64,6 +64,7 @@ pub fn run_native(config: MapConfig) -> Result<(), Box<dyn std::error::Error>> {
         window: None,
         gpu: None,
         controller: None,
+        shared_resources: None,
         renderer: None,
         terrain_renderer: None,
         model3d_renderer: None,
@@ -102,6 +103,7 @@ pub(crate) struct NativeApp {
     pub(super) gpu: Option<GpuContext>,
     /// Unified map controller (same as web platform).
     pub(super) controller: Option<MapController>,
+    pub(super) shared_resources: Option<SharedRenderResources>,
     pub(super) renderer: Option<TileRenderer>,
     pub(super) terrain_renderer: Option<TerrainRenderer>,
     pub(super) model3d_renderer: Option<Model3dRenderer>,
@@ -201,15 +203,18 @@ impl ApplicationHandler for NativeApp {
 
         log::info!("GPU adapter: {}", gpu.adapter_info().name);
 
+        // ── Shared GPU resources (depth, viewport uniforms, sampler, BGL) ──
+        let shared_resources = SharedRenderResources::new(&gpu);
+
         // ── TileRenderer ──
-        let renderer = TileRenderer::new(&gpu);
+        let renderer = TileRenderer::new(&gpu, &shared_resources);
 
         // ── TerrainRenderer ──
-        let mut terrain_renderer = TerrainRenderer::new(&gpu);
+        let mut terrain_renderer = TerrainRenderer::new(&gpu, &shared_resources);
         terrain_renderer.exaggeration = self.config.terrain_exaggeration;
 
         // ── Model3dRenderer ──
-        let model3d_renderer = Model3dRenderer::new(&gpu);
+        let model3d_renderer = Model3dRenderer::new(&gpu, &shared_resources);
 
         // ── TextureManager (creates per-tile label textures on demand) ──
         let tex_manager = TextureManager::new(&gpu.device);
@@ -233,6 +238,7 @@ impl ApplicationHandler for NativeApp {
         );
 
         self.gpu = Some(gpu);
+        self.shared_resources = Some(shared_resources);
         self.renderer = Some(renderer);
         self.terrain_renderer = Some(terrain_renderer);
         self.model3d_renderer = Some(model3d_renderer);
@@ -255,14 +261,8 @@ impl ApplicationHandler for NativeApp {
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize_surface(size.width, size.height);
-                    if let Some(renderer) = &mut self.renderer {
-                        renderer.resize(&gpu.device, size.width, size.height);
-                    }
-                    if let Some(terrain_renderer) = &mut self.terrain_renderer {
-                        terrain_renderer.resize(&gpu.device, size.width, size.height);
-                    }
-                    if let Some(model3d_renderer) = &mut self.model3d_renderer {
-                        model3d_renderer.resize(&gpu.device, size.width, size.height);
+                    if let Some(shared) = &mut self.shared_resources {
+                        shared.resize(&gpu.device, size.width, size.height);
                     }
                 }
                 if let Some(ctrl) = &mut self.controller {
@@ -295,6 +295,7 @@ impl NativeApp {
         if self.gpu.is_none()
             || self.controller.is_none()
             || self.renderer.is_none()
+            || self.shared_resources.is_none()
             || self.tex_manager.is_none()
         {
             return;
@@ -420,10 +421,12 @@ impl NativeApp {
 
             let renderer = self.renderer.as_mut().unwrap();
             let gpu = self.gpu.as_ref().unwrap();
+            let shared = self.shared_resources.as_ref().unwrap();
 
             let proj_mode = ctrl.rendering_mode();
             renderer.render_frame_layered_projected(
                 gpu,
+                shared,
                 &view,
                 &ctrl.engine.viewport,
                 &render_output.raster_layers,
@@ -438,6 +441,7 @@ impl NativeApp {
                     if !render_output.terrain_layers.is_empty() {
                         terrain_renderer.render_terrain_layered(
                             gpu,
+                            shared,
                             &view,
                             &ctrl.engine.viewport,
                             &render_output.terrain_layers,
@@ -447,6 +451,7 @@ impl NativeApp {
                     if !render_output.terrain_overlay_layers.is_empty() {
                         terrain_renderer.render_terrain_layered(
                             gpu,
+                            shared,
                             &view,
                             &ctrl.engine.viewport,
                             &render_output.terrain_overlay_layers,
@@ -491,7 +496,7 @@ impl NativeApp {
                 || visible.iter().any(|vt| !ls.tile_textures.contains(&vt.coord))
         });
         let any_tiles3d_pending = self.tiles3d_states.iter().any(|ts| {
-            !ts.pending_uris.is_empty() || !ts.is_initialized()
+            !ts.gpu.pending_uris.is_empty() || !ts.is_initialized()
         });
         if any_pending
             || any_tiles3d_pending

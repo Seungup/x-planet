@@ -8,9 +8,11 @@
 //! depend on `x-planets-core` directly *without* the `gpu` feature.
 
 // Re-export renderers from core (gpu feature is enabled via our Cargo.toml dependency)
+pub use x_planets_core::shared_render_resources::SharedRenderResources;
 pub use x_planets_core::tile_renderer::TileRenderer;
 pub use x_planets_core::terrain_renderer::{TerrainLayerData, TerrainRenderer};
 pub use x_planets_core::model3d_renderer::{GpuModel3d, Model3dRenderer, Model3dVertex, ModelUniforms};
+pub use x_planets_core::tiles3d_state::{GpuTileContent, Tiles3dGpuState};
 
 // Re-export GPU-dependent render data types
 pub use x_planets_core::render::RenderLayerData;

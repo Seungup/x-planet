@@ -10,6 +10,7 @@ use bytemuck::{Pod, Zeroable};
 use x_planets_gpu::GpuContext;
 use x_planets_math::ViewportUniforms;
 
+use crate::shared_render_resources::SharedRenderResources;
 use crate::viewport::Viewport;
 
 const MODEL3D_SHADER: &str = include_str!("../../../shaders/rendering/model3d.wgsl");
@@ -33,22 +34,19 @@ pub struct Model3dVertex {
 impl Model3dVertex {
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress, // 32 bytes
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
-                // position: Float32x3 at location 0
                 wgpu::VertexAttribute {
                     offset: 0,
                     shader_location: 0,
                     format: wgpu::VertexFormat::Float32x3,
                 },
-                // normal: Float32x3 at location 1
                 wgpu::VertexAttribute {
                     offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x3,
                 },
-                // tex_coord: Float32x2 at location 2
                 wgpu::VertexAttribute {
                     offset: (std::mem::size_of::<[f32; 3]>() * 2) as wgpu::BufferAddress,
                     shader_location: 2,
@@ -84,15 +82,11 @@ pub struct GpuModel3d {
     index_count: u32,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    /// Cached texture flag (1.0 = has texture, 0.0 = no texture).
     has_texture_flag: f32,
 }
 
 impl GpuModel3d {
     /// Update the model matrix and opacity for this model.
-    ///
-    /// Call this each frame when the camera moves to recompute
-    /// ECEF-relative transforms for planet-scale rendering.
     pub fn update_transform(&self, queue: &wgpu::Queue, model_matrix: [f32; 16], opacity: f32) {
         let uniforms = ModelUniforms {
             model_matrix,
@@ -150,15 +144,6 @@ fn create_white_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Tex
 /// Renderer for 3D tile models (glTF/B3DM meshes).
 pub struct Model3dRenderer {
     pipeline: wgpu::RenderPipeline,
-    _viewport_bgl: wgpu::BindGroupLayout,
-    model_bgl: wgpu::BindGroupLayout,
-    viewport_buffer: wgpu::Buffer,
-    viewport_bg: wgpu::BindGroup,
-    sampler: wgpu::Sampler,
-    depth_view: wgpu::TextureView,
-    depth_format: wgpu::TextureFormat,
-    surface_width: u32,
-    surface_height: u32,
     /// 1×1 white placeholder texture for models without textures.
     white_texture_view: wgpu::TextureView,
 }
@@ -167,67 +152,12 @@ impl Model3dRenderer {
     /// Create a new 3D model renderer.
     ///
     /// Requires a GpuContext with a surface (panics if headless).
-    pub fn new(gpu: &GpuContext) -> Self {
+    pub fn new(gpu: &GpuContext, shared: &SharedRenderResources) -> Self {
         let format = gpu
             .surface_format()
             .expect("Model3dRenderer requires a surface");
 
-        // ── Bind group layout 0: viewport uniforms ──
-        let _viewport_bgl =
-            gpu.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("model3d-viewport-bgl"),
-                    entries: &[wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    }],
-                });
-
-        // ── Bind group layout 1: model uniforms + texture + sampler ──
-        let model_bgl =
-            gpu.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("model3d-model-bgl"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::VERTEX
-                                | wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float {
-                                    filterable: true,
-                                },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(
-                                wgpu::SamplerBindingType::Filtering,
-                            ),
-                            count: None,
-                        },
-                    ],
-                });
+        let depth_format = SharedRenderResources::depth_format();
 
         // ── Shader + Pipeline ──
         let shader = gpu
@@ -241,7 +171,7 @@ impl Model3dRenderer {
             gpu.device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("model3d-layout"),
-                    bind_group_layouts: &[&_viewport_bgl, &model_bgl],
+                    bind_group_layouts: &[&shared.viewport_bgl, &shared.tile_bgl],
                     push_constant_ranges: &[],
                 });
 
@@ -273,7 +203,7 @@ impl Model3dRenderer {
                         ..Default::default()
                     },
                     depth_stencil: Some(wgpu::DepthStencilState {
-                        format: Self::depth_format(),
+                        format: depth_format,
                         depth_write_enabled: true,
                         depth_compare: wgpu::CompareFunction::LessEqual,
                         stencil: wgpu::StencilState::default(),
@@ -284,123 +214,22 @@ impl Model3dRenderer {
                     cache: None,
                 });
 
-        // ── Viewport uniform buffer ──
-        let viewport_uniforms = ViewportUniforms {
-            view_proj: [0.0; 16],
-            resolution: [0.0; 4],
-            camera: [0.0; 4],
-            clip_sphere: [0.0; 4],
-            terrain: [0.0; 4],
-            sun_dir: [0.0; 4],
-        };
-        let viewport_buffer =
-            gpu.create_uniform_buffer("model3d-viewport-uniforms", &viewport_uniforms);
-
-        let viewport_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("model3d-viewport-bg"),
-            layout: &_viewport_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: viewport_buffer.as_entire_binding(),
-            }],
-        });
-
-        // ── Sampler ──
-        let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("model3d-sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
-        // ── Depth texture ──
-        let (surface_width, surface_height) = gpu
-            .surface
-            .as_ref()
-            .map(|s| (s.config.width, s.config.height))
-            .unwrap_or((800, 600));
-        let depth_format = Self::depth_format();
-        let depth_view =
-            Self::create_depth_texture(&gpu.device, surface_width, surface_height, depth_format);
-
-        // ── White placeholder texture ──
         let white_texture_view = create_white_texture(&gpu.device, &gpu.queue);
 
-        log::info!(
-            "Model3dRenderer created (format: {:?}, depth: {:?})",
-            format,
-            depth_format
-        );
+        log::info!("Model3dRenderer created (format: {:?})", format);
 
         Self {
             pipeline,
-            _viewport_bgl,
-            model_bgl,
-            viewport_buffer,
-            viewport_bg,
-            sampler,
-            depth_view,
-            depth_format,
-            surface_width,
-            surface_height,
             white_texture_view,
         }
     }
 
-    /// Platform-appropriate depth format.
-    /// Depth24Plus is safer on WebGL2 fallback; Depth32Float on native.
-    fn depth_format() -> wgpu::TextureFormat {
-        #[cfg(target_arch = "wasm32")]
-        { wgpu::TextureFormat::Depth24Plus }
-        #[cfg(not(target_arch = "wasm32"))]
-        { wgpu::TextureFormat::Depth32Float }
-    }
-
-    fn create_depth_texture(
-        device: &wgpu::Device,
-        width: u32,
-        height: u32,
-        format: wgpu::TextureFormat,
-    ) -> wgpu::TextureView {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("model3d-depth-texture"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        texture.create_view(&wgpu::TextureViewDescriptor::default())
-    }
-
-    /// Recreate depth texture after window resize.
-    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        if width != self.surface_width || height != self.surface_height {
-            self.surface_width = width;
-            self.surface_height = height;
-            self.depth_view =
-                Self::create_depth_texture(device, width, height, self.depth_format);
-        }
-    }
-
     /// Upload a mesh to the GPU and create a renderable model.
-    ///
-    /// `model_matrix` transforms from local/ECEF coordinates to world space.
-    /// `opacity` is 0.0–1.0 for blending.
-    /// `texture_view` is optional; if None, a white placeholder is used.
     #[allow(clippy::too_many_arguments)]
     pub fn upload_mesh(
         &self,
         gpu: &GpuContext,
+        shared: &SharedRenderResources,
         label: &str,
         vertices: &[Model3dVertex],
         indices: &[u32],
@@ -424,7 +253,7 @@ impl Model3dRenderer {
 
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(&format!("model3d-bg-{}", label)),
-            layout: &self.model_bgl,
+            layout: &shared.tile_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -436,7 +265,7 @@ impl Model3dRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    resource: wgpu::BindingResource::Sampler(&shared.sampler),
                 },
             ],
         });
@@ -496,12 +325,10 @@ impl Model3dRenderer {
     }
 
     /// Render a set of 3D models to the target surface.
-    ///
-    /// Uses `LoadOp::Load` for color (preserves raster + terrain layers already drawn)
-    /// and `LoadOp::Clear(1.0)` for depth.
     pub fn render_models(
         &self,
         gpu: &GpuContext,
+        shared: &SharedRenderResources,
         target: &wgpu::TextureView,
         viewport: &Viewport,
         models: &[&GpuModel3d],
@@ -509,19 +336,15 @@ impl Model3dRenderer {
         if models.is_empty() {
             return;
         }
-
-        // Update viewport uniforms from the standard Mercator viewport.
         let uniforms = viewport.to_uniforms();
-        self.render_models_with_uniforms(gpu, target, &uniforms, models);
+        self.render_models_with_uniforms(gpu, shared, target, &uniforms, models);
     }
 
     /// Render a set of 3D models with custom viewport uniforms.
-    ///
-    /// Use this for ECEF-based rendering where the view-projection matrix
-    /// is computed in ECEF-relative space (from `tiles3d_pipeline`).
     pub fn render_models_with_uniforms(
         &self,
         gpu: &GpuContext,
+        shared: &SharedRenderResources,
         target: &wgpu::TextureView,
         uniforms: &ViewportUniforms,
         models: &[&GpuModel3d],
@@ -530,7 +353,7 @@ impl Model3dRenderer {
             return;
         }
 
-        gpu.update_buffer(&self.viewport_buffer, uniforms);
+        shared.update_viewport(gpu, uniforms);
 
         let mut encoder = gpu
             .device
@@ -548,7 +371,7 @@ impl Model3dRenderer {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
+                    view: &shared.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Discard,
@@ -559,7 +382,7 @@ impl Model3dRenderer {
             });
 
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.viewport_bg, &[]);
+            pass.set_bind_group(0, &shared.viewport_bg, &[]);
 
             for model in models {
                 pass.set_bind_group(1, &model.bind_group, &[]);
