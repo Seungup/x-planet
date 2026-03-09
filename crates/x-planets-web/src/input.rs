@@ -251,10 +251,13 @@ fn register_mouse_events(
                         let dx = x - down_pos.0;
                         let dy = y - down_pos.1;
                         if dx * dx + dy * dy < 25.0 {
-                            // Unproject screen coords (physical pixels) to geographic
+                            // Unproject screen coords (physical pixels) to geographic.
+                            // Extract the result before borrowing mutably to avoid
+                            // RefCell double-borrow panic.
                             let px = x * dpr;
                             let py = y * dpr;
-                            if let Some((lat, lon)) = app.borrow().controller.unproject(px, py) {
+                            let geo = app.borrow().controller.unproject(px, py);
+                            if let Some((lat, lon)) = geo {
                                 app.borrow_mut().controller.push_click(lat, lon, x, y);
                             }
                         }
