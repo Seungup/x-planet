@@ -352,8 +352,19 @@ impl super::Viewport {
         }
 
         if result.len() > tile_budget {
+            // Separate coarse background tiles from fine foreground tiles.
+            // Coarse tiles (below the ideal base zoom) are few and provide
+            // essential coverage for distant areas in pitched views.  Always
+            // keep them; only truncate fine tiles when the budget is exceeded.
+            // Without this, pitched views at high zoom drop distant coarse
+            // tiles, leaving visible dark gaps at the horizon.
+            let coarse_threshold = min_z.saturating_add(1);
+            let (coarse, mut fine): (Vec<_>, Vec<_>) = result
+                .into_iter()
+                .partition(|vt| vt.coord.z <= coarse_threshold);
+
             if use_angular {
-                result.sort_by(|a, b| {
+                fine.sort_by(|a, b| {
                     let ang_dist = |tc: glam::DVec2| -> f64 {
                         let g = mercator_to_geo(tc);
                         let dlat = g.lat.to_radians() - center_lat_rad;
@@ -369,13 +380,17 @@ impl super::Viewport {
                     da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
                 });
             } else {
-                result.sort_by(|a, b| {
+                fine.sort_by(|a, b| {
                     let da = (a.display_mercator_center() - center_merc).length();
                     let db = (b.display_mercator_center() - center_merc).length();
                     da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
-            result.truncate(tile_budget);
+            let fine_budget = tile_budget.saturating_sub(coarse.len());
+            fine.truncate(fine_budget);
+
+            result = coarse;
+            result.extend(fine);
         }
 
         result.sort_by_key(|vt| vt.coord.z);
