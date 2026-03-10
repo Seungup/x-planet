@@ -160,9 +160,106 @@ pub fn tile_count(tile: &Tile) -> usize {
     1 + tile.children.iter().map(tile_count).sum::<usize>()
 }
 
+/// Splice an external tileset into the main tileset tree.
+///
+/// Finds the tile whose **resolved** content URI matches `resolved_content_uri`
+/// and replaces it with the external tileset's root. The external root's
+/// children become children of the matched tile, and the external root's
+/// content (if any) replaces the original `.json` content reference.
+///
+/// `external_base_url` is the base URL for the external tileset (derived from
+/// the .json file's URL). All relative URIs in the spliced subtree are resolved
+/// to absolute URLs using this base.
+///
+/// Returns `true` if the splice was performed.
+pub fn splice_external_tileset(
+    tile: &mut Tile,
+    base_url: &str,
+    resolved_content_uri: &str,
+    external: &Tileset,
+    external_base_url: &str,
+) -> bool {
+    // Check if this tile's resolved content URI matches.
+    if let Some(resolved) = resolve_content_uri(base_url, tile) {
+        if resolved == resolved_content_uri {
+            let ext_root = &external.root;
+
+            // Replace content with external root's content.
+            tile.content = ext_root.content.clone();
+
+            // Replace children with external root's children.
+            tile.children = ext_root.children.clone();
+
+            // Inherit transform from external root if this tile has none.
+            if tile.transform.is_none() && ext_root.transform.is_some() {
+                tile.transform = ext_root.transform;
+            }
+
+            // Use external root's bounding volume.
+            tile.bounding_volume = ext_root.bounding_volume.clone();
+
+            // Inherit geometric error from external root.
+            tile.geometric_error = ext_root.geometric_error;
+
+            // Inherit refine strategy if not set.
+            if tile.refine.is_none() {
+                tile.refine = ext_root.refine;
+            }
+
+            // Resolve all relative URIs in the spliced subtree to absolute.
+            resolve_all_uris(tile, external_base_url);
+
+            return true;
+        }
+    }
+
+    // Recurse into children.
+    for child in &mut tile.children {
+        if splice_external_tileset(child, base_url, resolved_content_uri, external, external_base_url) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Get the effective refine strategy for a tile (inherits from parent if not set).
 pub fn effective_refine(tile: &Tile, parent_refine: Refine) -> Refine {
     tile.refine.unwrap_or(parent_refine)
+}
+
+/// Resolve all relative content URIs in a tile tree to absolute URLs.
+///
+/// This is used after splicing an external tileset so that all URIs
+/// in the subtree are absolute and don't depend on the base URL.
+pub fn resolve_all_uris(tile: &mut Tile, base_url: &str) {
+    if let Some(ref mut content) = tile.content {
+        if !content.uri.starts_with("http://") && !content.uri.starts_with("https://") {
+            // Resolve relative URI to absolute.
+            if content.uri.starts_with('/') {
+                // Absolute path — extract origin from base_url.
+                if let Some(origin_end) = base_url.find("://").map(|i| {
+                    base_url[i + 3..]
+                        .find('/')
+                        .map(|j| i + 3 + j)
+                        .unwrap_or(base_url.len())
+                }) {
+                    content.uri = format!("{}{}", &base_url[..origin_end], content.uri);
+                }
+            } else {
+                // Relative URI.
+                let base = if let Some(slash_pos) = base_url.rfind('/') {
+                    &base_url[..=slash_pos]
+                } else {
+                    base_url
+                };
+                content.uri = format!("{}{}", base, content.uri);
+            }
+        }
+    }
+    for child in &mut tile.children {
+        resolve_all_uris(child, base_url);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -306,6 +403,72 @@ mod tests {
             implicit_tiling: None,
         };
         assert!(resolve_content_uri("https://example.com/tileset.json", &tile).is_none());
+    }
+
+    #[test]
+    fn test_splice_external_tileset() {
+        // Main tileset has a child referencing an external JSON.
+        let main_json = r#"{
+            "asset": { "version": "1.1" },
+            "geometricError": 500.0,
+            "root": {
+                "boundingVolume": { "sphere": [0.0, 0.0, 0.0, 10000.0] },
+                "geometricError": 200.0,
+                "refine": "ADD",
+                "content": { "uri": "root.b3dm" },
+                "children": [
+                    {
+                        "boundingVolume": { "sphere": [0.0, 0.0, 0.0, 5000.0] },
+                        "geometricError": 100.0,
+                        "content": { "uri": "0-0-0.json" }
+                    }
+                ]
+            }
+        }"#;
+        let external_json = r#"{
+            "asset": { "version": "1.1" },
+            "geometricError": 100.0,
+            "root": {
+                "boundingVolume": { "sphere": [0.0, 0.0, 0.0, 5000.0] },
+                "geometricError": 50.0,
+                "refine": "REPLACE",
+                "content": { "uri": "tile.b3dm" },
+                "children": [
+                    {
+                        "boundingVolume": { "sphere": [0.0, 0.0, 0.0, 2500.0] },
+                        "geometricError": 25.0,
+                        "content": { "uri": "child0.b3dm" }
+                    }
+                ]
+            }
+        }"#;
+
+        let mut main_tileset = parse_tileset(main_json.as_bytes()).unwrap();
+        let external = parse_tileset(external_json.as_bytes()).unwrap();
+        let base_url = "https://example.com/tiles/";
+
+        // The external tileset's base URL is derived from the .json file's URL.
+        let external_base_url = "https://example.com/tiles/";
+        let spliced = splice_external_tileset(
+            &mut main_tileset.root,
+            base_url,
+            "https://example.com/tiles/0-0-0.json",
+            &external,
+            external_base_url,
+        );
+
+        assert!(spliced);
+        // The child should now have the external root's content (resolved to absolute).
+        let child = &main_tileset.root.children[0];
+        assert_eq!(child.content.as_ref().unwrap().uri, "https://example.com/tiles/tile.b3dm");
+        assert_eq!(child.geometric_error, 50.0);
+        assert_eq!(child.refine, Some(Refine::Replace));
+        // And the external root's children (also resolved).
+        assert_eq!(child.children.len(), 1);
+        assert_eq!(
+            child.children[0].content.as_ref().unwrap().uri,
+            "https://example.com/tiles/child0.b3dm"
+        );
     }
 
     #[test]
