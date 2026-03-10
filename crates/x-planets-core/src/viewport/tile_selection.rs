@@ -126,6 +126,15 @@ impl super::Viewport {
         lon_min_deg -= lon_range * 0.15;
         lon_max_deg += lon_range * 0.15;
 
+        // Clamp longitude to at most one world width centered on the
+        // viewport center.  Without this, the oblique Mercator inverse
+        // can produce very wide longitude ranges at high pitch, causing
+        // duplicate seed tiles with wrapped display_x values that consume
+        // the tile budget and starve the actual center tile.
+        let center_lon = self.center.lon;
+        lon_min_deg = lon_min_deg.max(center_lon - 180.0);
+        lon_max_deg = lon_max_deg.min(center_lon + 180.0);
+
         let lat_min = lat_min_deg;
         let lat_max = lat_max_deg;
         let lon_min = lon_min_deg;
