@@ -10,6 +10,8 @@
 mod app;
 #[cfg(target_arch = "wasm32")]
 mod input;
+#[cfg(target_arch = "wasm32")]
+mod tiles3d_web;
 
 #[cfg(target_arch = "wasm32")]
 mod web_impl {
@@ -17,6 +19,7 @@ mod web_impl {
     use wasm_bindgen::JsCast;
 
     use crate::app::WebApp;
+    use crate::tiles3d_web::{Tiles3dAuthKind, Tiles3dWebState};
     use x_planets_core::engine::{LayerConfig, LayerKind};
     use x_planets_tiles::TerrainEncoding;
 
@@ -482,7 +485,43 @@ mod web_impl {
             let terrain_renderer = x_planets_render::TerrainRenderer::new(&gpu);
             let tex_manager = x_planets_gpu::TextureManager::new(&gpu.device);
 
-            let app = WebApp::new(gpu, controller, renderer, terrain_renderer, tex_manager, canvas.clone(), dpr);
+            // Init 3D Tiles: create Model3dRenderer and layer states.
+            let has_3d_layers = controller.engine.layers.iter()
+                .any(|l| matches!(l.config.kind, LayerKind::Tiles3d));
+            let model3d_renderer = if has_3d_layers {
+                Some(x_planets_core::model3d_renderer::Model3dRenderer::new(&gpu))
+            } else {
+                None
+            };
+
+            let tiles3d_states: Vec<Tiles3dWebState> = controller.engine.layers.iter()
+                .filter(|l| matches!(l.config.kind, LayerKind::Tiles3d))
+                .filter_map(|l| {
+                    let cfg = &l.config;
+                    let auth = if let (Some(token), Some(asset_id)) =
+                        (&cfg.cesium_ion_token, cfg.cesium_ion_asset_id)
+                    {
+                        Some(Tiles3dAuthKind::CesiumIon {
+                            account_token: token.clone(),
+                            asset_id,
+                        })
+                    } else if let Some(key) = &cfg.google_api_key {
+                        Some(Tiles3dAuthKind::Google { api_key: key.clone() })
+                    } else {
+                        log::warn!("[{}] 3D Tiles layer missing auth config, skipping", cfg.name);
+                        None
+                    };
+                    auth.map(|a| {
+                        Tiles3dWebState::new(cfg.name.clone(), a)
+                            .with_config(cfg.tiles3d_max_sse, cfg.tiles3d_tile_budget)
+                    })
+                })
+                .collect();
+
+            let app = WebApp::new(
+                gpu, controller, renderer, terrain_renderer, model3d_renderer,
+                tex_manager, canvas.clone(), dpr, tiles3d_states,
+            );
             let app = std::rc::Rc::new(std::cell::RefCell::new(app));
 
             // Input events
@@ -621,8 +660,26 @@ mod web_impl {
                         imagery_layer,
                     );
 
-                    if !name.is_empty() && !url.is_empty() {
+                    if !name.is_empty() {
                         let terrain_encoding_explicit = encoding_str.is_some();
+
+                        // 3D Tiles auth config
+                        let cesium_ion_token = js_sys::Reflect::get(&item, &"cesiumIonToken".into())
+                            .ok().and_then(|v| v.as_string());
+                        let cesium_ion_asset_id = js_sys::Reflect::get(&item, &"cesiumIonAsset".into())
+                            .ok().and_then(|v| v.as_f64()).map(|n| n as u64);
+                        let google_api_key = js_sys::Reflect::get(&item, &"googleApiKey".into())
+                            .ok().and_then(|v| v.as_string());
+                        let tiles3d_max_sse = js_sys::Reflect::get(&item, &"maxSSE".into())
+                            .ok().and_then(|v| v.as_f64());
+                        let tiles3d_tile_budget = js_sys::Reflect::get(&item, &"tileBudget".into())
+                            .ok().and_then(|v| v.as_f64()).map(|n| n as usize);
+
+                        // For 3D Tiles, URL is optional (resolved via auth endpoint)
+                        if url.is_empty() && !matches!(kind, LayerKind::Tiles3d) {
+                            continue;
+                        }
+
                         layer_configs.push(LayerConfig {
                             name,
                             tile_source_url: url,
@@ -630,6 +687,11 @@ mod web_impl {
                             opacity,
                             kind,
                             terrain_encoding_explicit,
+                            cesium_ion_token,
+                            cesium_ion_asset_id,
+                            google_api_key,
+                            tiles3d_max_sse,
+                            tiles3d_tile_budget,
                             ..Default::default()
                         });
                     }
