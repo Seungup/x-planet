@@ -117,6 +117,7 @@ impl NativeApp {
                     layer_name,
                     content_uri,
                     result,
+                    generation,
                 } => {
                     if let Some(ts3d) = self
                         .tiles3d_states
@@ -124,6 +125,18 @@ impl NativeApp {
                         .find(|s| s.name == layer_name)
                     {
                         ts3d.pending_uris.remove(&content_uri);
+
+                        // Skip stale loads: if the generation has moved on,
+                        // this tile may no longer be needed.
+                        if generation < ts3d.generation.saturating_sub(2) {
+                            ts3d.stale_loads_skipped += 1;
+                            log::debug!(
+                                "[{}] skipping stale load: {} (gen {} vs current {})",
+                                layer_name, content_uri, generation, ts3d.generation,
+                            );
+                            continue;
+                        }
+
                         match result {
                             Ok(decoded) => {
                                 log::debug!(
@@ -160,10 +173,16 @@ impl NativeApp {
     /// Traverse initialized 3D Tiles layers, spawn loads, and render.
     pub(super) fn tiles3d_traverse_and_render(&mut self, view: &wgpu::TextureView) {
         let engine = &self.controller.as_ref().unwrap().engine;
+        let show_stats = std::env::var("XPLANETS_STATS").as_deref() == Ok("1");
+
         for ts3d in &mut self.tiles3d_states {
             if !ts3d.is_initialized() {
                 continue;
             }
+
+            // Increment generation each traversal for stale request detection.
+            ts3d.generation += 1;
+            let current_generation = ts3d.generation;
 
             let tileset = ts3d.tileset.as_ref().unwrap();
             let camera =
@@ -172,8 +191,8 @@ impl NativeApp {
                 );
             let config =
                 x_planets_tiles::tiles3d::traversal::TraversalConfig {
-                    max_sse: 16.0,
-                    tile_budget: 256,
+                    max_sse: ts3d.max_sse,
+                    tile_budget: ts3d.tile_budget,
                     screen_height: engine.viewport.height as f64,
                     fov_y: x_planets_core::tiles3d_pipeline::traversal_fov_y(),
                 };
@@ -187,7 +206,7 @@ impl NativeApp {
                     &config,
                 );
 
-            // Spawn loads for missing tiles.
+            // Spawn loads for missing tiles (tagged with current generation).
             for req in &traversal.load_requests {
                 if ts3d.pending_uris.contains(&req.content_uri) {
                     continue;
@@ -224,13 +243,16 @@ impl NativeApp {
                         layer_name,
                         content_uri,
                         result,
+                        generation: current_generation,
                     });
                 });
             }
 
-            // Unload tiles no longer needed.
+            // Unload tiles no longer needed (track GPU memory).
             for uri in &traversal.unload_set {
-                ts3d.gpu_tiles.remove(uri);
+                if let Some(evicted) = ts3d.gpu_tiles.remove(uri) {
+                    ts3d.total_gpu_bytes = ts3d.total_gpu_bytes.saturating_sub(evicted.gpu_bytes);
+                }
                 ts3d.loaded_uris.remove(uri);
             }
 
@@ -258,6 +280,13 @@ impl NativeApp {
                         &models,
                     );
                 }
+            }
+
+            // Log stats if XPLANETS_STATS=1 is set.
+            if show_stats && ts3d.generation % 60 == 0 {
+                let mut stats = ts3d.stats();
+                stats.rendered_tiles = traversal.render_set.len();
+                log::info!("[{}] {}", ts3d.name, stats);
             }
         }
     }

@@ -299,12 +299,15 @@ fn read_indices_accessor(
 // Normal generation
 // ═══════════════════════════════════════════════════════════════════
 
-/// Generate flat (face) normals from positions and indices.
+/// Generate area-weighted smooth normals from positions and indices.
 ///
-/// Each triangle gets a uniform normal; vertices shared across triangles
-/// get the normal of the last triangle that references them.
+/// For each triangle, the unnormalized cross product (whose magnitude is
+/// proportional to the triangle area) is accumulated into each vertex.
+/// After all triangles are processed, the accumulated normals are normalized.
+/// This produces smooth shading at shared edges and naturally weights
+/// larger faces more heavily.
 fn generate_flat_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
-    let mut normals = vec![[0.0_f32; 3]; positions.len()];
+    let mut normals = vec![glam::Vec3::ZERO; positions.len()];
 
     for tri in indices.chunks(3) {
         if tri.len() < 3 {
@@ -322,22 +325,24 @@ fn generate_flat_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3
         let v1 = glam::Vec3::from(positions[i1]);
         let v2 = glam::Vec3::from(positions[i2]);
 
-        let edge1 = v1 - v0;
-        let edge2 = v2 - v0;
-        let normal = edge1.cross(edge2);
-        let len = normal.length();
-        let n = if len > 1e-8 {
-            (normal / len).to_array()
-        } else {
-            [0.0, 1.0, 0.0] // Degenerate triangle — use up vector.
-        };
-
-        normals[i0] = n;
-        normals[i1] = n;
-        normals[i2] = n;
+        // Unnormalized cross product — magnitude ∝ triangle area.
+        let face_normal = (v1 - v0).cross(v2 - v0);
+        normals[i0] += face_normal;
+        normals[i1] += face_normal;
+        normals[i2] += face_normal;
     }
 
     normals
+        .into_iter()
+        .map(|n| {
+            let len = n.length();
+            if len > 1e-8 {
+                (n / len).to_array()
+            } else {
+                [0.0, 1.0, 0.0] // Degenerate — fallback to up vector.
+            }
+        })
+        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════

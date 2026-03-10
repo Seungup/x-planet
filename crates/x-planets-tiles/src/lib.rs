@@ -9,7 +9,7 @@ pub mod loader;
 pub mod quantized_mesh;
 pub mod tiles3d;
 
-pub use cache::TileCache;
+pub use cache::{CacheStats, TileCache};
 pub use decoder::{
     DecodedRasterTile, DecodedTerrainTile, RasterTileDecoder, TerrainEncoding, TerrainRgbDecoder,
     TerrariumDecoder, TileDecoder,
