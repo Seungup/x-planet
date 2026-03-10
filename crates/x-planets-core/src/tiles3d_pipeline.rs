@@ -385,4 +385,188 @@ mod tests {
         let fov = traversal_fov_y();
         assert!((fov - 60.0_f64.to_radians()).abs() < 1e-10);
     }
+
+    /// End-to-end test: simulate the full 3D tiles transform chain for the
+    /// NYC "3D Buildings" preset (zoom 15, pitch 0, bearing 0) and verify
+    /// that clip-space positions are valid (not degenerate / NaN / converging).
+    #[test]
+    fn test_full_transform_chain_nyc_zoom15() {
+        // NYC Statue of Liberty area — matches "3D Buildings" preset
+        let mut vp = Viewport::new(1920, 1080);
+        vp.center = GeoCoord::new(40.6892, -74.0445);
+        vp.zoom = 15.0;
+        vp.pitch = 0.0;
+        vp.bearing = 0.0;
+
+        // Step 1: Build VP uniforms (camera at origin in relative-world space)
+        let (uniforms, camera_ecef) = build_tiles3d_uniforms(&vp);
+
+        // Camera should be above NYC in ECEF
+        assert!(camera_ecef.length() > 6_000_000.0, "camera should be near Earth surface");
+        assert!(camera_ecef.length() < 7_000_000.0, "camera should be near Earth surface");
+
+        // VP matrix should not contain NaN/Inf
+        for v in &uniforms.view_proj {
+            assert!(v.is_finite(), "VP contains non-finite: {v}");
+        }
+
+        // Step 2: Simulate a B3DM tile near camera position
+        // Typical RTC center: near camera in ECEF (within ~1km)
+        let rtc_center: [f64; 3] = [
+            camera_ecef.x - 100.0, // 100m west
+            camera_ecef.y + 50.0,  // 50m east
+            camera_ecef.z - 200.0, // 200m below camera altitude
+        ];
+
+        // No tile transform (identity) — common for leaf B3DM tiles
+        let tile_transform = DMat4::IDENTITY;
+
+        // Step 3: Build model matrix
+        let model_ecef = build_model_matrix(Some(rtc_center), tile_transform);
+
+        // Translation should be the RTC center
+        let t = model_ecef.col(3);
+        assert!((t.x - rtc_center[0]).abs() < 1e-6);
+        assert!((t.y - rtc_center[1]).abs() < 1e-6);
+        assert!((t.z - rtc_center[2]).abs() < 1e-6);
+
+        // Step 4: Convert to relative-world (f32)
+        let model_rel = ecef_to_relative_world(model_ecef, camera_ecef);
+
+        // Translation should be small (relative to camera)
+        let rel_t = model_rel.col(3);
+        assert!(
+            rel_t.x.abs() < 1000.0 && rel_t.y.abs() < 1000.0 && rel_t.z.abs() < 1000.0,
+            "relative translation too large: ({}, {}, {})",
+            rel_t.x, rel_t.y, rel_t.z
+        );
+
+        // Step 5: Transform a vertex through the full pipeline
+        // Simulate a building vertex: 10m above ground, relative to RTC center
+        let vertex = glam::Vec4::new(0.0, 0.0, 10.0, 1.0);
+
+        // model_rel * vertex → world position (relative to camera)
+        let world_pos = model_rel * vertex;
+        assert!(
+            world_pos.w.abs() > 0.5,
+            "world w should be ~1: {}",
+            world_pos.w
+        );
+
+        // VP * world_pos → clip position
+        let vp_mat = glam::Mat4::from_cols_array(&uniforms.view_proj);
+        let clip_pos = vp_mat * world_pos;
+
+        // clip_pos should be finite
+        assert!(clip_pos.x.is_finite(), "clip x non-finite");
+        assert!(clip_pos.y.is_finite(), "clip y non-finite");
+        assert!(clip_pos.z.is_finite(), "clip z non-finite");
+        assert!(clip_pos.w.is_finite(), "clip w non-finite");
+
+        // w should be positive (vertex is in front of camera)
+        assert!(
+            clip_pos.w > 0.0,
+            "clip w should be positive (in front of camera): {}",
+            clip_pos.w
+        );
+
+        // NDC coordinates should be reasonable (within visible range roughly)
+        let ndc_x = clip_pos.x / clip_pos.w;
+        let ndc_y = clip_pos.y / clip_pos.w;
+        let ndc_z = clip_pos.z / clip_pos.w;
+
+        // Building 100m away at zoom 15 should be within NDC range
+        assert!(
+            ndc_x.abs() < 100.0 && ndc_y.abs() < 100.0,
+            "NDC out of range: ({}, {})",
+            ndc_x, ndc_y
+        );
+        assert!(
+            ndc_z >= 0.0 && ndc_z <= 1.0,
+            "NDC z out of [0,1] range: {}",
+            ndc_z
+        );
+
+        // Step 6: Test with a non-identity tile transform that shifts along
+        // the local surface (realistic: child tile offset from parent).
+        // Use a small translation along the ENU east/north directions,
+        // which keeps the tile near the camera (in front, not behind).
+        let lat_rad = vp.center.lat.to_radians();
+        let lon_rad = vp.center.lon.to_radians();
+        let cos_lat = lat_rad.cos();
+        let sin_lon = lon_rad.sin();
+        let cos_lon = lon_rad.cos();
+        // ENU east direction at camera location (unit vector in ECEF)
+        let east = DVec3::new(-sin_lon, cos_lon, 0.0);
+        // Shift tile 50m east (still visible from camera overhead)
+        let shift = east * 50.0;
+        let tile_shift = DMat4::from_translation(shift);
+        let model_with_transform = build_model_matrix(Some(rtc_center), tile_shift);
+        let rel_transformed = ecef_to_relative_world(model_with_transform, camera_ecef);
+        let world_pos2 = rel_transformed * vertex;
+        let clip_pos2 = vp_mat * world_pos2;
+        assert!(
+            clip_pos2.w > 0.0,
+            "clip w with surface-aligned transform should be positive: {}",
+            clip_pos2.w
+        );
+    }
+
+    /// Verify that multiple nearby tiles produce DISTINCT clip-space positions
+    /// (not converging to a single point — the "radiating lines" bug).
+    #[test]
+    fn test_distinct_clip_positions_for_nearby_tiles() {
+        let mut vp = Viewport::new(1920, 1080);
+        vp.center = GeoCoord::new(40.6892, -74.0445);
+        vp.zoom = 15.0;
+        vp.pitch = 0.0;
+        vp.bearing = 0.0;
+
+        let (uniforms, camera_ecef) = build_tiles3d_uniforms(&vp);
+        let vp_mat = glam::Mat4::from_cols_array(&uniforms.view_proj);
+
+        // Create 4 tiles at different nearby RTC centers (100m apart)
+        let offsets = [
+            [0.0, 0.0, 0.0],
+            [100.0, 0.0, 0.0],
+            [0.0, 100.0, 0.0],
+            [100.0, 100.0, 0.0],
+        ];
+
+        let mut clip_positions = Vec::new();
+        for offset in &offsets {
+            let rtc = [
+                camera_ecef.x + offset[0],
+                camera_ecef.y + offset[1],
+                camera_ecef.z + offset[2] - 300.0, // on surface
+            ];
+            let model = build_model_matrix(Some(rtc), DMat4::IDENTITY);
+            let rel = ecef_to_relative_world(model, camera_ecef);
+
+            let vertex = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
+            let world = rel * vertex;
+            let clip = vp_mat * world;
+
+            assert!(clip.w > 0.0, "tile behind camera");
+
+            let ndc = glam::Vec2::new(clip.x / clip.w, clip.y / clip.w);
+            clip_positions.push(ndc);
+        }
+
+        // All 4 tiles should produce DIFFERENT NDC positions
+        for i in 0..clip_positions.len() {
+            for j in (i + 1)..clip_positions.len() {
+                let dist = (clip_positions[i] - clip_positions[j]).length();
+                assert!(
+                    dist > 1e-4,
+                    "tiles {} and {} converge to same point (dist={}): {:?} vs {:?}",
+                    i,
+                    j,
+                    dist,
+                    clip_positions[i],
+                    clip_positions[j]
+                );
+            }
+        }
+    }
 }
