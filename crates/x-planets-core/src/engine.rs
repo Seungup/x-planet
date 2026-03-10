@@ -62,6 +62,10 @@ pub struct LayerConfig {
     /// Whether the terrain encoding was explicitly set in config.
     /// When `false`, TileJSON auto-detection may override the encoding.
     pub terrain_encoding_explicit: bool,
+    /// Maximum screen-space error for 3D Tiles LOD (overrides default 16.0).
+    pub tiles3d_max_sse: Option<f64>,
+    /// Maximum tile budget for 3D Tiles (overrides default 256).
+    pub tiles3d_tile_budget: Option<usize>,
 }
 
 impl Default for LayerConfig {
@@ -79,6 +83,8 @@ impl Default for LayerConfig {
             cesium_ion_asset_id: None,
             google_api_key: None,
             terrain_encoding_explicit: false,
+            tiles3d_max_sse: None,
+            tiles3d_tile_budget: None,
         }
     }
 }

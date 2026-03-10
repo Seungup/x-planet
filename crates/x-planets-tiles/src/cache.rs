@@ -3,6 +3,40 @@
 use std::collections::HashMap;
 use x_planets_math::TileCoord;
 
+/// Cache statistics for observability.
+#[derive(Debug, Clone, Default)]
+pub struct CacheStats {
+    /// Number of cache hits since creation/reset.
+    pub hits: u64,
+    /// Number of cache misses since creation/reset.
+    pub misses: u64,
+    /// Current number of entries in the cache.
+    pub entries: usize,
+    /// Maximum number of entries allowed.
+    pub max_entries: usize,
+    /// Number of evictions since creation/reset.
+    pub evictions: u64,
+}
+
+impl CacheStats {
+    /// Hit rate as a percentage (0.0–100.0). Returns 0.0 if no lookups.
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 { 0.0 } else { (self.hits as f64 / total as f64) * 100.0 }
+    }
+}
+
+impl std::fmt::Display for CacheStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "entries={}/{} hits={} misses={} hit_rate={:.1}% evictions={}",
+            self.entries, self.max_entries, self.hits, self.misses,
+            self.hit_rate(), self.evictions,
+        )
+    }
+}
+
 /// In-memory LRU cache for decoded tiles.
 ///
 /// Tracks tiles by TileCoord with a maximum entry limit.
@@ -11,6 +45,9 @@ pub struct TileCache<T> {
     entries: HashMap<TileCoord, CacheEntry<T>>,
     max_entries: usize,
     access_counter: u64,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
 }
 
 struct CacheEntry<T> {
@@ -25,6 +62,9 @@ impl<T> TileCache<T> {
             entries: HashMap::with_capacity(max_entries),
             max_entries,
             access_counter: 0,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
         }
     }
 
@@ -32,10 +72,14 @@ impl<T> TileCache<T> {
     pub fn get(&mut self, coord: &TileCoord) -> Option<&T> {
         self.access_counter += 1;
         let counter = self.access_counter;
-        self.entries.get_mut(coord).map(|entry| {
+        if let Some(entry) = self.entries.get_mut(coord) {
             entry.last_access = counter;
-            &entry.value
-        })
+            self.hits += 1;
+            Some(&entry.value)
+        } else {
+            self.misses += 1;
+            None
+        }
     }
 
     /// Peek at a cached tile **without** updating its access time.
@@ -104,6 +148,18 @@ impl<T> TileCache<T> {
             .min_by_key(|(_, entry)| entry.last_access)
         {
             self.entries.remove(&lru_key);
+            self.evictions += 1;
+        }
+    }
+
+    /// Get current cache statistics for observability.
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits,
+            misses: self.misses,
+            entries: self.entries.len(),
+            max_entries: self.max_entries,
+            evictions: self.evictions,
         }
     }
 }

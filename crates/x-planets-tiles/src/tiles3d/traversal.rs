@@ -192,14 +192,13 @@ fn traverse_tile(
     };
 
     // ── Resolve bounding volume in world space ──
+    // Use the accumulated tile_transform (parent × local), not just the
+    // tile's own transform, so that parent translations/rotations are
+    // correctly applied to children's bounding volumes.
     let bv_kind = match tile.bounding_volume.to_kind() {
         Some(kind) => {
-            if tile.transform.is_some() {
-                if let Some(t) = &tile.transform {
-                    transform_volume(&kind, t)
-                } else {
-                    kind
-                }
+            if tile_transform != DMat4::IDENTITY {
+                transform_volume(&kind, &tile_transform.to_cols_array())
             } else {
                 kind
             }
@@ -687,5 +686,119 @@ mod tests {
 
         // Leaf should render even with huge SSE.
         assert_eq!(result.render_set.len(), 1);
+    }
+
+    #[test]
+    fn test_zero_geometric_error_never_refines() {
+        let json = r#"{
+            "asset": { "version": "1.1" },
+            "geometricError": 0.0,
+            "root": {
+                "boundingVolume": {
+                    "sphere": [6378137.0, 0.0, 0.0, 10000.0]
+                },
+                "geometricError": 0.0,
+                "refine": "REPLACE",
+                "content": { "uri": "root.glb" },
+                "children": [
+                    {
+                        "boundingVolume": {
+                            "sphere": [6378137.0, 0.0, 0.0, 5000.0]
+                        },
+                        "geometricError": 0.0,
+                        "content": { "uri": "child.glb" }
+                    }
+                ]
+            }
+        }"#;
+        let tileset = parse_tileset(json.as_bytes()).unwrap();
+        let camera = make_camera_at_origin();
+        let config = TraversalConfig {
+            max_sse: 0.0,
+            ..make_config()
+        };
+        let loaded = HashSet::from([
+            "https://example.com/root.glb".to_string(),
+            "https://example.com/child.glb".to_string(),
+        ]);
+
+        let result = traverse_tileset(
+            &tileset,
+            "https://example.com/tileset.json",
+            &camera,
+            &loaded,
+            &config,
+        );
+
+        // With geometric_error=0, SSE is 0, which is <= max_sse=0, so no refinement.
+        let uris: HashSet<&str> = result.render_set.iter().map(|t| t.content_uri.as_str()).collect();
+        assert!(uris.contains("https://example.com/root.glb"));
+    }
+
+    #[test]
+    fn test_tile_with_transform_inherits_parent() {
+        let json = r#"{
+            "asset": { "version": "1.1" },
+            "geometricError": 500.0,
+            "root": {
+                "boundingVolume": {
+                    "sphere": [6378137.0, 0.0, 0.0, 10000.0]
+                },
+                "geometricError": 200.0,
+                "refine": "REPLACE",
+                "transform": [
+                    1, 0, 0, 0,
+                    0, 1, 0, 0,
+                    0, 0, 1, 0,
+                    100, 0, 0, 1
+                ],
+                "content": { "uri": "root.glb" },
+                "children": [
+                    {
+                        "boundingVolume": {
+                            "sphere": [6378137.0, 0.0, 0.0, 5000.0]
+                        },
+                        "geometricError": 50.0,
+                        "content": { "uri": "child.glb" }
+                    }
+                ]
+            }
+        }"#;
+        let tileset = parse_tileset(json.as_bytes()).unwrap();
+        let camera = make_camera_at_origin();
+        let config = TraversalConfig {
+            max_sse: 0.001,
+            ..make_config()
+        };
+        let loaded = HashSet::from([
+            "https://example.com/root.glb".to_string(),
+            "https://example.com/child.glb".to_string(),
+        ]);
+
+        let result = traverse_tileset(
+            &tileset,
+            "https://example.com/tileset.json",
+            &camera,
+            &loaded,
+            &config,
+        );
+
+        // Child should inherit root's transform.
+        let child_tile = result.render_set.iter()
+            .find(|t| t.content_uri == "https://example.com/child.glb");
+        assert!(child_tile.is_some(), "child tile should be in render set");
+        // The child should have the parent's transform applied.
+        let t = child_tile.unwrap().transform;
+        // Column-major: m[3][0] should be 100 (translation X from parent).
+        assert!((t.col(3).x - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_traversal_config_default() {
+        let config = TraversalConfig::default();
+        assert_eq!(config.max_sse, 16.0);
+        assert_eq!(config.tile_budget, 256);
+        assert_eq!(config.screen_height, 1080.0);
+        assert!((config.fov_y - 60.0_f64.to_radians()).abs() < 1e-10);
     }
 }

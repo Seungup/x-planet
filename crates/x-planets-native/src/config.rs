@@ -149,6 +149,11 @@ pub struct LayerSection {
     pub cesium_ion_token: Option<String>,
     pub cesium_ion_asset: Option<u64>,
     pub google_api_key: Option<String>,
+    /// Maximum screen-space error for 3D Tiles LOD traversal.
+    /// Lower values = higher quality, more tiles. Default: 16.0.
+    pub max_sse: Option<f64>,
+    /// Maximum tiles to render per frame for 3D Tiles. Default: 256.
+    pub tiles3d_tile_budget: Option<usize>,
 }
 
 fn default_kind_str() -> String {
@@ -318,6 +323,8 @@ fn convert_layer(section: LayerSection, index: usize) -> Result<LayerConfig, Str
         cesium_ion_asset_id: section.cesium_ion_asset,
         google_api_key,
         terrain_encoding_explicit: section.terrain_encoding.is_some(),
+        tiles3d_max_sse: section.max_sse,
+        tiles3d_tile_budget: section.tiles3d_tile_budget,
     })
 }
 

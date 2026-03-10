@@ -161,6 +161,7 @@ pub(super) fn init_tiles3d_states(engine: &MapEngine) -> Vec<Tiles3dLayerState> 
                 }
             };
             Tiles3dLayerState::new(cfg.name.clone(), auth)
+                .with_config(cfg.tiles3d_max_sse, cfg.tiles3d_tile_budget, cfg.max_concurrent_loads)
         })
         .collect()
 }
