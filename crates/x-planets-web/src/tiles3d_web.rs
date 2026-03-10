@@ -12,7 +12,7 @@ use wasm_bindgen_futures::JsFuture;
 
 use x_planets_core::model3d_renderer::{GpuModel3d, Model3dRenderer, Model3dVertex};
 use x_planets_gpu::GpuContext;
-use x_planets_tiles::tiles3d::decoder::{decode_3d_tile, Decoded3dTile};
+use x_planets_tiles::tiles3d::decoder::{decode_3d_tile, Decoded3dTile, Tiles3dContent};
 use x_planets_tiles::tiles3d::tileset::Tileset;
 use x_planets_tiles::tiles3d::traversal::{
     TraversalCamera, TraversalConfig, TraversalTile, traverse_tileset,
@@ -48,6 +48,12 @@ enum Tiles3dMsg {
     ContentLoaded {
         content_uri: String,
         decoded: Decoded3dTile,
+        generation: u64,
+    },
+    ExternalTilesetLoaded {
+        content_uri: String,
+        tileset: Tileset,
+        base_url: String,
         generation: u64,
     },
     ContentFailed {
@@ -201,9 +207,17 @@ impl Tiles3dWebState {
                     self.pending_uris.remove(&content_uri);
                     if generation < self.generation.saturating_sub(2) {
                         self.stale_loads_skipped += 1;
-                        return;
+                        continue;
                     }
                     self.upload_decoded_tile(gpu, renderer, &content_uri, &decoded);
+                }
+                Tiles3dMsg::ExternalTilesetLoaded { content_uri, tileset, base_url, generation } => {
+                    self.pending_uris.remove(&content_uri);
+                    if generation < self.generation.saturating_sub(2) {
+                        self.stale_loads_skipped += 1;
+                        continue;
+                    }
+                    self.splice_external_tileset(&content_uri, &tileset, &base_url);
                 }
                 Tiles3dMsg::ContentFailed { content_uri, error } => {
                     self.pending_uris.remove(&content_uri);
@@ -258,9 +272,14 @@ impl Tiles3dWebState {
                 match fetch_tile_bytes(&content_uri, access_token.as_deref()).await {
                     Ok(bytes) => {
                         match decode_3d_tile(&bytes, &content_uri) {
-                            Ok(decoded) => {
+                            Ok(Tiles3dContent::Mesh(decoded)) => {
                                 queue.borrow_mut().push(Tiles3dMsg::ContentLoaded {
                                     content_uri, decoded, generation: current_gen,
+                                });
+                            }
+                            Ok(Tiles3dContent::ExternalTileset { tileset, base_url, content_uri }) => {
+                                queue.borrow_mut().push(Tiles3dMsg::ExternalTilesetLoaded {
+                                    content_uri, tileset, base_url, generation: current_gen,
                                 });
                             }
                             Err(e) => {
@@ -369,6 +388,39 @@ impl Tiles3dWebState {
                 }
             } else {
                 break;
+            }
+        }
+    }
+
+    // ── External tileset splicing ──
+
+    fn splice_external_tileset(
+        &mut self,
+        content_uri: &str,
+        external: &x_planets_tiles::tiles3d::tileset::Tileset,
+        new_base_url: &str,
+    ) {
+        if let Some(tileset) = &mut self.tileset {
+            let spliced = x_planets_tiles::tiles3d::tileset::splice_external_tileset(
+                &mut tileset.root,
+                &self.base_url,
+                content_uri,
+                external,
+                new_base_url,
+            );
+            if spliced {
+                // Mark as "loaded" so traversal doesn't re-request the .json URI.
+                self.loaded_uris.insert(content_uri.to_string());
+                let new_count = x_planets_tiles::tiles3d::tileset::tile_count(&tileset.root);
+                log::info!(
+                    "[{}] spliced external tileset from {} (tree now {} tiles)",
+                    self.name, content_uri, new_count,
+                );
+            } else {
+                log::warn!(
+                    "[{}] failed to splice external tileset: {} not found in tree",
+                    self.name, content_uri,
+                );
             }
         }
     }

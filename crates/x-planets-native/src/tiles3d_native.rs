@@ -154,6 +154,14 @@ pub enum Tiles3dMessage {
         /// Generation at which this load was requested.
         generation: u64,
     },
+    /// An external tileset JSON was loaded and needs to be spliced into the tree.
+    ExternalTilesetLoaded {
+        layer_name: String,
+        content_uri: String,
+        tileset: Tileset,
+        base_url: String,
+        generation: u64,
+    },
 }
 
 /// Runtime statistics for a 3D Tiles layer (for DX/debugging).

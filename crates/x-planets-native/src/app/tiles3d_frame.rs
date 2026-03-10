@@ -126,8 +126,6 @@ impl NativeApp {
                     {
                         ts3d.pending_uris.remove(&content_uri);
 
-                        // Skip stale loads: if the generation has moved on,
-                        // this tile may no longer be needed.
                         if generation < ts3d.generation.saturating_sub(2) {
                             ts3d.stale_loads_skipped += 1;
                             log::debug!(
@@ -161,6 +159,53 @@ impl NativeApp {
                                     layer_name,
                                     content_uri,
                                     e
+                                );
+                            }
+                        }
+                    }
+                }
+                Tiles3dMessage::ExternalTilesetLoaded {
+                    layer_name,
+                    content_uri,
+                    tileset,
+                    base_url,
+                    generation,
+                } => {
+                    if let Some(ts3d) = self
+                        .tiles3d_states
+                        .iter_mut()
+                        .find(|s| s.name == layer_name)
+                    {
+                        ts3d.pending_uris.remove(&content_uri);
+
+                        if generation < ts3d.generation.saturating_sub(2) {
+                            ts3d.stale_loads_skipped += 1;
+                            continue;
+                        }
+
+                        if let Some(main_tileset) = &mut ts3d.tileset {
+                            let spliced =
+                                x_planets_tiles::tiles3d::tileset::splice_external_tileset(
+                                    &mut main_tileset.root,
+                                    &ts3d.base_url,
+                                    &content_uri,
+                                    &tileset,
+                                    &base_url,
+                                );
+                            if spliced {
+                                ts3d.loaded_uris.insert(content_uri.clone());
+                                let new_count =
+                                    x_planets_tiles::tiles3d::tileset::tile_count(
+                                        &main_tileset.root,
+                                    );
+                                log::info!(
+                                    "[{}] spliced external tileset from {} (tree now {} tiles)",
+                                    layer_name, content_uri, new_count,
+                                );
+                            } else {
+                                log::warn!(
+                                    "[{}] failed to splice external tileset: {} not found in tree",
+                                    layer_name, content_uri,
                                 );
                             }
                         }
@@ -229,22 +274,50 @@ impl NativeApp {
                         access_token.as_deref(),
                     )
                     .await;
-                    let result = match fetch_result {
+                    match fetch_result {
                         Ok(bytes) => {
-                            x_planets_tiles::tiles3d::decoder::decode_3d_tile(
+                            match x_planets_tiles::tiles3d::decoder::decode_3d_tile(
                                 &bytes,
                                 &content_uri,
-                            )
-                            .map_err(|e| e.to_string())
+                            ) {
+                                Ok(x_planets_tiles::tiles3d::decoder::Tiles3dContent::Mesh(decoded)) => {
+                                    let _ = tx.send(Tiles3dMessage::ContentLoaded {
+                                        layer_name,
+                                        content_uri,
+                                        result: Ok(decoded),
+                                        generation: current_generation,
+                                    });
+                                }
+                                Ok(x_planets_tiles::tiles3d::decoder::Tiles3dContent::ExternalTileset {
+                                    tileset, base_url, content_uri,
+                                }) => {
+                                    let _ = tx.send(Tiles3dMessage::ExternalTilesetLoaded {
+                                        layer_name,
+                                        content_uri,
+                                        tileset,
+                                        base_url,
+                                        generation: current_generation,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Tiles3dMessage::ContentLoaded {
+                                        layer_name,
+                                        content_uri,
+                                        result: Err(e.to_string()),
+                                        generation: current_generation,
+                                    });
+                                }
+                            }
                         }
-                        Err(e) => Err(e),
-                    };
-                    let _ = tx.send(Tiles3dMessage::ContentLoaded {
-                        layer_name,
-                        content_uri,
-                        result,
-                        generation: current_generation,
-                    });
+                        Err(e) => {
+                            let _ = tx.send(Tiles3dMessage::ContentLoaded {
+                                layer_name,
+                                content_uri,
+                                result: Err(e),
+                                generation: current_generation,
+                            });
+                        }
+                    }
                 });
             }
 
