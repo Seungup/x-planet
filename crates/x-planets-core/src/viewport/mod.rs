@@ -1426,4 +1426,106 @@ mod tests {
             );
         }
     }
+
+    /// Diagnostic: zoom in at high zoom then apply pitch — tiles must not vanish.
+    #[test]
+    fn test_high_zoom_then_pitch_tiles_not_empty() {
+        for zoom in [10.0, 13.0, 15.0, 17.0] {
+            for pitch in [0.0, 30.0, 45.0, 60.0] {
+                let mut vp = Viewport::new(1920, 1080);
+                vp.center = GeoCoord::new(37.5665, 126.978); // Seoul
+                vp.zoom = zoom;
+                vp.pitch = pitch;
+                let tiles =
+                    vp.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+                assert!(
+                    !tiles.is_empty(),
+                    "No tiles at zoom={zoom} pitch={pitch}! Tile selection is broken.",
+                );
+                // Center tile must be present at base zoom
+                let center_merc = x_planets_math::geo_to_mercator(&vp.center);
+                let base_z = vp.tile_zoom();
+                let n = (1u32 << base_z) as f64;
+                let center_tx = (center_merc.x * n).floor() as u32;
+                let center_ty = (center_merc.y * n).floor() as u32;
+                // Accept center tile at base_z OR one zoom level lower (LOD)
+                let has_center_or_parent = tiles.iter().any(|t| {
+                    if t.coord.z == base_z {
+                        t.coord.x == center_tx && t.coord.y == center_ty
+                    } else if t.coord.z == base_z.saturating_sub(1) {
+                        let pn = (1u32 << t.coord.z) as f64;
+                        let px = (center_merc.x * pn).floor() as u32;
+                        let py = (center_merc.y * pn).floor() as u32;
+                        t.coord.x == px && t.coord.y == py
+                    } else {
+                        false
+                    }
+                });
+                // Count tiles by zoom
+                let mut zoom_counts = std::collections::BTreeMap::new();
+                for t in &tiles {
+                    *zoom_counts.entry(t.coord.z).or_insert(0u32) += 1;
+                }
+                if !has_center_or_parent {
+                    // Find z=10 tiles nearest to center
+                    let mut z10_tiles: Vec<_> = tiles.iter()
+                        .filter(|t| t.coord.z == base_z)
+                        .map(|t| {
+                            let tn = (1u32 << t.coord.z) as f64;
+                            let tx = (t.coord.x as f64 + 0.5) / tn;
+                            let ty = (t.coord.y as f64 + 0.5) / tn;
+                            let dist = ((tx - center_merc.x).powi(2) + (ty - center_merc.y).powi(2)).sqrt();
+                            (t.coord.x, t.coord.y, t.display_x, dist)
+                        })
+                        .collect();
+                    z10_tiles.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap());
+                    let nearest_5: Vec<_> = z10_tiles.iter().take(5).collect();
+                    panic!(
+                        "Center tile area missing at zoom={zoom} pitch={pitch}! \
+                         center_merc=({:.4},{:.4}), base_z={base_z}, expected tile ({center_tx},{center_ty}). \
+                         Got {} tiles, zoom distribution: {:?}. \
+                         Nearest z={base_z} tiles to center: {:?}",
+                        center_merc.x, center_merc.y, tiles.len(), zoom_counts, nearest_5,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Diagnostic: verify VP matrix projects center tile to visible clip space.
+    #[test]
+    fn test_vp_projects_center_tile_visible() {
+        for zoom in [10.0, 15.0] {
+            for pitch in [0.0, 30.0, 45.0, 60.0] {
+                let mut vp = Viewport::new(1920, 1080);
+                vp.center = GeoCoord::new(37.5665, 126.978);
+                vp.zoom = zoom;
+                vp.pitch = pitch;
+
+                let vp_mat = vp.to_view_proj_f64_projected(
+                    x_planets_math::ProjectionMode::Mercator,
+                );
+
+                // The center should project near (0.5, 0.5) in oblique Mercator
+                // which is the camera target.  Check that it lands in clip space.
+                let center_pos = glam::DVec4::new(0.5, 0.5, 0.0, 1.0);
+                let clip = vp_mat * center_pos;
+                let ndc_x = clip.x / clip.w;
+                let ndc_y = clip.y / clip.w;
+                let ndc_z = clip.z / clip.w;
+                assert!(
+                    ndc_x.abs() < 2.0 && ndc_y.abs() < 2.0,
+                    "Center (0.5,0.5) projects outside NDC at zoom={zoom} pitch={pitch}: \
+                     ndc=({ndc_x:.4}, {ndc_y:.4}, {ndc_z:.4}) clip_w={:.6}",
+                    clip.w,
+                );
+                assert!(
+                    ndc_z >= 0.0 && ndc_z <= 1.0,
+                    "Center (0.5,0.5) depth outside [0,1] at zoom={zoom} pitch={pitch}: \
+                     ndc_z={ndc_z:.6}, near/far clipping issue. clip_z={:.6}, clip_w={:.6}",
+                    clip.z, clip.w,
+                );
+            }
+        }
+    }
 }
