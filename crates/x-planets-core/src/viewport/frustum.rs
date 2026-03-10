@@ -21,7 +21,7 @@ impl super::Viewport {
     pub(super) fn compute_frustum_geometry(&self) -> (BoundingBox, Option<ConvexPolygon2D>, glam::DVec2, glam::DVec2) {
         let center_merc = geo_to_mercator(&self.center);
         let scale = 2.0_f64.powf(-self.zoom);
-        let aspect = self.width as f64 / self.height as f64;
+        let aspect = self.width as f64 / self.height.max(1) as f64;
 
         // Fast path: nearly top-down, nearly north-up.
         if self.pitch < 1.0 && self.bearing.abs() < 1.0 {

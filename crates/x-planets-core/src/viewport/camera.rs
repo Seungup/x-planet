@@ -35,14 +35,14 @@ impl CameraController {
     /// Rotates the delta by the current bearing so panning always follows the screen.
     pub fn pan(&self, viewport: &mut super::Viewport, dx: f64, dy: f64) {
         let scale = 2.0_f64.powf(-viewport.zoom);
-        let aspect = viewport.width as f64 / viewport.height as f64;
+        let aspect = viewport.width as f64 / viewport.height.max(1) as f64;
 
         let bearing_rad = viewport.bearing.to_radians();
         let sin_b = bearing_rad.sin();
         let cos_b = bearing_rad.cos();
 
-        let dx_n = dx / viewport.width as f64 * scale * aspect * self.pan_speed;
-        let dy_n = dy / viewport.height as f64 * scale * self.pan_speed;
+        let dx_n = dx / viewport.width.max(1) as f64 * scale * aspect * self.pan_speed;
+        let dy_n = dy / viewport.height.max(1) as f64 * scale * self.pan_speed;
 
         let merc_dx = -(cos_b * dx_n + sin_b * dy_n);
         let merc_dy = -(sin_b * dx_n - cos_b * dy_n);
@@ -125,10 +125,10 @@ impl CameraController {
             return;
         }
 
-        let aspect = viewport.width as f64 / viewport.height as f64;
+        let aspect = viewport.width as f64 / viewport.height.max(1) as f64;
 
-        let dx_norm = (screen_x - viewport.width as f64 * 0.5) / viewport.width as f64;
-        let dy_norm = (screen_y - viewport.height as f64 * 0.5) / viewport.height as f64;
+        let dx_norm = (screen_x - viewport.width as f64 * 0.5) / viewport.width.max(1) as f64;
+        let dy_norm = (screen_y - viewport.height as f64 * 0.5) / viewport.height.max(1) as f64;
 
         let bearing_rad = viewport.bearing.to_radians();
         let sin_b = bearing_rad.sin();
@@ -149,7 +149,7 @@ impl CameraController {
         let visible_half = globe_visible_half_angle(unit_altitude);
         let visible_deg = visible_half.to_degrees() * 2.0;
 
-        let deg_per_px = visible_deg / viewport.height as f64;
+        let deg_per_px = visible_deg / viewport.height.max(1) as f64;
 
         let bearing_rad = viewport.bearing.to_radians();
         let sin_b = bearing_rad.sin();
@@ -178,8 +178,8 @@ impl CameraController {
         let unit_altitude = super::globe_unit_altitude(viewport.zoom, &viewport.body);
         let half_angle_old = globe_visible_half_angle(unit_altitude).to_degrees();
 
-        let dx_norm = (screen_x - viewport.width as f64 * 0.5) / viewport.height as f64;
-        let dy_norm = (screen_y - viewport.height as f64 * 0.5) / viewport.height as f64;
+        let dx_norm = (screen_x - viewport.width as f64 * 0.5) / viewport.width.max(1) as f64;
+        let dy_norm = (screen_y - viewport.height as f64 * 0.5) / viewport.height.max(1) as f64;
 
         let bearing_rad = viewport.bearing.to_radians();
         let sin_b = bearing_rad.sin();
@@ -213,7 +213,7 @@ impl CameraController {
         let edge_y = (0.5 + scale * 0.5).min(0.9999);
         let edge_geo = mercator_to_geo(glam::DVec2::new(0.5, edge_y));
         let visible_deg = edge_geo.lat.abs() * 2.0;
-        let deg_per_px = visible_deg / viewport.height as f64;
+        let deg_per_px = visible_deg / viewport.height.max(1) as f64;
 
         let bearing_rad = viewport.bearing.to_radians();
         let sin_b = bearing_rad.sin();
