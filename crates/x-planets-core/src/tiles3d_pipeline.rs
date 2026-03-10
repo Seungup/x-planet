@@ -282,6 +282,7 @@ mod tests {
     use super::*;
     use x_planets_math::GeoCoord;
 
+    #[allow(dead_code)]
     fn make_viewport() -> Viewport {
         let mut vp = Viewport::new(1920, 1080);
         vp.center = GeoCoord::new(37.5665, 126.978);
@@ -493,7 +494,7 @@ mod tests {
         // which keeps the tile near the camera (in front, not behind).
         let lat_rad = vp.center.lat.to_radians();
         let lon_rad = vp.center.lon.to_radians();
-        let cos_lat = lat_rad.cos();
+        let _cos_lat = lat_rad.cos();
         let sin_lon = lon_rad.sin();
         let cos_lon = lon_rad.cos();
         // ENU east direction at camera location (unit vector in ECEF)

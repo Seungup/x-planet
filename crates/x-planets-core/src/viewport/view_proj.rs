@@ -22,7 +22,7 @@ impl super::Viewport {
         let center = glam::DVec2::new(0.5, 0.5);
         let center_merc = center;
         let scale = 2.0_f64.powf(self.zoom);
-        let aspect = self.width as f64 / self.height as f64;
+        let aspect = self.width as f64 / self.height.max(1) as f64;
         let cx = center_merc.x;
         let cy = center_merc.y;
 
@@ -132,7 +132,7 @@ impl super::Viewport {
     pub fn to_uniforms(&self) -> ViewportUniforms {
         let center_merc = geo_to_mercator(&self.center);
         let scale = 2.0_f64.powf(self.zoom) as f32;
-        let aspect = self.width as f32 / self.height as f32;
+        let aspect = self.width as f32 / self.height.max(1) as f32;
         let cx = center_merc.x as f32;
         let cy = center_merc.y as f32;
 
@@ -192,8 +192,8 @@ impl super::Viewport {
             resolution: [
                 self.width as f32,
                 self.height as f32,
-                1.0 / self.width as f32,
-                1.0 / self.height as f32,
+                1.0 / self.width.max(1) as f32,
+                1.0 / self.height.max(1) as f32,
             ],
             camera: [cx, cy, self.zoom as f32, self.pitch as f32],
             clip_sphere: [

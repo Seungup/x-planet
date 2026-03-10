@@ -34,7 +34,7 @@ impl super::Viewport {
     /// Centered-Mercator visible tile selection.
     fn visible_tiles_centered(&self) -> Vec<VisibleTile> {
         let scale = 2.0_f64.powf(-self.zoom);
-        let aspect = self.width as f64 / self.height as f64;
+        let aspect = self.width as f64 / self.height.max(1) as f64;
 
         let half_h = scale * 1.1;
         let half_w = scale * aspect * 1.1;
