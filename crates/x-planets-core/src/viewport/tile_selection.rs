@@ -340,14 +340,25 @@ impl super::Viewport {
         let mut result = Vec::<VisibleTile>::new();
 
         let use_angular = mode != TileLodMode::Flat;
+        // Shader clips at 85° from the viewport center.  We add a margin
+        // based on the tile's angular half-size so coarse tiles that partially
+        // overlap the visible cap are not discarded.  At zoom z, each tile
+        // spans roughly 180°/2^z in latitude.
+        let clip_angle_deg = 85.0_f64;
+
+        // Haversine angular distance (radians) from viewport center to a Mercator point.
+        let angular_dist_rad = |tc: glam::DVec2| -> f64 {
+            let g = mercator_to_geo(tc);
+            let dlat = g.lat.to_radians() - center_lat_rad;
+            let dlon = g.lon.to_radians() - center_lon_rad;
+            let a = (dlat * 0.5).sin().powi(2)
+                + cos_center_lat * g.lat.to_radians().cos() * (dlon * 0.5).sin().powi(2);
+            2.0 * a.sqrt().asin()
+        };
+
         let tile_priority = |tc: glam::DVec2| -> f64 {
             if use_angular {
-                let g = mercator_to_geo(tc);
-                let dlat = g.lat.to_radians() - center_lat_rad;
-                let dlon = g.lon.to_radians() - center_lon_rad;
-                let a = (dlat * 0.5).sin().powi(2)
-                    + cos_center_lat * g.lat.to_radians().cos() * (dlon * 0.5).sin().powi(2);
-                let theta = 2.0 * a.sqrt().asin();
+                let theta = angular_dist_rad(tc);
                 1.0 / (theta + 1e-10)
             } else {
                 let dist = (tc - center_merc).length();
@@ -355,9 +366,23 @@ impl super::Viewport {
             }
         };
 
+        // Check if a tile at the given zoom is beyond the clip sphere.
+        // Accounts for the tile's angular half-size as margin.
+        let is_beyond_clip = |tc: glam::DVec2, zoom: u8| -> bool {
+            if !use_angular {
+                return false;
+            }
+            let tile_half_deg = 180.0 / (1u64 << zoom) as f64;
+            let threshold_rad = (clip_angle_deg + tile_half_deg).to_radians();
+            angular_dist_rad(tc) > threshold_rad
+        };
+
         let seed_z = if mode != TileLodMode::Flat { 0 } else { min_z };
         for vt in frustum.visible_tiles(seed_z) {
             let tc = vt.display_mercator_center();
+            if is_beyond_clip(tc, vt.coord.z) {
+                continue;
+            }
             heap.push(Candidate {
                 tile: vt,
                 priority: tile_priority(tc),
@@ -400,6 +425,9 @@ impl super::Viewport {
                 for child in vt.children() {
                     if frustum.is_visible_tile(&child) {
                         let cc = child.display_mercator_center();
+                        if is_beyond_clip(cc, child.coord.z) {
+                            continue;
+                        }
                         heap.push(Candidate {
                             tile: child,
                             priority: tile_priority(cc),

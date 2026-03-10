@@ -283,13 +283,37 @@ fn traverse_tile(
                             });
                         }
                     }
-                    // Request missing children.
+                    // Request missing children with per-child SSE priority.
                     for child in &tile.children {
                         if let Some(child_uri) = resolve_content_uri(base_url, child) {
                             if !loaded_uris.contains(&child_uri) {
+                                // Compute child's own SSE for more accurate prioritization.
+                                let child_transform = if let Some(t) = &child.transform {
+                                    tile_transform * DMat4::from_cols_array(t)
+                                } else {
+                                    tile_transform
+                                };
+                                let child_priority = child
+                                    .bounding_volume
+                                    .to_kind()
+                                    .map(|bv| {
+                                        let bv = if child_transform != DMat4::IDENTITY {
+                                            transform_volume(&bv, &child_transform.to_cols_array())
+                                        } else {
+                                            bv
+                                        };
+                                        let d = distance_to_volume(camera.position_ecef, &bv);
+                                        screen_space_error(
+                                            child.geometric_error,
+                                            d,
+                                            config.screen_height,
+                                            config.fov_y,
+                                        )
+                                    })
+                                    .unwrap_or(sse); // Fall back to parent SSE if no bounding volume.
                                 result.load_requests.push(LoadRequest3d {
                                     content_uri: child_uri,
-                                    priority: sse, // Parent's SSE as priority.
+                                    priority: child_priority,
                                 });
                             }
                         }
