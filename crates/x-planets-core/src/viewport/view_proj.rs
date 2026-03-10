@@ -48,17 +48,25 @@ impl super::Viewport {
         let view = glam::DMat4::look_at_rh(eye, target, up);
         // Adaptive near/far: tighten the ratio to preserve depth-buffer
         // precision, but extend far plane for pitched views.
-        let pitch_rad = self.pitch.to_radians();
-        let far_mult = if pitch_rad > 0.01 {
-            // At high pitch, distant tiles are much farther than cam_h.
-            // tan(pitch) gives the horizontal reach; camera→ground distance
-            // is sqrt(cam_h² + reach²).  Use a generous multiplier.
-            4.0 + 8.0 * pitch_rad.sin()
+        //
+        // At high pitch the visible ground extends much further from the
+        // camera.  Compute the geometric distance to the far ground point
+        // and use that as the basis for the far plane.  Also push near
+        // forward proportionally so the far/near ratio stays under ~80,
+        // avoiding depth-buffer precision loss and z-fighting.
+        let sin_p = pitch_rad.sin();
+        let cos_p = pitch_rad.cos();
+        let far_ground = if sin_p > 0.01 {
+            // Horizontal reach on the ground from the camera eye
+            let reach = cam_h * sin_p;
+            let eye_z = cam_h * cos_p;
+            // Distance from eye to the far ground point
+            (eye_z * eye_z + reach * reach * 4.0).sqrt() * 2.5
         } else {
-            4.0
+            cam_h * 4.0
         };
-        let near = cam_h * 0.1;
-        let far = cam_h * far_mult;
+        let near = cam_h * cos_p.max(0.5) * 0.15;
+        let far = far_ground.max(cam_h * 4.0);
         let proj = glam::DMat4::perspective_rh(fov_y, aspect, near, far);
 
         let flip_x = glam::DMat4::from_diagonal(glam::DVec4::new(-1.0, 1.0, 1.0, 1.0));
@@ -159,13 +167,17 @@ impl super::Viewport {
         let target = glam::Vec3::new(cx, cy, 0.0);
 
         let view = glam::Mat4::look_at_rh(eye, target, up);
-        let far_mult = if pitch_rad > 0.01 {
-            4.0 + 8.0 * pitch_rad.sin()
+        let sin_p = pitch_rad.sin();
+        let cos_p = pitch_rad.cos();
+        let far_ground = if sin_p > 0.01 {
+            let reach = cam_h * sin_p;
+            let eye_z = cam_h * cos_p;
+            (eye_z * eye_z + reach * reach * 4.0).sqrt() * 2.5
         } else {
-            4.0
+            cam_h * 4.0
         };
-        let near = cam_h * 0.1;
-        let far = cam_h * far_mult;
+        let near = cam_h * cos_p.max(0.5) * 0.15;
+        let far = far_ground.max(cam_h * 4.0);
         let proj = glam::Mat4::perspective_rh(fov_y, aspect, near, far);
 
         // look_at_rh with up=(sin_b,-cos_b,0) makes camera_right = world(-cos_b,-sin_b,0),

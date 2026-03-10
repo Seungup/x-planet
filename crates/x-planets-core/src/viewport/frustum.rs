@@ -81,7 +81,9 @@ impl super::Viewport {
         ];
 
         // Maximum trace distance (prevents infinite bounds at the horizon).
-        let max_dist = cam_h * 20.0;
+        // Scale with pitch: at high pitch the horizon is much further than cam_h.
+        let pitch_factor = 1.0 + 2.0 * pitch_rad.sin();
+        let max_dist = cam_h * 20.0 * pitch_factor;
         let mut min_x = cx;
         let mut max_x = cx;
         let mut min_y = cy;
