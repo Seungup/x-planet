@@ -46,27 +46,25 @@ impl super::Viewport {
         let target = glam::DVec3::new(cx, cy, 0.0);
 
         let view = glam::DMat4::look_at_rh(eye, target, up);
-        // Adaptive near/far: tighten the ratio to preserve depth-buffer
-        // precision, but extend far plane for pitched views.
+        // Adaptive near/far for pitched views.
         //
-        // At high pitch the visible ground extends much further from the
-        // camera.  Compute the geometric distance to the far ground point
-        // and use that as the basis for the far plane.  Also push near
-        // forward proportionally so the far/near ratio stays under ~80,
-        // avoiding depth-buffer precision loss and z-fighting.
+        // Far plane: generous multiplier so the frustum covers distant tiles
+        // visible near the horizon.  At pitch=60° the top frustum ray is
+        // nearly horizontal, requiring a far plane ≈ 11× cam_h.
+        //
+        // Near plane: the closest visible ground point is where the bottom
+        // frustum ray (pitch − fov_half from vertical) hits z=0.  Placing
+        // near at half that distance keeps the far/near ratio ≈ 30–40,
+        // preserving depth-buffer precision.
         let sin_p = pitch_rad.sin();
-        let cos_p = pitch_rad.cos();
-        let far_ground = if sin_p > 0.01 {
-            // Horizontal reach on the ground from the camera eye
-            let reach = cam_h * sin_p;
-            let eye_z = cam_h * cos_p;
-            // Distance from eye to the far ground point
-            (eye_z * eye_z + reach * reach * 4.0).sqrt() * 2.5
-        } else {
-            cam_h * 4.0
-        };
-        let near = cam_h * cos_p.max(0.5) * 0.15;
-        let far = far_ground.max(cam_h * 4.0);
+        let far = cam_h * (4.0 + 8.0 * sin_p);
+        // Closest ground intersection along the bottom frustum ray:
+        //   angle_from_vertical = pitch − fov/2;  dist = eye_z / cos(angle)
+        // Simplified: near ≈ cam_h * cos(pitch) / (2 * cos(pitch − 30°))
+        let fov_half = std::f64::consts::FRAC_PI_3 * 0.5;
+        let bottom_angle = (pitch_rad - fov_half).max(0.0);
+        let cos_bottom = bottom_angle.cos().max(0.1);
+        let near = (cam_h * pitch_rad.cos() / (2.0 * cos_bottom)).max(cam_h * 0.01);
         let proj = glam::DMat4::perspective_rh(fov_y, aspect, near, far);
 
         let flip_x = glam::DMat4::from_diagonal(glam::DVec4::new(-1.0, 1.0, 1.0, 1.0));
@@ -168,16 +166,11 @@ impl super::Viewport {
 
         let view = glam::Mat4::look_at_rh(eye, target, up);
         let sin_p = pitch_rad.sin();
-        let cos_p = pitch_rad.cos();
-        let far_ground = if sin_p > 0.01 {
-            let reach = cam_h * sin_p;
-            let eye_z = cam_h * cos_p;
-            (eye_z * eye_z + reach * reach * 4.0).sqrt() * 2.5
-        } else {
-            cam_h * 4.0
-        };
-        let near = cam_h * cos_p.max(0.5) * 0.15;
-        let far = far_ground.max(cam_h * 4.0);
+        let far = cam_h * (4.0 + 8.0 * sin_p);
+        let fov_half_f = std::f32::consts::FRAC_PI_3 * 0.5;
+        let bottom_angle = (pitch_rad - fov_half_f).max(0.0);
+        let cos_bottom = bottom_angle.cos().max(0.1);
+        let near = (cam_h * pitch_rad.cos() / (2.0 * cos_bottom)).max(cam_h * 0.01);
         let proj = glam::Mat4::perspective_rh(fov_y, aspect, near, far);
 
         // look_at_rh with up=(sin_b,-cos_b,0) makes camera_right = world(-cos_b,-sin_b,0),
