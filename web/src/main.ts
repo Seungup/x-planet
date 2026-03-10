@@ -1,43 +1,68 @@
 import "./style.css";
 import { setupControls } from "./controls.ts";
-import type { XPlanetsMap, XPlanetsConfig } from "./types.ts";
+import { PRESETS } from "./presets.ts";
+import type { XPlanetsMap, ExamplePreset } from "./types.ts";
 
-/**
- * Map configuration — all layer setup lives here in TypeScript.
- *
- * Edit this object to change the base imagery, add terrain sources,
- * switch projections, etc. No Rust recompilation needed.
- */
-const MAP_CONFIG: XPlanetsConfig = {
-  center: [37.5665, 126.978],
-  zoom: 5,
-  projection: "Web Mercator",
-  layers: [
-    {
-      name: "osm",
-      url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-      kind: "raster",
-    },
-  ],
-  terrain: {
-    url: "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
-    encoding: "terrarium",
-  },
-};
+/** Current map instance — destroyed and re-created on preset switch. */
+let currentMap: XPlanetsMap | null = null;
 
-async function main(): Promise<void> {
-  // Load the WASM module and import the XPlanets factory.
+/** Persist selected preset across reloads via URL hash. */
+function getPresetId(): string {
+  const hash = location.hash.slice(1);
+  const found = PRESETS.find((p) => p.id === hash);
+  return found ? found.id : PRESETS[0].id;
+}
+
+function setPresetId(id: string): void {
+  history.replaceState(null, "", `#${id}`);
+}
+
+async function createMap(preset: ExamplePreset): Promise<XPlanetsMap> {
   const { default: init, XPlanets } = await import("../pkg/x_planets_web.js");
   await init();
 
-  // Create the map with our TS-defined config.
   const map: XPlanetsMap = await XPlanets.create(
     "x-planets-canvas",
-    MAP_CONFIG,
+    preset.config,
   );
+  return map;
+}
 
-  // Create UI controls driven by the typed map API.
-  setupControls(map);
+/** Remove all UI controls created by setupControls. */
+function clearControls(): void {
+  for (const id of ["proj-btn", "alt-btn", "example-selector"]) {
+    document.getElementById(id)?.remove();
+  }
+}
+
+async function switchPreset(preset: ExamplePreset): Promise<void> {
+  setPresetId(preset.id);
+
+  // Destroy existing map
+  if (currentMap) {
+    currentMap.destroy();
+    currentMap = null;
+  }
+  clearControls();
+
+  // Create new map with selected config
+  currentMap = await createMap(preset);
+
+  // Set up UI with the new map
+  setupControls(currentMap, PRESETS, preset.id, (newPreset) => {
+    switchPreset(newPreset).catch(console.error);
+  });
+
+  // Apply terrain if configured (terrain starts enabled when config has terrain)
+  if (preset.config.terrain) {
+    currentMap.toggleTerrain();
+  }
+}
+
+async function main(): Promise<void> {
+  const presetId = getPresetId();
+  const preset = PRESETS.find((p) => p.id === presetId) ?? PRESETS[0];
+  await switchPreset(preset);
 }
 
 main().catch(console.error);

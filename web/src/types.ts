@@ -140,6 +140,16 @@ export interface LayerConfig {
   imageryLayer?: string;
   zOrder?: number;
   opacity?: number;
+  /** Cesium Ion access token (for 3D Tiles layers). */
+  cesiumIonToken?: string;
+  /** Cesium Ion asset ID (for 3D Tiles layers). */
+  cesiumIonAsset?: number;
+  /** Google Maps 3D Tiles API key. */
+  googleApiKey?: string;
+  /** Max screen-space error for 3D Tiles LOD. */
+  maxSSE?: number;
+  /** Tile budget for 3D Tiles concurrent loads. */
+  tileBudget?: number;
 }
 
 /** Terrain configuration for `XPlanetsConfig`. */
@@ -173,6 +183,14 @@ export interface XPlanetsConfig {
 /** Factory for creating x-planets map instances via Promise-based init. */
 export interface XPlanetsFactory {
   create(canvasId: string, config?: XPlanetsConfig): Promise<XPlanetsMap>;
+}
+
+/** A named example preset with description and full config. */
+export interface ExamplePreset {
+  id: string;
+  name: string;
+  description: string;
+  config: XPlanetsConfig;
 }
 
 declare global {
