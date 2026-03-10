@@ -190,9 +190,21 @@ pub fn splice_external_tileset(
             // Replace children with external root's children.
             tile.children = ext_root.children.clone();
 
-            // Inherit transform from external root if this tile has none.
-            if tile.transform.is_none() && ext_root.transform.is_some() {
-                tile.transform = ext_root.transform;
+            // Compose transforms: if both the referencing tile and the
+            // external root have transforms, they must be composed so that
+            // traversal applies both.  Per the 3D Tiles spec, the external
+            // tileset root is positioned relative to the referencing tile's
+            // coordinate frame.
+            match (tile.transform, ext_root.transform) {
+                (Some(parent_t), Some(ext_t)) => {
+                    let parent_mat = glam::DMat4::from_cols_array(&parent_t);
+                    let ext_mat = glam::DMat4::from_cols_array(&ext_t);
+                    tile.transform = Some((parent_mat * ext_mat).to_cols_array());
+                }
+                (None, Some(_)) => {
+                    tile.transform = ext_root.transform;
+                }
+                _ => {} // Keep existing transform (or both None)
             }
 
             // Use external root's bounding volume.
@@ -469,6 +481,80 @@ mod tests {
             child.children[0].content.as_ref().unwrap().uri,
             "https://example.com/tiles/child0.b3dm"
         );
+    }
+
+    #[test]
+    fn test_splice_composes_transforms() {
+        // Parent tile has a transform, external root also has a transform.
+        // Both should be composed (parent * external).
+        let main_json = r#"{
+            "asset": { "version": "1.1" },
+            "geometricError": 500.0,
+            "root": {
+                "boundingVolume": { "sphere": [0.0, 0.0, 0.0, 10000.0] },
+                "geometricError": 200.0,
+                "refine": "ADD",
+                "children": [
+                    {
+                        "boundingVolume": { "sphere": [0.0, 0.0, 0.0, 5000.0] },
+                        "geometricError": 100.0,
+                        "content": { "uri": "sub.json" },
+                        "transform": [
+                            2.0, 0.0, 0.0, 0.0,
+                            0.0, 2.0, 0.0, 0.0,
+                            0.0, 0.0, 2.0, 0.0,
+                            100.0, 200.0, 300.0, 1.0
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        let external_json = r#"{
+            "asset": { "version": "1.1" },
+            "geometricError": 100.0,
+            "root": {
+                "boundingVolume": { "sphere": [0.0, 0.0, 0.0, 5000.0] },
+                "geometricError": 50.0,
+                "refine": "REPLACE",
+                "content": { "uri": "tile.b3dm" },
+                "transform": [
+                    1.0, 0.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0,
+                    0.0, 0.0, 1.0, 0.0,
+                    10.0, 20.0, 30.0, 1.0
+                ]
+            }
+        }"#;
+
+        let mut main_tileset = parse_tileset(main_json.as_bytes()).unwrap();
+        let external = parse_tileset(external_json.as_bytes()).unwrap();
+        let base_url = "https://example.com/";
+        let external_base_url = "https://example.com/";
+
+        let spliced = splice_external_tileset(
+            &mut main_tileset.root,
+            base_url,
+            "https://example.com/sub.json",
+            &external,
+            external_base_url,
+        );
+
+        assert!(spliced);
+        let child = &main_tileset.root.children[0];
+        let t = child.transform.expect("transform should be composed");
+
+        // Expected: parent_scale(2) * ext_translation(10,20,30) + parent_translation(100,200,300)
+        // Column 3 (translation) of (parent * ext):
+        //   parent * [10, 20, 30, 1] = [2*10+100, 2*20+200, 2*30+300, 1] = [120, 240, 360, 1]
+        let composed = glam::DMat4::from_cols_array(&t);
+        let col3 = composed.col(3);
+        assert!((col3.x - 120.0).abs() < 1e-6, "translation x: {}", col3.x);
+        assert!((col3.y - 240.0).abs() < 1e-6, "translation y: {}", col3.y);
+        assert!((col3.z - 360.0).abs() < 1e-6, "translation z: {}", col3.z);
+
+        // Scale columns should be 2x (from parent).
+        let col0 = composed.col(0);
+        assert!((col0.x - 2.0).abs() < 1e-6, "scale x: {}", col0.x);
     }
 
     #[test]

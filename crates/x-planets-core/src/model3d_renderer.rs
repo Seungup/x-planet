@@ -94,6 +94,11 @@ impl GpuModel3d {
     /// Call this each frame when the camera moves to recompute
     /// ECEF-relative transforms for planet-scale rendering.
     pub fn update_transform(&self, queue: &wgpu::Queue, model_matrix: [f32; 16], opacity: f32) {
+        // Sanity check: skip degenerate matrices that would produce garbage rendering.
+        if model_matrix.iter().any(|v| !v.is_finite()) {
+            log::warn!("model3d: skipping update_transform with non-finite matrix");
+            return;
+        }
         let uniforms = ModelUniforms {
             model_matrix,
             params: [opacity, self.has_texture_flag, 0.0, 0.0],

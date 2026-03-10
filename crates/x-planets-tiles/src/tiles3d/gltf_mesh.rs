@@ -81,10 +81,41 @@ pub fn extract_meshes_from_glb(
 
     let mut meshes = Vec::new();
 
-    for mesh in document.meshes() {
-        for primitive in mesh.primitives() {
-            if let Some(extracted) = extract_primitive(&primitive, &buffers, &images, rtc_center)? {
-                meshes.push(extracted);
+    // Walk the scene/node hierarchy to collect node transforms.
+    // glTF node transforms (e.g., Y-up → Z-up rotation) must be
+    // applied to vertex positions and normals for correct rendering.
+    let node_transforms = collect_node_transforms(&document);
+
+    for node in document.nodes() {
+        if let Some(mesh) = node.mesh() {
+            let transform = node_transforms
+                .get(&node.index())
+                .copied()
+                .unwrap_or(IDENTITY_F32);
+            let has_transform = transform != IDENTITY_F32;
+
+            for primitive in mesh.primitives() {
+                if let Some(mut extracted) =
+                    extract_primitive(&primitive, &buffers, &images, rtc_center)?
+                {
+                    if has_transform {
+                        apply_node_transform(&mut extracted, &transform);
+                    }
+                    meshes.push(extracted);
+                }
+            }
+        }
+    }
+
+    // Fallback: if no nodes reference meshes (unusual), iterate meshes directly.
+    if meshes.is_empty() {
+        for mesh in document.meshes() {
+            for primitive in mesh.primitives() {
+                if let Some(extracted) =
+                    extract_primitive(&primitive, &buffers, &images, rtc_center)?
+                {
+                    meshes.push(extracted);
+                }
             }
         }
     }
@@ -94,6 +125,80 @@ pub fn extract_meshes_from_glb(
     }
 
     Ok(meshes)
+}
+
+/// Identity 4x4 matrix in column-major f32.
+const IDENTITY_F32: [[f32; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+/// Collect accumulated transforms for each node by walking the scene hierarchy.
+fn collect_node_transforms(document: &gltf::Document) -> std::collections::HashMap<usize, [[f32; 4]; 4]> {
+    let mut result = std::collections::HashMap::new();
+
+    fn walk_node(
+        node: &gltf::Node<'_>,
+        parent_transform: [[f32; 4]; 4],
+        result: &mut std::collections::HashMap<usize, [[f32; 4]; 4]>,
+    ) {
+        let local = node.transform().matrix();
+        let accumulated = mat4_mul(&parent_transform, &local);
+        result.insert(node.index(), accumulated);
+        for child in node.children() {
+            walk_node(&child, accumulated, result);
+        }
+    }
+
+    for scene in document.scenes() {
+        for node in scene.nodes() {
+            walk_node(&node, IDENTITY_F32, &mut result);
+        }
+    }
+
+    result
+}
+
+/// Multiply two 4x4 column-major matrices (a * b).
+fn mat4_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut result = [[0.0f32; 4]; 4];
+    for col in 0..4 {
+        for row in 0..4 {
+            result[col][row] = a[0][row] * b[col][0]
+                + a[1][row] * b[col][1]
+                + a[2][row] * b[col][2]
+                + a[3][row] * b[col][3];
+        }
+    }
+    result
+}
+
+/// Apply a node transform to mesh positions and normals.
+fn apply_node_transform(mesh: &mut ExtractedMesh, transform: &[[f32; 4]; 4]) {
+    // Transform positions (as points: w=1)
+    for pos in &mut mesh.positions {
+        let [x, y, z] = *pos;
+        *pos = [
+            transform[0][0] * x + transform[1][0] * y + transform[2][0] * z + transform[3][0],
+            transform[0][1] * x + transform[1][1] * y + transform[2][1] * z + transform[3][1],
+            transform[0][2] * x + transform[1][2] * y + transform[2][2] * z + transform[3][2],
+        ];
+    }
+
+    // Transform normals (as vectors: w=0, using upper-left 3x3)
+    for normal in &mut mesh.normals {
+        let [nx, ny, nz] = *normal;
+        let tx = transform[0][0] * nx + transform[1][0] * ny + transform[2][0] * nz;
+        let ty = transform[0][1] * nx + transform[1][1] * ny + transform[2][1] * nz;
+        let tz = transform[0][2] * nx + transform[1][2] * ny + transform[2][2] * nz;
+        // Re-normalize (transform may include scale)
+        let len = (tx * tx + ty * ty + tz * tz).sqrt();
+        if len > 1e-6 {
+            *normal = [tx / len, ty / len, tz / len];
+        }
+    }
 }
 
 /// Extract a single primitive's data.
@@ -501,5 +606,79 @@ mod tests {
     fn test_generate_normals_empty() {
         let normals = generate_flat_normals(&[], &[]);
         assert!(normals.is_empty());
+    }
+
+    #[test]
+    fn test_apply_node_transform_identity() {
+        let mut mesh = ExtractedMesh {
+            positions: vec![[1.0, 2.0, 3.0]],
+            normals: vec![[0.0, 0.0, 1.0]],
+            tex_coords: vec![[0.5, 0.5]],
+            indices: vec![0],
+            texture_rgba: None,
+            texture_width: 0,
+            texture_height: 0,
+            rtc_center: None,
+        };
+        apply_node_transform(&mut mesh, &IDENTITY_F32);
+        assert!((mesh.positions[0][0] - 1.0).abs() < 1e-6);
+        assert!((mesh.positions[0][1] - 2.0).abs() < 1e-6);
+        assert!((mesh.positions[0][2] - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_apply_node_transform_y_up_to_z_up() {
+        // Y-up to Z-up rotation: swap Y→Z, Z→-Y
+        // This is common in Cesium glTF tiles.
+        let y_to_z: [[f32; 4]; 4] = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mut mesh = ExtractedMesh {
+            positions: vec![[1.0, 5.0, 0.0]], // (x=1, y_up=5, z_up=0)
+            normals: vec![[0.0, 1.0, 0.0]],   // pointing up in Y-up
+            tex_coords: vec![[0.0, 0.0]],
+            indices: vec![0],
+            texture_rgba: None,
+            texture_width: 0,
+            texture_height: 0,
+            rtc_center: None,
+        };
+        apply_node_transform(&mut mesh, &y_to_z);
+
+        // After Y→Z rotation: (1, 5, 0) → (1, 0, 5)
+        assert!((mesh.positions[0][0] - 1.0).abs() < 1e-5);
+        assert!(mesh.positions[0][1].abs() < 1e-5);
+        assert!((mesh.positions[0][2] - 5.0).abs() < 1e-5);
+
+        // Normal (0,1,0) → (0,0,1) in Z-up
+        assert!(mesh.normals[0][0].abs() < 1e-5);
+        assert!(mesh.normals[0][1].abs() < 1e-5);
+        assert!((mesh.normals[0][2] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_mat4_mul() {
+        let a = IDENTITY_F32;
+        let b = [
+            [2.0, 0.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0, 0.0],
+            [0.0, 0.0, 4.0, 0.0],
+            [1.0, 2.0, 3.0, 1.0],
+        ];
+        let result = mat4_mul(&a, &b);
+        // Identity * B = B
+        for col in 0..4 {
+            for row in 0..4 {
+                assert!(
+                    (result[col][row] - b[col][row]).abs() < 1e-6,
+                    "mismatch at [{col}][{row}]: {} vs {}",
+                    result[col][row],
+                    b[col][row]
+                );
+            }
+        }
     }
 }
