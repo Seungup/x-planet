@@ -9,6 +9,7 @@ use wasm_bindgen::JsCast;
 
 use x_planets_core::engine::LayerKind;
 use x_planets_core::map_controller::LayerStateView;
+use x_planets_core::model3d_renderer::Model3dRenderer;
 use x_planets_core::tile_load_planner::{plan_tile_loads, LayerLoadState, PlannedRequestKind};
 use x_planets_core::MapController;
 use x_planets_render::{TerrainLayerData, TerrainRenderer, TerrainTileData, TileRenderer};
@@ -16,6 +17,8 @@ use x_planets_gpu::{GpuContext, GpuTexture, TextureManager};
 use x_planets_math::{TileCoord, VisibleTile};
 use x_planets_tiles::{RasterTileDecoder, TerrainEncoding, TerrainRgbDecoder, TerrariumDecoder, TileCache, TileDecoder};
 use wasm_bindgen_futures::JsFuture;
+
+use crate::tiles3d_web::Tiles3dWebState;
 
 // ═══════════════════════════════════════════════════════════════════
 // Per-layer tile loading result (produced by async fetch, consumed each frame)
@@ -162,6 +165,7 @@ pub struct WebApp {
     pub controller: MapController,
     renderer: TileRenderer,
     pub(crate) terrain_renderer: TerrainRenderer,
+    model3d_renderer: Option<Model3dRenderer>,
     tex_manager: TextureManager,
     pub(crate) canvas: web_sys::HtmlCanvasElement,
     pub dpr: f64,
@@ -170,6 +174,8 @@ pub struct WebApp {
 
     // Per-layer state
     layer_states: Vec<WebLayerState>,
+    /// 3D Tiles layer states.
+    pub(crate) tiles3d_states: Vec<Tiles3dWebState>,
 
     /// Previous frame timestamp (ms) for dt calculation.
     last_frame_ms: Option<f64>,
@@ -190,9 +196,11 @@ impl WebApp {
         controller: MapController,
         renderer: TileRenderer,
         terrain_renderer: TerrainRenderer,
+        model3d_renderer: Option<Model3dRenderer>,
         tex_manager: TextureManager,
         canvas: web_sys::HtmlCanvasElement,
         dpr: f64,
+        tiles3d_states: Vec<Tiles3dWebState>,
     ) -> Self {
         let width = canvas.width();
         let height = canvas.height();
@@ -202,6 +210,7 @@ impl WebApp {
             .engine
             .layers
             .iter()
+            .filter(|l| !matches!(l.config.kind, LayerKind::Tiles3d))
             .map(|l| WebLayerState::new(
                 l.config.name.clone(),
                 l.config.kind.clone(),
@@ -216,12 +225,14 @@ impl WebApp {
             controller,
             renderer,
             terrain_renderer,
+            model3d_renderer,
             tex_manager,
             canvas,
             dpr,
             last_width: width,
             last_height: height,
             layer_states,
+            tiles3d_states,
             last_frame_ms: None,
             event_handlers: HashMap::new(),
             destroyed: false,
@@ -455,6 +466,9 @@ impl WebApp {
             );
         }
 
+        // ── 6b. 3D Tiles: init, poll, traverse, render ──
+        self.tiles3d_render(&view);
+
         frame.present();
 
         // ── 7. LRU bump visible tiles + base tiles ──
@@ -487,6 +501,9 @@ impl WebApp {
             self.controller.resize(w, h);
             self.renderer.resize(&self.gpu.device, w, h);
             self.terrain_renderer.resize(&self.gpu.device, w, h);
+            if let Some(m3d) = &mut self.model3d_renderer {
+                m3d.resize(&self.gpu.device, w, h);
+            }
             self.last_width = w;
             self.last_height = h;
             log::info!("Resized: {}x{}", w, h);
@@ -547,6 +564,58 @@ impl WebApp {
                 completed_ref.push(r);
             }
             drop(completed_ref);
+        }
+    }
+
+    /// 3D Tiles: init, poll messages, traverse, and render.
+    fn tiles3d_render(&mut self, view: &wgpu::TextureView) {
+        if self.tiles3d_states.is_empty() {
+            return;
+        }
+
+        // Spawn init for any uninitialized layers.
+        for ts3d in &mut self.tiles3d_states {
+            if !ts3d.is_initialized() && !ts3d.init_spawned {
+                ts3d.spawn_init();
+            }
+        }
+
+        // Poll messages (GPU upload of decoded tiles).
+        if let Some(renderer) = &self.model3d_renderer {
+            // Need to split borrow: take states out temporarily.
+            let mut states = std::mem::take(&mut self.tiles3d_states);
+            for ts3d in &mut states {
+                ts3d.poll_messages(&self.gpu, renderer);
+            }
+            self.tiles3d_states = states;
+        }
+
+        // Traverse and render each initialized layer.
+        let viewport = &self.controller.engine.viewport;
+        for ts3d in &mut self.tiles3d_states {
+            if !ts3d.is_initialized() {
+                continue;
+            }
+
+            let camera = x_planets_core::tiles3d_pipeline::viewport_to_traversal_camera(viewport);
+            let fov_y = x_planets_core::tiles3d_pipeline::traversal_fov_y();
+            let render_set = ts3d.traverse_and_spawn_loads(
+                &camera, viewport.height as f64, fov_y,
+            );
+
+            if render_set.is_empty() {
+                continue;
+            }
+
+            let (uniforms, camera_ecef) =
+                x_planets_core::tiles3d_pipeline::build_tiles3d_uniforms(viewport);
+
+            ts3d.update_render_transforms(&self.gpu.queue, &render_set, camera_ecef, 1.0);
+
+            let models = ts3d.collect_render_models(&render_set);
+            if let Some(renderer) = &self.model3d_renderer {
+                renderer.render_models_with_uniforms(&self.gpu, view, &uniforms, &models);
+            }
         }
     }
 

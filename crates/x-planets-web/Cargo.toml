@@ -21,6 +21,8 @@ wgpu = { workspace = true }
 async-trait = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
+glam = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { workspace = true, features = ["webgpu"] }
@@ -32,6 +34,8 @@ web-sys = { version = "0.3", features = [
     "Element",
     "EventTarget",
     "HtmlCanvasElement",
+    "Request",
+    "RequestInit",
     "Response",
     "Headers",
     # Input events
