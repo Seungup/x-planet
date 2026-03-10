@@ -300,12 +300,11 @@ impl TileRenderer {
     }
 
     /// Platform-appropriate depth format.
-    /// Depth24Plus is safer on WebGL2 fallback; Depth32Float on native.
+    /// Depth32Float on all platforms.  WebGPU (the only WASM backend we
+    /// target) supports it, and it provides significantly better depth
+    /// precision at oblique pitch angles where the near/far ratio is large.
     fn depth_format() -> wgpu::TextureFormat {
-        #[cfg(target_arch = "wasm32")]
-        { wgpu::TextureFormat::Depth24Plus }
-        #[cfg(not(target_arch = "wasm32"))]
-        { wgpu::TextureFormat::Depth32Float }
+        wgpu::TextureFormat::Depth32Float
     }
 
     /// Create a depth texture and return its view.
