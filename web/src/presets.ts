@@ -1,20 +1,24 @@
 import type { ExamplePreset } from "./types.ts";
 
 /**
- * Cesium Ion default access token for community assets.
+ * Cesium Ion access token — read from environment variable at build time.
  *
- * This token provides access to Cesium's default assets (World Terrain,
- * OSM Buildings, etc.) for demo/evaluation purposes.
- * For production use, replace with your own token from https://ion.cesium.com
+ * Set `VITE_CESIUM_ION_TOKEN` in your environment or `.env` file.
+ * Get a free token at https://ion.cesium.com/tokens
  */
-const CESIUM_ION_DEFAULT_TOKEN =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI3NjhhMGZhZC0yMjhiLTRhMjMtYTFlMy01NzBjNjI0NWJjMjgiLCJpZCI6MjU5LCJpYXQiOjE3MzA5Nzg1MjN9.KYdGljmp7CzVbLyhzEuDzJnWezCj7GNvN5SGHIEJQAQ";
+const CESIUM_ION_TOKEN: string | undefined =
+  (import.meta as any).env?.VITE_CESIUM_ION_TOKEN || undefined;
 
 /** Cesium Ion well-known asset IDs. */
 const CESIUM_ASSETS = {
   OSM_BUILDINGS: 96188,
   WORLD_TERRAIN: 1,
 } as const;
+
+/** Whether a Cesium Ion token is available. */
+export function hasCesiumToken(): boolean {
+  return !!CESIUM_ION_TOKEN;
+}
 
 /** Built-in example presets. */
 export const PRESETS: ExamplePreset[] = [
@@ -60,7 +64,9 @@ export const PRESETS: ExamplePreset[] = [
   {
     id: "cesium-osm-buildings",
     name: "3D Buildings",
-    description: "Cesium OSM Buildings (3D Tiles)",
+    description: CESIUM_ION_TOKEN
+      ? "Cesium OSM Buildings (3D Tiles)"
+      : "Cesium OSM Buildings — set VITE_CESIUM_ION_TOKEN",
     config: {
       center: [40.6892, -74.0445],
       zoom: 15,
@@ -71,13 +77,17 @@ export const PRESETS: ExamplePreset[] = [
           url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
           kind: "raster",
         },
-        {
-          name: "buildings",
-          url: "",
-          kind: "3dtiles",
-          cesiumIonToken: CESIUM_ION_DEFAULT_TOKEN,
-          cesiumIonAsset: CESIUM_ASSETS.OSM_BUILDINGS,
-        },
+        ...(CESIUM_ION_TOKEN
+          ? [
+              {
+                name: "buildings",
+                url: "",
+                kind: "3dtiles" as const,
+                cesiumIonToken: CESIUM_ION_TOKEN,
+                cesiumIonAsset: CESIUM_ASSETS.OSM_BUILDINGS,
+              },
+            ]
+          : []),
       ],
       terrain: {
         url: "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
