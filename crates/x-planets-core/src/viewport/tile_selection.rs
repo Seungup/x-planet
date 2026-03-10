@@ -253,7 +253,7 @@ impl super::Viewport {
                 else if self.pitch >= 10.0 { 3_u8 }
                 else { 2_u8 }
             }
-            _ => ((self.pitch / 20.0).ceil() as u8).min(3),
+            _ => ((self.pitch / 15.0).ceil() as u8).min(4),
         };
         let min_z = base_z.saturating_sub(max_drop);
 
@@ -288,7 +288,13 @@ impl super::Viewport {
             let d_fwd = dx * sin_b - dy * cos_b;
 
             if d_fwd > 0.0 && sin_p > 0.01 {
-                let perspective = cam_h / (cam_h + d_fwd * sin_p * 0.6);
+                // Geometric perspective factor: ratio of apparent tile size
+                // at distance d_fwd vs directly below the camera.
+                // The 3D distance from eye to a ground point at forward
+                // offset d_fwd is sqrt(cam_h² + (d_fwd * sin_p)²).
+                let eye_z = cam_h * pitch_rad.cos();
+                let d_3d = (eye_z * eye_z + d_fwd * d_fwd).sqrt();
+                let perspective = cam_h / d_3d;
                 (self.zoom + perspective.log2())
                     .round()
                     .clamp(min_z as f64, base_z as f64) as u8
