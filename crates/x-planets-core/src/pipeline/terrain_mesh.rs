@@ -157,8 +157,10 @@ pub fn build_terrain_mesh(
 
     // ── Skirt geometry ──
     // Extend vertical "walls" below each edge to hide gaps between tiles.
+    // Skirt vertices inherit the surface edge vertex's normal so that
+    // hillshade shading is continuous — using a downward normal ([0,0,-1])
+    // causes visible dark bands at tile edges when viewed at oblique pitch.
     let skirt_depth = tile_w * 0.05; // 5% of tile width
-    let down_normal = [0.0f32, 0.0, -1.0];
 
     // Collect edge vertex indices: bottom, top, right, left edges
     let mut edge_strips: Vec<Vec<u32>> = Vec::new();
@@ -200,13 +202,14 @@ pub fn build_terrain_mesh(
             let top_a = edge[i] as usize;
             let top_b = edge[i + 1] as usize;
 
-            // Add two skirt vertices (same xy, lowered z)
+            // Add two skirt vertices (same xy, lowered z).
+            // Use the surface vertex's normal for seamless hillshade.
             let skirt_a = vertices.len() as u32;
             let mut pa = positions[top_a];
             pa[2] -= skirt_depth;
             vertices.push(TerrainVertex {
                 position: pa,
-                normal: down_normal,
+                normal: normals[top_a],
                 tex_coord: tex_coords[top_a],
             });
 
@@ -215,7 +218,7 @@ pub fn build_terrain_mesh(
             pb[2] -= skirt_depth;
             vertices.push(TerrainVertex {
                 position: pb,
-                normal: down_normal,
+                normal: normals[top_b],
                 tex_coord: tex_coords[top_b],
             });
 
@@ -388,9 +391,12 @@ pub fn build_terrain_mesh_from_qm_with(
     // scaling.  We use ~2 % of the tile's equatorial width in metres,
     // which gives a consistent 2-3 % depth relative to tile_w in the
     // final coordinate space regardless of exaggeration.
+    //
+    // Skirt vertices inherit the surface edge vertex's normal so that
+    // hillshade is continuous — a downward normal causes visible dark
+    // bands at tile edges when viewed at oblique pitch angles.
     let tile_extent_m = circumference / n;
     let skirt_depth = (tile_extent_m * 0.02) as f32;
-    let down_normal = [0.0f32, 0.0, -1.0];
 
     for edge_indices in [
         &qm.west_indices,
@@ -414,7 +420,7 @@ pub fn build_terrain_mesh_from_qm_with(
             pa[2] -= skirt_depth;
             vertices.push(TerrainVertex {
                 position:  pa,
-                normal:    down_normal,
+                normal:    normals[top_a],
                 tex_coord: tex_coords[top_a],
             });
 
@@ -423,7 +429,7 @@ pub fn build_terrain_mesh_from_qm_with(
             pb[2] -= skirt_depth;
             vertices.push(TerrainVertex {
                 position:  pb,
-                normal:    down_normal,
+                normal:    normals[top_b],
                 tex_coord: tex_coords[top_b],
             });
 
@@ -626,12 +632,13 @@ pub fn build_terrain_mesh_centered(
     }
 
     // Skirt geometry — use 5% of the centered-space tile extent.
+    // Skirt vertices inherit the surface edge vertex's normal so that
+    // hillshade is continuous at oblique pitch angles.
     let skirt_depth = {
         let extent_x = (positions[verts_per_side as usize - 1][0] - positions[0][0]).abs();
         let extent_y = (positions[(verts_per_side * (verts_per_side - 1)) as usize][1] - positions[0][1]).abs();
         (extent_x.max(extent_y) * 0.05).max(1e-8)
     };
-    let down_normal = [0.0f32, 0.0, -1.0];
 
     let mut edge_strips: Vec<Vec<u32>> = Vec::new();
     // Bottom edge
@@ -658,11 +665,11 @@ pub fn build_terrain_mesh_centered(
             let skirt_a = vertices.len() as u32;
             let mut pa = positions[top_a];
             pa[2] -= skirt_depth;
-            vertices.push(TerrainVertex { position: pa, normal: down_normal, tex_coord: tex_coords[top_a] });
+            vertices.push(TerrainVertex { position: pa, normal: normals[top_a], tex_coord: tex_coords[top_a] });
             let skirt_b = vertices.len() as u32;
             let mut pb = positions[top_b];
             pb[2] -= skirt_depth;
-            vertices.push(TerrainVertex { position: pb, normal: down_normal, tex_coord: tex_coords[top_b] });
+            vertices.push(TerrainVertex { position: pb, normal: normals[top_b], tex_coord: tex_coords[top_b] });
             if flipped {
                 indices.push(edge[i]);
                 indices.push(edge[i + 1]);
