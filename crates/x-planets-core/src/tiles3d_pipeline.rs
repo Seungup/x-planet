@@ -177,23 +177,25 @@ pub fn ecef_to_relative_world(ecef_transform: DMat4, reference_ecef: DVec3) -> M
     )
 }
 
-/// Build a model matrix from an RTC center (relative-to-center)
-/// and a tile transform.
+/// Build a model matrix from an RTC center, glTF local transform,
+/// and tile hierarchy transform.
 ///
-/// Many 3D Tiles content uses RTC_CENTER to store positions relative
-/// to a known ECEF point. This function combines RTC with the tile's
-/// hierarchical transform.
+/// Composes: tile_transform × local_transform × translate(rtc)
+///
+/// - `rtc_center`: CESIUM_RTC or B3DM feature table offset (tile-local space)
+/// - `local_transform`: glTF node hierarchy transform (Y-up → ECEF conversion)
+/// - `tile_transform`: 3D Tiles hierarchy transform (tile-local → ECEF)
 pub fn build_model_matrix(
     rtc_center: Option<[f64; 3]>,
+    local_transform: DMat4,
     tile_transform: DMat4,
 ) -> DMat4 {
+    let mut result = tile_transform * local_transform;
     if let Some(rtc) = rtc_center {
-        // RTC: translate by the center point, then apply tile transform.
         let rtc_translation = DMat4::from_translation(DVec3::new(rtc[0], rtc[1], rtc[2]));
-        tile_transform * rtc_translation
-    } else {
-        tile_transform
+        result = result * rtc_translation;
     }
+    result
 }
 
 /// Get the vertical FOV used for 3D Tiles traversal.
@@ -384,15 +386,14 @@ mod tests {
 
     #[test]
     fn test_build_model_matrix_no_rtc() {
-        let transform = DMat4::IDENTITY;
-        let model = build_model_matrix(None, transform);
+        let model = build_model_matrix(None, DMat4::IDENTITY, DMat4::IDENTITY);
         assert!((model - DMat4::IDENTITY).abs_diff_eq(DMat4::ZERO, 1e-10));
     }
 
     #[test]
     fn test_build_model_matrix_with_rtc() {
         let rtc = [100.0, 200.0, 300.0];
-        let model = build_model_matrix(Some(rtc), DMat4::IDENTITY);
+        let model = build_model_matrix(Some(rtc), DMat4::IDENTITY, DMat4::IDENTITY);
 
         // Translation column should be the RTC center.
         let t = model.col(3);
@@ -443,7 +444,7 @@ mod tests {
         let tile_transform = DMat4::IDENTITY;
 
         // Step 3: Build model matrix
-        let model_ecef = build_model_matrix(Some(rtc_center), tile_transform);
+        let model_ecef = build_model_matrix(Some(rtc_center), DMat4::IDENTITY, tile_transform);
 
         // Translation should be the RTC center
         let t = model_ecef.col(3);
@@ -522,7 +523,7 @@ mod tests {
         // Shift tile 50m east (still visible from camera overhead)
         let shift = east * 50.0;
         let tile_shift = DMat4::from_translation(shift);
-        let model_with_transform = build_model_matrix(Some(rtc_center), tile_shift);
+        let model_with_transform = build_model_matrix(Some(rtc_center), DMat4::IDENTITY, tile_shift);
         let rel_transformed = ecef_to_relative_world(model_with_transform, camera_ecef);
         let world_pos2 = rel_transformed * vertex;
         let clip_pos2 = vp_mat * world_pos2;
@@ -561,7 +562,7 @@ mod tests {
                 camera_ecef.y + offset[1],
                 camera_ecef.z + offset[2] - 300.0, // on surface
             ];
-            let model = build_model_matrix(Some(rtc), DMat4::IDENTITY);
+            let model = build_model_matrix(Some(rtc), DMat4::IDENTITY, DMat4::IDENTITY);
             let rel = ecef_to_relative_world(model, camera_ecef);
 
             let vertex = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);

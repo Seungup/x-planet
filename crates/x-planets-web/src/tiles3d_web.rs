@@ -69,6 +69,7 @@ enum Tiles3dMsg {
 pub struct GpuTileContent {
     pub models: Vec<GpuModel3d>,
     pub rtc_centers: Vec<Option<[f64; 3]>>,
+    pub local_transforms: Vec<glam::DMat4>,
     pub gpu_bytes: usize,
     pub last_access: u64,
 }
@@ -320,6 +321,7 @@ impl Tiles3dWebState {
     ) {
         let mut models = Vec::new();
         let mut rtc_centers = Vec::new();
+        let mut local_transforms = Vec::new();
         let mut tile_gpu_bytes: usize = 0;
 
         for (i, mesh) in decoded.meshes.iter().enumerate() {
@@ -379,12 +381,13 @@ impl Tiles3dWebState {
 
             models.push(model);
             rtc_centers.push(mesh.rtc_center);
+            local_transforms.push(glam::DMat4::from_cols_array_2d(&mesh.local_transform));
         }
 
         if !models.is_empty() {
             self.total_gpu_bytes += tile_gpu_bytes;
             self.gpu_tiles.insert(content_uri.to_string(), GpuTileContent {
-                models, rtc_centers,
+                models, rtc_centers, local_transforms,
                 gpu_bytes: tile_gpu_bytes,
                 last_access: self.generation,
             });
@@ -456,8 +459,8 @@ impl Tiles3dWebState {
         for tile in render_set {
             if let Some(content) = self.gpu_tiles.get_mut(&tile.content_uri) {
                 content.last_access = gen;
-                for (model, rtc) in content.models.iter().zip(content.rtc_centers.iter()) {
-                    let mm = x_planets_core::tiles3d_pipeline::build_model_matrix(*rtc, tile.transform);
+                for ((model, rtc), local_tr) in content.models.iter().zip(content.rtc_centers.iter()).zip(content.local_transforms.iter()) {
+                    let mm = x_planets_core::tiles3d_pipeline::build_model_matrix(*rtc, *local_tr, tile.transform);
                     let rel = x_planets_core::tiles3d_pipeline::ecef_to_relative_world(mm, camera_ecef);
 
                     if !logged_first {

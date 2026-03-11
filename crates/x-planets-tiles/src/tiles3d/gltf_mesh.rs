@@ -59,6 +59,11 @@ pub struct ExtractedMesh {
     /// RTC_CENTER offset from CESIUM_RTC extension or B3DM feature table.
     /// When present, vertex positions are relative to this ECEF point.
     pub rtc_center: Option<[f64; 3]>,
+    /// Accumulated glTF node transform (column-major 4x4, f64).
+    /// Captures the scene hierarchy transform that should be applied
+    /// between the tile transform and vertex positions.
+    /// Identity when no node transform exists.
+    pub local_transform: [[f64; 4]; 4],
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -82,8 +87,10 @@ pub fn extract_meshes_from_glb(
     let mut meshes = Vec::new();
 
     // Walk the scene/node hierarchy to collect node transforms.
-    // glTF node transforms (e.g., Y-up → Z-up rotation) must be
-    // applied to vertex positions and normals for correct rendering.
+    // Instead of baking node transforms into vertex positions (which can
+    // cause coordinate-system mismatches with the 3D Tiles hierarchy),
+    // store them in `local_transform` and let the rendering pipeline
+    // compose: tile_transform × local_transform × translate(rtc).
     let node_transforms = collect_node_transforms(&document);
 
     for node in document.nodes() {
@@ -92,35 +99,9 @@ pub fn extract_meshes_from_glb(
                 .get(&node.index())
                 .copied()
                 .unwrap_or(IDENTITY_F32);
-            let has_transform = transform != IDENTITY_F32;
 
-            // Check if the node transform has a large translation (ECEF offset).
-            // If so, split it: apply only rotation/scale to vertices, and fold
-            // the translation into the RTC center.  This prevents the tile
-            // hierarchy's transform from double-counting the ECEF position.
-            let node_translation = [
-                transform[3][0] as f64,
-                transform[3][1] as f64,
-                transform[3][2] as f64,
-            ];
-            let translation_mag = (node_translation[0] * node_translation[0]
-                + node_translation[1] * node_translation[1]
-                + node_translation[2] * node_translation[2])
-                .sqrt();
-            let has_large_translation = translation_mag > 10_000.0;
-
-            // Transform to apply to vertex positions: full or rotation-only.
-            let vertex_transform = if has_large_translation {
-                [
-                    transform[0],
-                    transform[1],
-                    transform[2],
-                    [0.0, 0.0, 0.0, 1.0], // zero out translation
-                ]
-            } else {
-                transform
-            };
-            let apply_vertex_transform = vertex_transform != IDENTITY_F32;
+            // Convert node transform to f64 for the local_transform field.
+            let local_transform = f32_to_f64_mat4(&transform);
 
             for primitive in mesh.primitives() {
                 // Skip non-triangle primitives (strips, fans, lines, points)
@@ -131,56 +112,7 @@ pub fn extract_meshes_from_glb(
                 if let Some(mut extracted) =
                     extract_primitive(&primitive, &buffers, &images, rtc_center)?
                 {
-                    if has_transform {
-                        if apply_vertex_transform {
-                            apply_node_transform(&mut extracted, &vertex_transform);
-                        }
-
-                        if has_large_translation {
-                            // Fold node translation into RTC center.
-                            // Transform existing RTC by rotation, then add node translation.
-                            match &mut extracted.rtc_center {
-                                Some(rtc) => {
-                                    let [x, y, z] = *rtc;
-                                    // Rotate existing RTC by node's rotation/scale
-                                    *rtc = [
-                                        transform[0][0] as f64 * x
-                                            + transform[1][0] as f64 * y
-                                            + transform[2][0] as f64 * z
-                                            + node_translation[0],
-                                        transform[0][1] as f64 * x
-                                            + transform[1][1] as f64 * y
-                                            + transform[2][1] as f64 * z
-                                            + node_translation[1],
-                                        transform[0][2] as f64 * x
-                                            + transform[1][2] as f64 * y
-                                            + transform[2][2] as f64 * z
-                                            + node_translation[2],
-                                    ];
-                                }
-                                None => {
-                                    extracted.rtc_center = Some(node_translation);
-                                }
-                            }
-                        } else if let Some(rtc) = &mut extracted.rtc_center {
-                            // Small translation: transform RTC by full node transform.
-                            let [x, y, z] = *rtc;
-                            *rtc = [
-                                transform[0][0] as f64 * x
-                                    + transform[1][0] as f64 * y
-                                    + transform[2][0] as f64 * z
-                                    + transform[3][0] as f64,
-                                transform[0][1] as f64 * x
-                                    + transform[1][1] as f64 * y
-                                    + transform[2][1] as f64 * z
-                                    + transform[3][1] as f64,
-                                transform[0][2] as f64 * x
-                                    + transform[1][2] as f64 * y
-                                    + transform[2][2] as f64 * z
-                                    + transform[3][2] as f64,
-                            ];
-                        }
-                    }
+                    extracted.local_transform = local_transform;
                     meshes.push(extracted);
                 }
             }
@@ -203,40 +135,16 @@ pub fn extract_meshes_from_glb(
         }
     }
 
-    // Post-process: synthesize RTC center for meshes with large absolute
-    // positions but no RTC.  Some 3D Tiles (e.g. Cesium OSM Buildings) bake
-    // ECEF positions directly into vertices without RTC_CENTER.  Subtracting
-    // the centroid keeps vertex values small for f32 GPU precision.
-    for mesh in &mut meshes {
-        if mesh.rtc_center.is_some() || mesh.positions.is_empty() {
-            continue;
-        }
-        let n = mesh.positions.len() as f64;
-        let centroid = mesh.positions.iter().fold([0.0_f64; 3], |acc, p| {
-            [acc[0] + p[0] as f64, acc[1] + p[1] as f64, acc[2] + p[2] as f64]
-        });
-        let centroid = [centroid[0] / n, centroid[1] / n, centroid[2] / n];
-
-        // Only synthesize if positions are large (> 10 km from origin).
-        let mag = (centroid[0] * centroid[0]
-            + centroid[1] * centroid[1]
-            + centroid[2] * centroid[2])
-            .sqrt();
-        if mag > 10_000.0 {
-            let cx = centroid[0] as f32;
-            let cy = centroid[1] as f32;
-            let cz = centroid[2] as f32;
-            for pos in &mut mesh.positions {
-                pos[0] -= cx;
-                pos[1] -= cy;
-                pos[2] -= cz;
-            }
-            mesh.rtc_center = Some(centroid);
-        }
-    }
-
     Ok(meshes)
 }
+
+/// Identity 4x4 matrix in column-major f64.
+pub const IDENTITY_F64: [[f64; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
 
 /// Identity 4x4 matrix in column-major f32.
 const IDENTITY_F32: [[f32; 4]; 4] = [
@@ -245,6 +153,16 @@ const IDENTITY_F32: [[f32; 4]; 4] = [
     [0.0, 0.0, 1.0, 0.0],
     [0.0, 0.0, 0.0, 1.0],
 ];
+
+/// Convert f32 4x4 matrix to f64.
+fn f32_to_f64_mat4(m: &[[f32; 4]; 4]) -> [[f64; 4]; 4] {
+    [
+        [m[0][0] as f64, m[0][1] as f64, m[0][2] as f64, m[0][3] as f64],
+        [m[1][0] as f64, m[1][1] as f64, m[1][2] as f64, m[1][3] as f64],
+        [m[2][0] as f64, m[2][1] as f64, m[2][2] as f64, m[2][3] as f64],
+        [m[3][0] as f64, m[3][1] as f64, m[3][2] as f64, m[3][3] as f64],
+    ]
+}
 
 /// Collect accumulated transforms for each node by walking the scene hierarchy.
 fn collect_node_transforms(document: &gltf::Document) -> std::collections::HashMap<usize, [[f32; 4]; 4]> {
@@ -284,32 +202,6 @@ fn mat4_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
         }
     }
     result
-}
-
-/// Apply a node transform to mesh positions and normals.
-fn apply_node_transform(mesh: &mut ExtractedMesh, transform: &[[f32; 4]; 4]) {
-    // Transform positions (as points: w=1)
-    for pos in &mut mesh.positions {
-        let [x, y, z] = *pos;
-        *pos = [
-            transform[0][0] * x + transform[1][0] * y + transform[2][0] * z + transform[3][0],
-            transform[0][1] * x + transform[1][1] * y + transform[2][1] * z + transform[3][1],
-            transform[0][2] * x + transform[1][2] * y + transform[2][2] * z + transform[3][2],
-        ];
-    }
-
-    // Transform normals (as vectors: w=0, using upper-left 3x3)
-    for normal in &mut mesh.normals {
-        let [nx, ny, nz] = *normal;
-        let tx = transform[0][0] * nx + transform[1][0] * ny + transform[2][0] * nz;
-        let ty = transform[0][1] * nx + transform[1][1] * ny + transform[2][1] * nz;
-        let tz = transform[0][2] * nx + transform[1][2] * ny + transform[2][2] * nz;
-        // Re-normalize (transform may include scale)
-        let len = (tx * tx + ty * ty + tz * tz).sqrt();
-        if len > 1e-6 {
-            *normal = [tx / len, ty / len, tz / len];
-        }
-    }
 }
 
 /// Extract a single primitive's data.
@@ -371,6 +263,7 @@ fn extract_primitive(
         texture_width,
         texture_height,
         rtc_center,
+        local_transform: IDENTITY_F64,
     }))
 }
 
@@ -720,8 +613,9 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_node_transform_identity() {
-        let mut mesh = ExtractedMesh {
+    fn test_local_transform_stored_not_applied() {
+        // Verify that extract stores local_transform but does NOT apply it to vertices.
+        let mesh = ExtractedMesh {
             positions: vec![[1.0, 2.0, 3.0]],
             normals: vec![[0.0, 0.0, 1.0]],
             tex_coords: vec![[0.5, 0.5]],
@@ -730,44 +624,19 @@ mod tests {
             texture_width: 0,
             texture_height: 0,
             rtc_center: None,
+            local_transform: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [100.0, 200.0, 300.0, 1.0],
+            ],
         };
-        apply_node_transform(&mut mesh, &IDENTITY_F32);
+        // Positions remain unchanged — transform is applied at render time
         assert!((mesh.positions[0][0] - 1.0).abs() < 1e-6);
         assert!((mesh.positions[0][1] - 2.0).abs() < 1e-6);
         assert!((mesh.positions[0][2] - 3.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_apply_node_transform_y_up_to_z_up() {
-        // Y-up to Z-up rotation: swap Y→Z, Z→-Y
-        // This is common in Cesium glTF tiles.
-        let y_to_z: [[f32; 4]; 4] = [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, -1.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ];
-        let mut mesh = ExtractedMesh {
-            positions: vec![[1.0, 5.0, 0.0]], // (x=1, y_up=5, z_up=0)
-            normals: vec![[0.0, 1.0, 0.0]],   // pointing up in Y-up
-            tex_coords: vec![[0.0, 0.0]],
-            indices: vec![0],
-            texture_rgba: None,
-            texture_width: 0,
-            texture_height: 0,
-            rtc_center: None,
-        };
-        apply_node_transform(&mut mesh, &y_to_z);
-
-        // After Y→Z rotation: (1, 5, 0) → (1, 0, 5)
-        assert!((mesh.positions[0][0] - 1.0).abs() < 1e-5);
-        assert!(mesh.positions[0][1].abs() < 1e-5);
-        assert!((mesh.positions[0][2] - 5.0).abs() < 1e-5);
-
-        // Normal (0,1,0) → (0,0,1) in Z-up
-        assert!(mesh.normals[0][0].abs() < 1e-5);
-        assert!(mesh.normals[0][1].abs() < 1e-5);
-        assert!((mesh.normals[0][2] - 1.0).abs() < 1e-5);
+        // Transform is stored for later use
+        assert!((mesh.local_transform[3][0] - 100.0).abs() < 1e-6);
     }
 
     #[test]

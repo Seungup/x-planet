@@ -200,6 +200,8 @@ pub struct GpuTileContent {
     pub models: Vec<GpuModel3d>,
     /// RTC centers for each mesh (needed for model matrix computation).
     pub rtc_centers: Vec<Option<[f64; 3]>>,
+    /// Per-mesh local transforms (glTF node hierarchy).
+    pub local_transforms: Vec<glam::DMat4>,
     /// Total GPU memory used by this tile (vertex + index + texture bytes).
     pub gpu_bytes: usize,
     /// Last-access generation for LRU eviction.
@@ -312,6 +314,7 @@ impl Tiles3dLayerState {
     ) {
         let mut models = Vec::new();
         let mut rtc_centers = Vec::new();
+        let mut local_transforms = Vec::new();
         let mut tile_gpu_bytes: usize = 0;
 
         for (i, mesh) in decoded.meshes.iter().enumerate() {
@@ -372,6 +375,7 @@ impl Tiles3dLayerState {
 
             models.push(model);
             rtc_centers.push(mesh.rtc_center);
+            local_transforms.push(glam::DMat4::from_cols_array_2d(&mesh.local_transform));
         }
 
         if !models.is_empty() {
@@ -381,6 +385,7 @@ impl Tiles3dLayerState {
                 GpuTileContent {
                     models,
                     rtc_centers,
+                    local_transforms,
                     gpu_bytes: tile_gpu_bytes,
                     last_access: self.generation,
                 },
@@ -434,11 +439,11 @@ impl Tiles3dLayerState {
         for tile in render_set {
             if let Some(content) = self.gpu_tiles.get_mut(&tile.content_uri) {
                 content.last_access = current_gen;
-                for (model, rtc_center) in
-                    content.models.iter().zip(content.rtc_centers.iter())
+                for ((model, rtc_center), local_tr) in
+                    content.models.iter().zip(content.rtc_centers.iter()).zip(content.local_transforms.iter())
                 {
                     let model_matrix =
-                        x_planets_core::tiles3d_pipeline::build_model_matrix(*rtc_center, tile.transform);
+                        x_planets_core::tiles3d_pipeline::build_model_matrix(*rtc_center, *local_tr, tile.transform);
                     let relative =
                         x_planets_core::tiles3d_pipeline::ecef_to_relative_world(model_matrix, camera_ecef);
                     model.update_transform(queue, relative.to_cols_array(), opacity);
