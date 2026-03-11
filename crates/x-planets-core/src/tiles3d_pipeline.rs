@@ -182,6 +182,12 @@ pub fn ecef_to_relative_world(ecef_transform: DMat4, reference_ecef: DVec3) -> M
 ///
 /// Composes: tile_transform × local_transform × translate(rtc)
 ///
+/// When `local_transform` already contains an ECEF-scale translation
+/// (magnitude > 10 km), it is treated as self-positioning: the tile
+/// hierarchy transform is skipped to avoid double-counting the ECEF
+/// position.  This is the case for Cesium CWT tiles where the glTF
+/// node transform includes the full ECEF placement.
+///
 /// - `rtc_center`: CESIUM_RTC or B3DM feature table offset (tile-local space)
 /// - `local_transform`: glTF node hierarchy transform (Y-up → ECEF conversion)
 /// - `tile_transform`: 3D Tiles hierarchy transform (tile-local → ECEF)
@@ -190,7 +196,17 @@ pub fn build_model_matrix(
     local_transform: DMat4,
     tile_transform: DMat4,
 ) -> DMat4 {
-    let mut result = tile_transform * local_transform;
+    // If local_transform has an ECEF-scale translation, it already
+    // positions the content in ECEF.  Composing with tile_transform
+    // would double-count the positioning.
+    let local_translation = local_transform.col(3).truncate();
+    let effective_tile_transform = if local_translation.length() > 10_000.0 {
+        DMat4::IDENTITY
+    } else {
+        tile_transform
+    };
+
+    let mut result = effective_tile_transform * local_transform;
     if let Some(rtc) = rtc_center {
         let rtc_translation = DMat4::from_translation(DVec3::new(rtc[0], rtc[1], rtc[2]));
         result = result * rtc_translation;
