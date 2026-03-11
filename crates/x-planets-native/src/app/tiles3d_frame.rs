@@ -160,6 +160,8 @@ impl NativeApp {
                                     content_uri,
                                     e
                                 );
+                                // Mark as loaded to prevent infinite re-fetch.
+                                ts3d.loaded_uris.insert(content_uri.clone());
                             }
                         }
                     }

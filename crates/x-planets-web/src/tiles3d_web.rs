@@ -223,6 +223,8 @@ impl Tiles3dWebState {
                 Tiles3dMsg::ContentFailed { content_uri, error } => {
                     self.pending_uris.remove(&content_uri);
                     log::warn!("[{}] 3D tile failed: {} - {}", self.name, content_uri, error);
+                    // Mark as loaded to prevent infinite re-fetch.
+                    self.loaded_uris.insert(content_uri);
                 }
             }
         }
@@ -384,6 +386,9 @@ impl Tiles3dWebState {
             local_transforms.push(glam::DMat4::from_cols_array_2d(&mesh.local_transform));
         }
 
+        // Always mark as loaded to prevent infinite re-fetch of empty tiles.
+        self.loaded_uris.insert(content_uri.to_string());
+
         if !models.is_empty() {
             self.total_gpu_bytes += tile_gpu_bytes;
             self.gpu_tiles.insert(content_uri.to_string(), GpuTileContent {
@@ -391,7 +396,6 @@ impl Tiles3dWebState {
                 gpu_bytes: tile_gpu_bytes,
                 last_access: self.generation,
             });
-            self.loaded_uris.insert(content_uri.to_string());
             self.evict_over_budget();
         }
     }

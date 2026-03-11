@@ -118,18 +118,20 @@ pub fn extract_meshes_from_glb(
                 .sqrt();
             let has_large_translation = translation_mag > 10_000.0;
 
-            // Transform to apply to vertex positions: full or rotation-only.
-            let vertex_transform = if has_large_translation {
-                [
+            // When the node transform has a large (ECEF-scale) translation,
+            // strip it from local_transform.  The tile hierarchy transform
+            // already positions the content in ECEF; keeping the large
+            // translation would double-count the position.
+            let stored_local_transform = if has_large_translation {
+                f32_to_f64_mat4(&[
                     transform[0],
                     transform[1],
                     transform[2],
-                    [0.0, 0.0, 0.0, 1.0], // zero out translation
-                ]
+                    [0.0, 0.0, 0.0, 1.0], // keep rotation/scale, zero translation
+                ])
             } else {
-                transform
+                local_transform
             };
-            let apply_vertex_transform = vertex_transform != IDENTITY_F32;
 
             for primitive in mesh.primitives() {
                 // Skip non-triangle primitives (strips, fans, lines, points)
@@ -140,7 +142,7 @@ pub fn extract_meshes_from_glb(
                 if let Some(mut extracted) =
                     extract_primitive(&primitive, &buffers, &images, rtc_center)?
                 {
-                    extracted.local_transform = local_transform;
+                    extracted.local_transform = stored_local_transform;
                     meshes.push(extracted);
                 }
             }
