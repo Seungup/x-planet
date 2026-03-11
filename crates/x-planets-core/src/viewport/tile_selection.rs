@@ -368,8 +368,11 @@ impl super::Viewport {
 
         // Check if a tile at the given zoom is beyond the clip sphere.
         // Accounts for the tile's angular half-size as margin.
+        // Only applies in Globe mode where the shader clips at 85°.
+        // Centered mode renders the full spherical cap on a flat plane
+        // without fragment clipping, so tiles beyond 85° are still visible.
         let is_beyond_clip = |tc: glam::DVec2, zoom: u8| -> bool {
-            if !use_angular {
+            if mode != TileLodMode::Globe {
                 return false;
             }
             let tile_half_deg = 180.0 / (1u64 << zoom) as f64;

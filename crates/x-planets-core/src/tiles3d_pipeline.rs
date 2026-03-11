@@ -28,8 +28,26 @@ pub fn viewport_to_traversal_camera(viewport: &Viewport) -> TraversalCamera {
     // Camera altitude from zoom level (approximate).
     let altitude = zoom_to_altitude_for(viewport.zoom, viewport.body.circumference);
 
-    // Camera position in ECEF.
-    let position_ecef = geodetic_to_ecef(lat_rad, lon_rad, altitude, &viewport.body.ellipsoid);
+    // Displace camera position backward for pitch, matching the raster
+    // renderer's orbit-style camera model.  At pitch=0 the camera is
+    // directly above the center; at pitch>0 it moves backward and lower.
+    let pitch_rad = viewport.pitch.to_radians();
+    let bearing_rad = viewport.bearing.to_radians();
+
+    let sin_lat = lat_rad.sin();
+    let cos_lat = lat_rad.cos();
+    let sin_lon = lon_rad.sin();
+    let cos_lon = lon_rad.cos();
+
+    let up = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
+    let east = DVec3::new(-sin_lon, cos_lon, 0.0);
+    let north = up.cross(east).normalize();
+
+    // Camera is displaced backward (opposite to bearing direction) by pitch.
+    let forward_horizontal = north * bearing_rad.cos() + east * bearing_rad.sin();
+    let backward = -forward_horizontal * pitch_rad.sin() + up * pitch_rad.cos();
+    let position_ecef = geodetic_to_ecef(lat_rad, lon_rad, 0.0, &viewport.body.ellipsoid)
+        + backward.normalize() * altitude;
 
     // Build view-projection matrix.
     let view_proj = build_ecef_view_proj(viewport, position_ecef, lat_rad, lon_rad, altitude);
@@ -200,9 +218,6 @@ pub fn build_tiles3d_uniforms(viewport: &Viewport) -> (x_planets_math::ViewportU
     let lon_rad = viewport.center.lon.to_radians();
     let altitude = zoom_to_altitude_for(viewport.zoom, viewport.body.circumference);
 
-    // Camera ECEF position (returned for model matrix computation).
-    let camera_ecef = geodetic_to_ecef(lat_rad, lon_rad, altitude, &viewport.body.ellipsoid);
-
     // ── Local ENU basis ──
     let sin_lat = lat_rad.sin();
     let cos_lat = lat_rad.cos();
@@ -223,6 +238,11 @@ pub fn build_tiles3d_uniforms(viewport: &Viewport) -> (x_planets_math::ViewportU
 
     let forward_horizontal = north * cos_bearing + east * sin_bearing;
     let forward = (-up * cos_pitch + forward_horizontal * sin_pitch).normalize();
+
+    // Camera ECEF position: displaced backward for pitch (orbit-style).
+    let backward = -forward_horizontal * sin_pitch + up * cos_pitch;
+    let camera_ecef = geodetic_to_ecef(lat_rad, lon_rad, 0.0, &viewport.body.ellipsoid)
+        + backward.normalize() * altitude;
 
     let camera_up = if pitch_rad.abs() < 0.01 {
         (north * cos_bearing + east * sin_bearing).normalize()

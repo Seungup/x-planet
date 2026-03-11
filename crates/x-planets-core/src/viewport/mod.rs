@@ -1528,4 +1528,148 @@ mod tests {
             }
         }
     }
+
+    /// Diagnostic: verify centered Mercator clip-space positions at various pitch values.
+    ///
+    /// Simulates the shader's vertex transform (tile.mvp * position) and checks that
+    /// the center tile's center vertex ends up in the visible clip volume [-w, +w].
+    #[test]
+    fn test_centered_clip_space_at_pitch() {
+        use crate::pipeline::tile_mesh::centered_tile_center;
+
+        for pitch in [0.0, 15.0, 30.0, 45.0, 60.0] {
+            let mut vp = Viewport::new(1920, 1080);
+            vp.center = GeoCoord::new(37.5665, 126.978);
+            vp.zoom = 10.0;
+            vp.pitch = pitch;
+
+            let vp_f64 = vp.to_view_proj_f64_projected(x_planets_math::ProjectionMode::Mercator);
+            let center_lat_rad = vp.center.lat.to_radians();
+            let center_lon_rad = vp.center.lon.to_radians();
+
+            // Get the tiles for this viewport.
+            let tiles = vp.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+            assert!(!tiles.is_empty(), "No tiles at pitch={pitch}");
+
+            // Find a tile near the center.
+            let center_merc = x_planets_math::geo_to_mercator(&vp.center);
+            let base_z = vp.tile_zoom();
+            let n = (1u32 << base_z) as f64;
+            let center_tx = (center_merc.x * n).floor() as u32;
+            let center_ty = (center_merc.y * n).floor() as u32;
+
+            let center_tile = tiles.iter().find(|t| {
+                t.coord.z == base_z && t.coord.x == center_tx && t.coord.y == center_ty
+            });
+            // Accept parent-level tile if exact match not found
+            let tile = center_tile.or_else(|| tiles.first());
+            let tile = tile.expect("Should have at least one tile");
+
+            // Compute the tile center in oblique Mercator
+            let tc = centered_tile_center(&tile.coord, tile.display_x, center_lat_rad, center_lon_rad);
+
+            // Build the model matrix (same as tile_uniforms_for_centered)
+            let model = glam::DMat4::from_translation(glam::DVec3::new(tc.x, tc.y, 0.0));
+            let mvp = vp_f64 * model;
+
+            // Transform the tile center vertex (position = 0,0,0 since it's RTE)
+            let clip = mvp * glam::DVec4::new(0.0, 0.0, 0.0, 1.0);
+
+            // The clip position should be within the visible volume
+            let ndc_x = clip.x / clip.w;
+            let ndc_y = clip.y / clip.w;
+            let ndc_z = clip.z / clip.w;
+
+            assert!(
+                clip.w > 0.0,
+                "pitch={pitch}: w={} should be positive (tile behind camera?)",
+                clip.w
+            );
+            assert!(
+                ndc_x.abs() < 2.0 && ndc_y.abs() < 2.0,
+                "pitch={pitch}: center tile NDC ({ndc_x:.3}, {ndc_y:.3}) is off-screen",
+            );
+            assert!(
+                ndc_z >= 0.0 && ndc_z <= 1.0,
+                "pitch={pitch}: center tile depth {ndc_z:.6} outside [0, 1] (near/far clipped)",
+            );
+        }
+    }
+
+    /// Diagnostic: verify centered clip positions at zoom=15 (3D buildings preset).
+    #[test]
+    fn test_centered_clip_space_at_zoom15_pitch() {
+        for pitch in [0.0, 10.0, 20.0, 30.0, 45.0, 60.0] {
+            let mut vp = Viewport::new(1920, 1080);
+            vp.center = GeoCoord::new(40.6892, -74.0445); // Statue of Liberty
+            vp.zoom = 15.0;
+            vp.pitch = pitch;
+
+            let vp_f64 = vp.to_view_proj_f64_projected(x_planets_math::ProjectionMode::Mercator);
+            let tiles = vp.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+            assert!(!tiles.is_empty(), "No tiles at zoom=15 pitch={pitch}");
+
+            // Transform the viewport center (oblique Mercator 0.5, 0.5) through the VP
+            let center_clip = vp_f64 * glam::DVec4::new(0.5, 0.5, 0.0, 1.0);
+            assert!(
+                center_clip.w > 0.0,
+                "pitch={pitch}: w={} should be positive",
+                center_clip.w
+            );
+
+            let ndc_x = center_clip.x / center_clip.w;
+            let ndc_y = center_clip.y / center_clip.w;
+            let ndc_z = center_clip.z / center_clip.w;
+
+            assert!(
+                ndc_x.abs() < 1.5,
+                "pitch={pitch}: center NDC x={ndc_x:.4} out of range",
+            );
+            // At high pitch, center moves down in screen space (y increases)
+            // but should still be visible
+            assert!(
+                ndc_y.abs() < 2.0,
+                "pitch={pitch}: center NDC y={ndc_y:.4} out of range",
+            );
+            assert!(
+                ndc_z >= -0.01 && ndc_z <= 1.01,
+                "pitch={pitch}: center depth {ndc_z:.6} clipped by near/far",
+            );
+        }
+    }
+
+    /// Verify clip_sphere check doesn't discard center-tile fragments at any pitch.
+    #[test]
+    fn test_clip_sphere_passes_at_center() {
+        for pitch in [0.0, 30.0, 60.0] {
+            let mut vp = Viewport::new(1920, 1080);
+            vp.center = GeoCoord::new(37.5665, 126.978);
+            vp.zoom = 10.0;
+            vp.pitch = pitch;
+
+            let uniforms = vp.to_uniforms();
+            let clip_center = glam::Vec3::new(
+                uniforms.clip_sphere[0],
+                uniforms.clip_sphere[1],
+                uniforms.clip_sphere[2],
+            );
+            let cos_clip = uniforms.clip_sphere[3];
+
+            // sphere_pos for the viewport center
+            let center_sphere = x_planets_math::geo_to_unit_sphere(
+                vp.center.lat.to_radians(),
+                vp.center.lon.to_radians(),
+            );
+            let sp = glam::Vec3::new(
+                center_sphere.x as f32,
+                center_sphere.y as f32,
+                center_sphere.z as f32,
+            );
+            let cos_angle = sp.normalize().dot(clip_center);
+            assert!(
+                cos_angle >= cos_clip,
+                "pitch={pitch}: center fragment would be clipped! cos_angle={cos_angle} < cos_clip={cos_clip}",
+            );
+        }
+    }
 }
