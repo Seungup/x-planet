@@ -103,6 +103,34 @@ pub fn extract_meshes_from_glb(
             // Convert node transform to f64 for the local_transform field.
             let local_transform = f32_to_f64_mat4(&transform);
 
+            // Check if the node transform has a large translation (ECEF offset).
+            // If so, split it: apply only rotation/scale to vertices, and fold
+            // the translation into the RTC center.  This prevents the tile
+            // hierarchy's transform from double-counting the ECEF position.
+            let node_translation = [
+                transform[3][0] as f64,
+                transform[3][1] as f64,
+                transform[3][2] as f64,
+            ];
+            let translation_mag = (node_translation[0] * node_translation[0]
+                + node_translation[1] * node_translation[1]
+                + node_translation[2] * node_translation[2])
+                .sqrt();
+            let has_large_translation = translation_mag > 10_000.0;
+
+            // Transform to apply to vertex positions: full or rotation-only.
+            let vertex_transform = if has_large_translation {
+                [
+                    transform[0],
+                    transform[1],
+                    transform[2],
+                    [0.0, 0.0, 0.0, 1.0], // zero out translation
+                ]
+            } else {
+                transform
+            };
+            let apply_vertex_transform = vertex_transform != IDENTITY_F32;
+
             for primitive in mesh.primitives() {
                 // Skip non-triangle primitives (strips, fans, lines, points)
                 // since the render pipeline uses TriangleList topology.
