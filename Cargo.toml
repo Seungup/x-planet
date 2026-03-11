@@ -39,7 +39,7 @@ toml = "0.8"
 dotenvy = "0.15"
 
 # 3D model formats
-gltf = { version = "1", features = ["extensions"] }
+gltf = { version = "1", features = ["extensions", "extras"] }
 
 # Image processing
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
