@@ -147,6 +147,38 @@ pub fn extract_meshes_from_glb(
         }
     }
 
+    // Post-process: synthesize RTC center for meshes with large absolute
+    // positions but no RTC.  Some 3D Tiles (e.g. Cesium OSM Buildings) bake
+    // ECEF positions directly into vertices without RTC_CENTER.  Subtracting
+    // the centroid keeps vertex values small for f32 GPU precision.
+    for mesh in &mut meshes {
+        if mesh.rtc_center.is_some() || mesh.positions.is_empty() {
+            continue;
+        }
+        let n = mesh.positions.len() as f64;
+        let centroid = mesh.positions.iter().fold([0.0_f64; 3], |acc, p| {
+            [acc[0] + p[0] as f64, acc[1] + p[1] as f64, acc[2] + p[2] as f64]
+        });
+        let centroid = [centroid[0] / n, centroid[1] / n, centroid[2] / n];
+
+        // Only synthesize if positions are large (> 10 km from origin).
+        let mag = (centroid[0] * centroid[0]
+            + centroid[1] * centroid[1]
+            + centroid[2] * centroid[2])
+            .sqrt();
+        if mag > 10_000.0 {
+            let cx = centroid[0] as f32;
+            let cy = centroid[1] as f32;
+            let cz = centroid[2] as f32;
+            for pos in &mut mesh.positions {
+                pos[0] -= cx;
+                pos[1] -= cy;
+                pos[2] -= cz;
+            }
+            mesh.rtc_center = Some(centroid);
+        }
+    }
+
     Ok(meshes)
 }
 
