@@ -203,3 +203,57 @@ pub fn build_centered_tile_mesh(
 
     (all_verts, all_idxs, tile_idx_counts)
 }
+
+// ───────────────────────────────────────────────────────────────────
+// Tests
+// ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify centered tile meshes produce valid (finite, non-NaN) vertices
+    /// at zoom=15 with pitch=60 — the 3D buildings preset scenario.
+    #[test]
+    fn test_centered_mesh_valid_at_high_zoom_pitch() {
+        use crate::viewport::Viewport;
+        use x_planets_math::GeoCoord;
+
+        let mut vp = Viewport::new(1920, 1080);
+        vp.center = GeoCoord::new(40.6892, -74.0445);
+        vp.zoom = 15.0;
+        vp.pitch = 60.0;
+
+        let center_lat_rad = vp.center.lat.to_radians();
+        let center_lon_rad = vp.center.lon.to_radians();
+
+        let tiles = vp.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+        assert!(!tiles.is_empty(), "Should have visible tiles at zoom=15 pitch=60");
+
+        let renderables: Vec<RenderableTile> = tiles.iter().map(|vt| RenderableTile {
+            coord: vt.coord,
+            texture_coord: vt.coord,
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            display_x: vt.display_x,
+        }).collect();
+
+        let (verts, idxs, counts) =
+            build_centered_tile_mesh(&renderables, center_lat_rad, center_lon_rad);
+
+        assert!(!verts.is_empty(), "Should produce vertices");
+        assert!(!idxs.is_empty(), "Should produce indices");
+        assert_eq!(counts.len(), renderables.len(), "One count per tile");
+
+        // Check all vertices are finite
+        let mut nan_count = 0;
+        for v in &verts {
+            for &p in &v.position {
+                if !p.is_finite() { nan_count += 1; }
+            }
+            for &s in &v.sphere_pos {
+                if !s.is_finite() { nan_count += 1; }
+            }
+        }
+        assert_eq!(nan_count, 0, "All vertex positions and sphere_pos must be finite");
+    }
+}
