@@ -335,6 +335,23 @@ impl Tiles3dWebState {
                 continue;
             }
 
+            // Log first mesh stats for debugging
+            if i == 0 {
+                let pos_range = mesh.positions.iter().fold(
+                    ([f32::MAX; 3], [f32::MIN; 3]),
+                    |(min, max), p| {
+                        ([min[0].min(p[0]), min[1].min(p[1]), min[2].min(p[2])],
+                         [max[0].max(p[0]), max[1].max(p[1]), max[2].max(p[2])])
+                    },
+                );
+                log::info!(
+                    "[3dtiles] upload mesh: {} verts, {} indices, rtc={:?}, pos_range=[({:.1},{:.1},{:.1})..({:.1},{:.1},{:.1})]",
+                    vertices.len(), mesh.indices.len(), mesh.rtc_center,
+                    pos_range.0[0], pos_range.0[1], pos_range.0[2],
+                    pos_range.1[0], pos_range.1[1], pos_range.1[2],
+                );
+            }
+
             let vertex_bytes = vertices.len() * std::mem::size_of::<Model3dVertex>();
             let index_bytes = mesh.indices.len() * std::mem::size_of::<u32>();
             let texture_bytes = mesh.texture_rgba.as_ref().map_or(0, |rgba| rgba.len());
@@ -435,12 +452,26 @@ impl Tiles3dWebState {
         opacity: f32,
     ) {
         let gen = self.generation;
+        let mut logged_first = gen % 300 != 0; // Log first tile every ~300 frames
         for tile in render_set {
             if let Some(content) = self.gpu_tiles.get_mut(&tile.content_uri) {
                 content.last_access = gen;
                 for (model, rtc) in content.models.iter().zip(content.rtc_centers.iter()) {
                     let mm = x_planets_core::tiles3d_pipeline::build_model_matrix(*rtc, tile.transform);
                     let rel = x_planets_core::tiles3d_pipeline::ecef_to_relative_world(mm, camera_ecef);
+
+                    if !logged_first {
+                        logged_first = true;
+                        let t = rel.col(3);
+                        log::info!(
+                            "[3dtiles] render: {} tiles, camera_ecef=({:.0},{:.0},{:.0}), rel_translation=({:.1},{:.1},{:.1}), rtc={:?}",
+                            render_set.len(),
+                            camera_ecef.x, camera_ecef.y, camera_ecef.z,
+                            t.x, t.y, t.z,
+                            rtc,
+                        );
+                    }
+
                     model.update_transform(queue, rel.to_cols_array(), opacity);
                 }
             }

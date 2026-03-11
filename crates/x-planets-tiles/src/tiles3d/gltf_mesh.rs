@@ -95,11 +95,35 @@ pub fn extract_meshes_from_glb(
             let has_transform = transform != IDENTITY_F32;
 
             for primitive in mesh.primitives() {
+                // Skip non-triangle primitives (strips, fans, lines, points)
+                // since the render pipeline uses TriangleList topology.
+                if primitive.mode() != gltf::mesh::Mode::Triangles {
+                    continue;
+                }
                 if let Some(mut extracted) =
                     extract_primitive(&primitive, &buffers, &images, rtc_center)?
                 {
                     if has_transform {
                         apply_node_transform(&mut extracted, &transform);
+                        // Also transform RTC_CENTER to keep it consistent
+                        // with the now-transformed vertex positions.
+                        if let Some(rtc) = &mut extracted.rtc_center {
+                            let [x, y, z] = *rtc;
+                            *rtc = [
+                                transform[0][0] as f64 * x
+                                    + transform[1][0] as f64 * y
+                                    + transform[2][0] as f64 * z
+                                    + transform[3][0] as f64,
+                                transform[0][1] as f64 * x
+                                    + transform[1][1] as f64 * y
+                                    + transform[2][1] as f64 * z
+                                    + transform[3][1] as f64,
+                                transform[0][2] as f64 * x
+                                    + transform[1][2] as f64 * y
+                                    + transform[2][2] as f64 * z
+                                    + transform[3][2] as f64,
+                            ];
+                        }
                     }
                     meshes.push(extracted);
                 }
@@ -111,6 +135,9 @@ pub fn extract_meshes_from_glb(
     if meshes.is_empty() {
         for mesh in document.meshes() {
             for primitive in mesh.primitives() {
+                if primitive.mode() != gltf::mesh::Mode::Triangles {
+                    continue;
+                }
                 if let Some(extracted) =
                     extract_primitive(&primitive, &buffers, &images, rtc_center)?
                 {
