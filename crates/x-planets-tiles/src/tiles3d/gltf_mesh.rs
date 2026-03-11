@@ -94,6 +94,34 @@ pub fn extract_meshes_from_glb(
                 .unwrap_or(IDENTITY_F32);
             let has_transform = transform != IDENTITY_F32;
 
+            // Check if the node transform has a large translation (ECEF offset).
+            // If so, split it: apply only rotation/scale to vertices, and fold
+            // the translation into the RTC center.  This prevents the tile
+            // hierarchy's transform from double-counting the ECEF position.
+            let node_translation = [
+                transform[3][0] as f64,
+                transform[3][1] as f64,
+                transform[3][2] as f64,
+            ];
+            let translation_mag = (node_translation[0] * node_translation[0]
+                + node_translation[1] * node_translation[1]
+                + node_translation[2] * node_translation[2])
+                .sqrt();
+            let has_large_translation = translation_mag > 10_000.0;
+
+            // Transform to apply to vertex positions: full or rotation-only.
+            let vertex_transform = if has_large_translation {
+                [
+                    transform[0],
+                    transform[1],
+                    transform[2],
+                    [0.0, 0.0, 0.0, 1.0], // zero out translation
+                ]
+            } else {
+                transform
+            };
+            let apply_vertex_transform = vertex_transform != IDENTITY_F32;
+
             for primitive in mesh.primitives() {
                 // Skip non-triangle primitives (strips, fans, lines, points)
                 // since the render pipeline uses TriangleList topology.
@@ -104,10 +132,38 @@ pub fn extract_meshes_from_glb(
                     extract_primitive(&primitive, &buffers, &images, rtc_center)?
                 {
                     if has_transform {
-                        apply_node_transform(&mut extracted, &transform);
-                        // Also transform RTC_CENTER to keep it consistent
-                        // with the now-transformed vertex positions.
-                        if let Some(rtc) = &mut extracted.rtc_center {
+                        if apply_vertex_transform {
+                            apply_node_transform(&mut extracted, &vertex_transform);
+                        }
+
+                        if has_large_translation {
+                            // Fold node translation into RTC center.
+                            // Transform existing RTC by rotation, then add node translation.
+                            match &mut extracted.rtc_center {
+                                Some(rtc) => {
+                                    let [x, y, z] = *rtc;
+                                    // Rotate existing RTC by node's rotation/scale
+                                    *rtc = [
+                                        transform[0][0] as f64 * x
+                                            + transform[1][0] as f64 * y
+                                            + transform[2][0] as f64 * z
+                                            + node_translation[0],
+                                        transform[0][1] as f64 * x
+                                            + transform[1][1] as f64 * y
+                                            + transform[2][1] as f64 * z
+                                            + node_translation[1],
+                                        transform[0][2] as f64 * x
+                                            + transform[1][2] as f64 * y
+                                            + transform[2][2] as f64 * z
+                                            + node_translation[2],
+                                    ];
+                                }
+                                None => {
+                                    extracted.rtc_center = Some(node_translation);
+                                }
+                            }
+                        } else if let Some(rtc) = &mut extracted.rtc_center {
+                            // Small translation: transform RTC by full node transform.
                             let [x, y, z] = *rtc;
                             *rtc = [
                                 transform[0][0] as f64 * x
