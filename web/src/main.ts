@@ -74,6 +74,10 @@ async function switchPreset(preset: ExamplePreset): Promise<void> {
     showTokenBanner();
   }
 
+  // Wait for layout after clearing old map — canvas dimensions may
+  // need a frame to settle (especially on iOS Safari).
+  await waitForLayout();
+
   // Create new map with selected config
   currentMap = await createMap(preset);
 
@@ -88,7 +92,17 @@ async function switchPreset(preset: ExamplePreset): Promise<void> {
   }
 }
 
+/** Wait for layout to complete (important for iOS Safari). */
+function waitForLayout(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
 async function main(): Promise<void> {
+  // Ensure the canvas element has been laid out before creating the GPU
+  // surface. On iOS Safari, clientWidth/clientHeight can return 0 if
+  // the first layout pass hasn't finished yet.
+  await waitForLayout();
+
   const presetId = getPresetId();
   const preset = PRESETS.find((p) => p.id === presetId) ?? PRESETS[0];
   await switchPreset(preset);
