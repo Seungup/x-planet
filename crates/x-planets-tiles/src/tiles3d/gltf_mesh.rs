@@ -103,36 +103,6 @@ pub fn extract_meshes_from_glb(
             // Convert node transform to f64 for the local_transform field.
             let local_transform = f32_to_f64_mat4(&transform);
 
-            // Check if the node transform has a large translation (ECEF offset).
-            // If so, split it: apply only rotation/scale to vertices, and fold
-            // the translation into the RTC center.  This prevents the tile
-            // hierarchy's transform from double-counting the ECEF position.
-            let node_translation = [
-                transform[3][0] as f64,
-                transform[3][1] as f64,
-                transform[3][2] as f64,
-            ];
-            let translation_mag = (node_translation[0] * node_translation[0]
-                + node_translation[1] * node_translation[1]
-                + node_translation[2] * node_translation[2])
-                .sqrt();
-            let has_large_translation = translation_mag > 10_000.0;
-
-            // When the node transform has a large (ECEF-scale) translation,
-            // strip it from local_transform.  The tile hierarchy transform
-            // already positions the content in ECEF; keeping the large
-            // translation would double-count the position.
-            let stored_local_transform = if has_large_translation {
-                f32_to_f64_mat4(&[
-                    transform[0],
-                    transform[1],
-                    transform[2],
-                    [0.0, 0.0, 0.0, 1.0], // keep rotation/scale, zero translation
-                ])
-            } else {
-                local_transform
-            };
-
             for primitive in mesh.primitives() {
                 // Skip non-triangle primitives (strips, fans, lines, points)
                 // since the render pipeline uses TriangleList topology.
@@ -142,7 +112,7 @@ pub fn extract_meshes_from_glb(
                 if let Some(mut extracted) =
                     extract_primitive(&primitive, &buffers, &images, rtc_center)?
                 {
-                    extracted.local_transform = stored_local_transform;
+                    extracted.local_transform = local_transform;
                     meshes.push(extracted);
                 }
             }
