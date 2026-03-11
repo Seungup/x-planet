@@ -302,7 +302,17 @@ impl Tiles3dWebState {
         }
 
         // Unload
+        if !traversal.unload_set.is_empty() && self.generation % 300 == 1 {
+            log::info!(
+                "[3dtiles] unloading {} tiles, load_requests={}",
+                traversal.unload_set.len(),
+                traversal.load_requests.len(),
+            );
+        }
         for uri in &traversal.unload_set {
+            if self.gpu_tiles.contains_key(uri) {
+                log::info!("[3dtiles] unloading GPU tile: {}", uri);
+            }
             if let Some(evicted) = self.gpu_tiles.remove(uri) {
                 self.total_gpu_bytes = self.total_gpu_bytes.saturating_sub(evicted.gpu_bytes);
             }

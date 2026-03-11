@@ -632,6 +632,34 @@ impl WebApp {
                 &camera, viewport.height as f64, fov_y,
             );
 
+            // Diagnostic: log traversal results periodically
+            if ts3d.generation % 300 == 1 {
+                log::info!(
+                    "[3dtiles] traversal: render_set={}, loaded={}, pending={}, gpu_tiles={}, camera=({:.0},{:.0},{:.0})",
+                    render_set.len(),
+                    ts3d.loaded_uris.len(),
+                    ts3d.pending_uris.len(),
+                    ts3d.gpu_tiles.len(),
+                    camera.position_ecef.x, camera.position_ecef.y, camera.position_ecef.z,
+                );
+                if render_set.is_empty() && !ts3d.loaded_uris.is_empty() {
+                    // Log first few loaded URIs for debugging URI mismatch
+                    for (i, uri) in ts3d.loaded_uris.iter().take(3).enumerate() {
+                        log::info!("[3dtiles] loaded_uri[{}]: {}", i, uri);
+                    }
+                }
+                if !render_set.is_empty() {
+                    for (i, tile) in render_set.iter().take(3).enumerate() {
+                        let in_gpu = ts3d.gpu_tiles.contains_key(&tile.content_uri);
+                        log::info!(
+                            "[3dtiles] render[{}]: uri={}, in_gpu={}, sse={:.1}, transform_t=({:.0},{:.0},{:.0})",
+                            i, tile.content_uri, in_gpu, tile.sse,
+                            tile.transform.col(3).x, tile.transform.col(3).y, tile.transform.col(3).z,
+                        );
+                    }
+                }
+            }
+
             if render_set.is_empty() {
                 continue;
             }
