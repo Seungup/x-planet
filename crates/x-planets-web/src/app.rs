@@ -65,6 +65,10 @@ pub(crate) struct WebLayerState {
     pub max_elevation_concurrent: usize,
     /// Failed elevation tile fetches (separate from raster failures).
     pub failed_elevation_queue: Rc<RefCell<Vec<TileCoord>>>,
+    /// Per-coord failure count for elevation tiles.
+    elevation_fail_count: HashMap<TileCoord, u8>,
+    /// Elevation tiles that have permanently failed (exceeded max retries).
+    failed_elevation_permanent: HashSet<TileCoord>,
 }
 
 impl WebLayerState {
@@ -90,6 +94,8 @@ impl WebLayerState {
             pending_elevation_coords: HashSet::new(),
             max_elevation_concurrent: max_concurrent.min(4),
             failed_elevation_queue: Rc::new(RefCell::new(Vec::new())),
+            elevation_fail_count: HashMap::new(),
+            failed_elevation_permanent: HashSet::new(),
         }
     }
 
@@ -285,6 +291,8 @@ impl WebApp {
                 ls.elevation_url = None;
                 ls.terrain_data.clear();
                 ls.pending_elevation_coords.clear();
+                ls.elevation_fail_count.clear();
+                ls.failed_elevation_permanent.clear();
             }
         }
 
@@ -535,9 +543,14 @@ impl WebApp {
             for coord in ls.failed_queue.borrow_mut().drain(..) {
                 ls.pending_coords.remove(&coord);
             }
-            // Drain failed elevation fetch notifications
+            // Drain failed elevation fetch notifications — track retry counts
             for coord in ls.failed_elevation_queue.borrow_mut().drain(..) {
                 ls.pending_elevation_coords.remove(&coord);
+                let count = ls.elevation_fail_count.entry(coord).or_insert(0);
+                *count += 1;
+                if *count >= 3 {
+                    ls.failed_elevation_permanent.insert(coord);
+                }
             }
 
             // Process completed results with a per-frame upload budget.
@@ -775,6 +788,9 @@ impl WebApp {
                         if ls.pending_elevation_coords.contains(&req.coord) {
                             continue;
                         }
+                        if ls.failed_elevation_permanent.contains(&req.coord) {
+                            continue;
+                        }
                         let Some(ref elev_url_template) = elev_url else {
                             continue;
                         };
@@ -843,7 +859,11 @@ fn tile_url(template: &str, coord: &TileCoord) -> String {
 
 async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     let window = web_sys::window().ok_or("No window")?;
-    let resp = JsFuture::from(window.fetch_with_str(url))
+    let opts = web_sys::RequestInit::new();
+    opts.set_mode(web_sys::RequestMode::Cors);
+    let request = web_sys::Request::new_with_str_and_init(url, &opts)
+        .map_err(|e| format!("{:?}", e))?;
+    let resp = JsFuture::from(window.fetch_with_request(&request))
         .await
         .map_err(|e| format!("{:?}", e))?;
     let resp: web_sys::Response = resp
