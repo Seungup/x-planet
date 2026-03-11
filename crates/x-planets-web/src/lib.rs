@@ -684,9 +684,20 @@ mod web_impl {
                     if !name.is_empty() {
                         let terrain_encoding_explicit = encoding_str.is_some();
 
-                        // 3D Tiles auth config
+                        // 3D Tiles auth config (fall back to default public Cesium Ion token)
+                        const DEFAULT_CESIUM_ION_TOKEN: &str =
+                            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
+                             eyJqdGkiOiJlYjY4M2NmOS1kMjYyLTQ3MGUtYTdlNy1hYmZiNDcyNDViOWYiLCJpZCI6ODAxNTIsImlhdCI6MTY0MjY0NDM3Nn0.\
+                             u0rXHh2r0iuai_J-7minjL91ud3cEzhIR2ex47RP5vQ";
                         let cesium_ion_token = js_sys::Reflect::get(&item, &"cesiumIonToken".into())
-                            .ok().and_then(|v| v.as_string());
+                            .ok().and_then(|v| v.as_string())
+                            .or_else(|| {
+                                if matches!(kind, LayerKind::Tiles3d) {
+                                    Some(DEFAULT_CESIUM_ION_TOKEN.to_string())
+                                } else {
+                                    None
+                                }
+                            });
                         let cesium_ion_asset_id = js_sys::Reflect::get(&item, &"cesiumIonAsset".into())
                             .ok().and_then(|v| v.as_f64()).map(|n| n as u64);
                         let google_api_key = js_sys::Reflect::get(&item, &"googleApiKey".into())
