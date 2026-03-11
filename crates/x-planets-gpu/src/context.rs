@@ -79,17 +79,32 @@ impl GpuContext {
             )
             .await?;
 
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, width.max(1), height.max(1))
             .ok_or(GpuError::SurfaceConfig)?;
+
+        // Explicit alpha mode for iOS Safari compatibility.
+        // Safari's WebGPU expects an explicit alpha mode; relying on Auto
+        // can cause rendering artifacts on some iOS versions.
+        let surface_caps = surface.get_capabilities(&adapter);
+        if surface_caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
+        }
+        // Prefer Fifo (vsync) for broad mobile compatibility.
+        if surface_caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
+            config.present_mode = wgpu::PresentMode::Fifo;
+        }
+
         surface.configure(&device, &config);
 
         log::info!(
-            "GPU context initialized: {} ({}x{}, {:?})",
+            "GPU context initialized: {} ({}x{}, {:?}, alpha={:?}, present={:?})",
             adapter.get_info().name,
             config.width,
             config.height,
             config.format,
+            config.alpha_mode,
+            config.present_mode,
         );
 
         Ok(Self {

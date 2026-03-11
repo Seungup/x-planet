@@ -449,14 +449,35 @@ mod web_impl {
                 .ok_or_else(|| JsValue::from_str(&format!("Canvas '{}' not found", canvas_id)))?
                 .dyn_into::<web_sys::HtmlCanvasElement>()?;
 
-            // DPR-aware canvas sizing
+            // DPR-aware canvas sizing.
+            //
+            // On iOS Safari, `clientWidth`/`clientHeight` can return 0 before
+            // the first layout pass.  Use `getBoundingClientRect()` as primary
+            // source and fall back to `window.innerWidth/innerHeight`.
             let dpr = window.device_pixel_ratio();
-            let css_w = canvas.client_width() as f64;
-            let css_h = canvas.client_height() as f64;
+            let rect = canvas.get_bounding_client_rect();
+            let mut css_w = rect.width();
+            let mut css_h = rect.height();
+            if css_w < 1.0 || css_h < 1.0 {
+                // Fallback: clientWidth (integer but usually available)
+                css_w = canvas.client_width() as f64;
+                css_h = canvas.client_height() as f64;
+            }
+            if css_w < 1.0 || css_h < 1.0 {
+                // Last resort: use window inner dimensions
+                css_w = window.inner_width()
+                    .ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
+                css_h = window.inner_height()
+                    .ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
+            }
             let width = (css_w * dpr).max(1.0) as u32;
             let height = (css_h * dpr).max(1.0) as u32;
             canvas.set_width(width);
             canvas.set_height(height);
+            log::info!(
+                "Canvas init: css={}x{}, physical={}x{}, dpr={}",
+                css_w as u32, css_h as u32, width, height, dpr,
+            );
 
             // GPU
             let surface_target = wgpu::SurfaceTarget::Canvas(canvas.clone());

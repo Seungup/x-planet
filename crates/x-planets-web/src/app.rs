@@ -490,8 +490,24 @@ impl WebApp {
     }
 
     fn check_resize(&mut self) {
-        let css_w = self.canvas.client_width() as f64;
-        let css_h = self.canvas.client_height() as f64;
+        // Use getBoundingClientRect for reliable sizing on mobile Safari.
+        // clientWidth/clientHeight can return 0 before the first layout pass
+        // on iOS Safari, causing the viewport to stay at 1x1.
+        let rect = self.canvas.get_bounding_client_rect();
+        let mut css_w = rect.width();
+        let mut css_h = rect.height();
+        if css_w < 1.0 || css_h < 1.0 {
+            css_w = self.canvas.client_width() as f64;
+            css_h = self.canvas.client_height() as f64;
+        }
+        if css_w < 1.0 || css_h < 1.0 {
+            if let Some(window) = web_sys::window() {
+                css_w = window.inner_width()
+                    .ok().and_then(|v| v.as_f64()).unwrap_or(css_w);
+                css_h = window.inner_height()
+                    .ok().and_then(|v| v.as_f64()).unwrap_or(css_h);
+            }
+        }
         let w = (css_w * self.dpr).max(1.0) as u32;
         let h = (css_h * self.dpr).max(1.0) as u32;
         if w != self.last_width || h != self.last_height {
@@ -506,7 +522,7 @@ impl WebApp {
             }
             self.last_width = w;
             self.last_height = h;
-            log::info!("Resized: {}x{}", w, h);
+            log::info!("Resized: {}x{} (css: {}x{})", w, h, css_w as u32, css_h as u32);
         }
     }
 
