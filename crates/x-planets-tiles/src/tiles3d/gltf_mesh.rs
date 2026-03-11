@@ -147,10 +147,6 @@ pub fn extract_meshes_from_glb(
         }
     }
 
-    if meshes.is_empty() {
-        return Err(GltfExtractError::NoMeshes);
-    }
-
     Ok(meshes)
 }
 
