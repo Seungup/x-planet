@@ -198,18 +198,30 @@ pub fn build_model_matrix(
 ) -> DMat4 {
     // If local_transform has an ECEF-scale translation, it already
     // positions the content in ECEF.  Composing with tile_transform
-    // would double-count the positioning.
+    // or RTC_CENTER would double-count the positioning.
+    // This is the case for Cesium CWT tiles where the glTF node
+    // transform includes the full ECEF placement.
     let local_translation = local_transform.col(3).truncate();
-    let effective_tile_transform = if local_translation.length() > 10_000.0 {
+    let self_positioning = local_translation.length() > 10_000.0;
+
+    let effective_tile_transform = if self_positioning {
         DMat4::IDENTITY
     } else {
         tile_transform
     };
 
     let mut result = effective_tile_transform * local_transform;
-    if let Some(rtc) = rtc_center {
-        let rtc_translation = DMat4::from_translation(DVec3::new(rtc[0], rtc[1], rtc[2]));
-        result = result * rtc_translation;
+
+    // Only apply RTC offset when content is NOT self-positioning.
+    // Self-positioning content already encodes the ECEF position in
+    // local_transform; applying RTC_CENTER on top would produce a
+    // translation of ~2× ECEF magnitude, placing the tile millions
+    // of meters off-screen.
+    if !self_positioning {
+        if let Some(rtc) = rtc_center {
+            let rtc_translation = DMat4::from_translation(DVec3::new(rtc[0], rtc[1], rtc[2]));
+            result = result * rtc_translation;
+        }
     }
     result
 }
@@ -416,6 +428,62 @@ mod tests {
         assert!((t.x - 100.0).abs() < 1e-10);
         assert!((t.y - 200.0).abs() < 1e-10);
         assert!((t.z - 300.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_build_model_matrix_self_positioning_skips_rtc() {
+        // CWT tile: local_transform has ECEF-scale translation (self-positioning).
+        // RTC_CENTER should be SKIPPED to avoid double ECEF positioning.
+        let ecef_pos = DVec3::new(1_334_800.0, -4_654_000.0, 4_138_300.0); // NYC ECEF
+        let local_transform = DMat4::from_translation(ecef_pos);
+        let rtc = [1_334_900.0, -4_654_100.0, 4_138_400.0]; // Nearby ECEF
+
+        let model = build_model_matrix(Some(rtc), local_transform, DMat4::IDENTITY);
+
+        // Translation should be ONLY from local_transform (rtc skipped).
+        let t = model.col(3).truncate();
+        assert!(
+            (t - ecef_pos).length() < 1e-6,
+            "Self-positioning tile should ignore RTC_CENTER. Got ({:.0}, {:.0}, {:.0}), expected ({:.0}, {:.0}, {:.0})",
+            t.x, t.y, t.z, ecef_pos.x, ecef_pos.y, ecef_pos.z,
+        );
+    }
+
+    #[test]
+    fn test_build_model_matrix_self_positioning_skips_tile_transform() {
+        // CWT tile: local_transform has ECEF-scale translation.
+        // tile_transform should also be SKIPPED.
+        let ecef_pos = DVec3::new(1_334_800.0, -4_654_000.0, 4_138_300.0);
+        let local_transform = DMat4::from_translation(ecef_pos);
+        let tile_transform = DMat4::from_translation(DVec3::new(100.0, 200.0, 300.0));
+
+        let model = build_model_matrix(None, local_transform, tile_transform);
+
+        // Translation should be ONLY from local_transform.
+        let t = model.col(3).truncate();
+        assert!(
+            (t - ecef_pos).length() < 1e-6,
+            "Self-positioning tile should ignore tile_transform",
+        );
+    }
+
+    #[test]
+    fn test_build_model_matrix_normal_tile_uses_rtc_and_tile_transform() {
+        // Normal B3DM tile: local_transform is identity (no ECEF translation).
+        // Both RTC_CENTER and tile_transform should be applied.
+        let rtc = [1_334_800.0, -4_654_000.0, 4_138_300.0];
+        let tile_transform = DMat4::from_translation(DVec3::new(100.0, 0.0, 0.0));
+
+        let model = build_model_matrix(Some(rtc), DMat4::IDENTITY, tile_transform);
+
+        // Translation = tile_transform × (vertex + rtc) at vertex=0
+        // = tile_offset + rtc
+        let t = model.col(3).truncate();
+        assert!(
+            (t.x - (rtc[0] + 100.0)).abs() < 1e-6,
+            "Normal tile should apply both RTC and tile_transform. Got x={:.1}, expected {:.1}",
+            t.x, rtc[0] + 100.0,
+        );
     }
 
     #[test]

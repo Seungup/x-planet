@@ -196,7 +196,23 @@ impl Tiles3dWebState {
             match msg {
                 Tiles3dMsg::Initialized { tileset, base_url, access_token } => {
                     let tile_count = x_planets_tiles::tiles3d::tileset::tile_count(&tileset.root);
-                    log::info!("[{}] 3D Tiles initialized: {} tiles", self.name, tile_count);
+                    let has_implicit = tileset.root.implicit_tiling.is_some();
+                    let root_has_content = tileset.root.content.is_some();
+                    let root_children = tileset.root.children.len();
+                    let root_refine = tileset.root.refine;
+                    log::info!(
+                        "[{}] 3D Tiles initialized: {} tiles, root: children={}, content={}, implicit={}, refine={:?}, base_url={}",
+                        self.name, tile_count, root_children, root_has_content, has_implicit, root_refine, base_url,
+                    );
+                    if has_implicit {
+                        let it = tileset.root.implicit_tiling.as_ref().unwrap();
+                        log::warn!(
+                            "[{}] implicit tiling detected: scheme={:?}, subtree_levels={}, available_levels={}, subtrees={}, content={:?}",
+                            self.name, it.subdivision_scheme, it.subtree_levels, it.available_levels,
+                            it.subtrees.uri,
+                            it.content.as_ref().map(|c| &c.uri),
+                        );
+                    }
                     self.tileset = Some(tileset);
                     self.base_url = base_url;
                     self.access_token = access_token;
@@ -302,7 +318,17 @@ impl Tiles3dWebState {
         }
 
         // Unload
+        if !traversal.unload_set.is_empty() && self.generation % 300 == 1 {
+            log::info!(
+                "[3dtiles] unloading {} tiles, load_requests={}",
+                traversal.unload_set.len(),
+                traversal.load_requests.len(),
+            );
+        }
         for uri in &traversal.unload_set {
+            if self.gpu_tiles.contains_key(uri) {
+                log::info!("[3dtiles] unloading GPU tile: {}", uri);
+            }
             if let Some(evicted) = self.gpu_tiles.remove(uri) {
                 self.total_gpu_bytes = self.total_gpu_bytes.saturating_sub(evicted.gpu_bytes);
             }
@@ -470,12 +496,14 @@ impl Tiles3dWebState {
                     if !logged_first {
                         logged_first = true;
                         let t = rel.col(3);
+                        let local_t = local_tr.col(3).truncate();
+                        let self_pos = local_t.length() > 10_000.0;
                         log::info!(
-                            "[3dtiles] render: {} tiles, camera_ecef=({:.0},{:.0},{:.0}), rel_translation=({:.1},{:.1},{:.1}), rtc={:?}",
+                            "[3dtiles] render: {} tiles, camera=({:.0},{:.0},{:.0}), rel=({:.1},{:.1},{:.1}), rtc={:?}, self_pos={}, local_t_len={:.0}",
                             render_set.len(),
                             camera_ecef.x, camera_ecef.y, camera_ecef.z,
                             t.x, t.y, t.z,
-                            rtc,
+                            rtc, self_pos, local_t.length(),
                         );
                     }
 
