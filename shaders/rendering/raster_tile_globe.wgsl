@@ -79,14 +79,21 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Small-circle clipping: discard fragments beyond the clip angle
     // from the viewport center on the unit sphere.
     // clip_sphere.xyz = center direction, clip_sphere.w = cos(clip_angle).
-    let cos_angle = dot(normalize(input.sphere_pos), viewport.clip_sphere.xyz);
-    if cos_angle < viewport.clip_sphere.w {
-        discard;
+    // When clip_sphere.w <= -1.0, clipping is disabled (debug bypass).
+    if viewport.clip_sphere.w > -1.0 {
+        let cos_angle = dot(normalize(input.sphere_pos), viewport.clip_sphere.xyz);
+        if cos_angle < viewport.clip_sphere.w {
+            discard;
+        }
     }
 
     // Remap tex_coord from [0,1] to the UV sub-rect.
     let uv = mix(tile.uv_rect.xy, tile.uv_rect.zw, input.tex_coord);
     let color = textureSample(tile_texture, tile_sampler, uv);
+
+    // DEBUG: solid red output to test geometry visibility
+    // Remove this block once the black screen issue is diagnosed.
+    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
 
     // Apply tile opacity (premultiplied alpha output)
     let opacity = tile.tile_meta.y;
