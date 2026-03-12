@@ -457,6 +457,48 @@ impl WebApp {
         self.diag_frame += 1;
         let vp = &self.controller.engine.viewport;
         if vp.pitch > 0.5 && self.diag_frame % 180 == 1 {
+            let base_z = vp.tile_zoom();
+
+            // Zoom distribution from quadtree visible tiles
+            let mut vis_zoom_dist = [0u16; 23];
+            for vt in &visible {
+                let z = (vt.coord.z as usize).min(22);
+                vis_zoom_dist[z] += 1;
+            }
+            let vis_dist_str: String = vis_zoom_dist
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c > 0)
+                .map(|(z, c)| format!("z{}={}", z, c))
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            // Zoom distribution from render output
+            let mut render_zoom_dist = [0u16; 23];
+            let mut render_tex_zoom_dist = [0u16; 23];
+            for layer in &render_output.raster_layers {
+                for rt in &layer.tiles {
+                    let z = (rt.coord.z as usize).min(22);
+                    render_zoom_dist[z] += 1;
+                    let tz = (rt.texture_coord.z as usize).min(22);
+                    render_tex_zoom_dist[tz] += 1;
+                }
+            }
+            let render_dist_str: String = render_zoom_dist
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c > 0)
+                .map(|(z, c)| format!("z{}={}", z, c))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let tex_dist_str: String = render_tex_zoom_dist
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c > 0)
+                .map(|(z, c)| format!("z{}={}", z, c))
+                .collect::<Vec<_>>()
+                .join(" ");
+
             let total_raster_tiles: usize = render_output.raster_layers.iter()
                 .map(|l| l.tiles.len())
                 .sum();
@@ -466,54 +508,21 @@ impl WebApp {
             let total_tex: usize = render_output.raster_layers.iter()
                 .map(|l| l.texture_views.len())
                 .sum();
-            let vp_f64 = vp.to_view_proj_f64_projected(mode);
-            // Check center point clip coordinates
-            let center_clip = if mode == x_planets_math::ProjectionMode::Globe {
-                let lat_r = vp.center.lat.to_radians();
-                let lon_r = vp.center.lon.to_radians();
-                let sp = x_planets_math::geo_to_unit_sphere(lat_r, lon_r);
-                vp_f64 * glam::DVec4::new(sp.x, sp.y, sp.z, 1.0)
-            } else {
-                vp_f64 * glam::DVec4::new(0.5, 0.5, 0.0, 1.0)
-            };
-            let ndc_z = if center_clip.w > 0.0 { center_clip.z / center_clip.w } else { f64::NAN };
-            log::info!(
-                "[pitch-diag] pitch={:.1}° zoom={:.1} mode={:?} visible_tiles={} with_tex={} cached_tex={} center_w={:.6} ndc_z={:.6} size={}x{}",
-                vp.pitch, vp.zoom, mode, total_raster_tiles, tiles_with_tex, total_tex,
-                center_clip.w, ndc_z, vp.width, vp.height,
-            );
 
-            // Zoom distribution and depth analysis
-            if let Some(first_layer) = render_output.raster_layers.first() {
-                let mut z14_plus = 0usize;
-                let mut z14_plus_within = 0usize;
-                for rt in &first_layer.tiles {
-                    if rt.coord.z >= 14 {
-                        z14_plus += 1;
-                        let center_lat_r = vp.center.lat.to_radians();
-                        let center_lon_r = vp.center.lon.to_radians();
-                        let n = rt.coord.extent() as f64;
-                        let mx = (rt.display_x as f64 + 0.5) / n;
-                        let my = (rt.coord.y as f64 + 0.5) / n;
-                        let lon_r = (mx * 2.0 - 1.0) * std::f64::consts::PI;
-                        let lat_r = x_planets_math::mercator_y_to_lat_rad(my);
-                        let obl = x_planets_math::oblique_mercator(
-                            lat_r, lon_r, center_lat_r, center_lon_r,
-                        );
-                        let tc = glam::DVec3::new(obl.x, obl.y, 0.0);
-                        let model = glam::DMat4::from_translation(tc);
-                        let clip = (vp_f64 * model) * glam::DVec4::new(0.0, 0.0, 0.0, 1.0);
-                        let nz = if clip.w > 0.0 { clip.z / clip.w } else { f64::NAN };
-                        if nz >= 0.0 && nz <= 1.0 {
-                            z14_plus_within += 1;
-                        }
-                    }
-                }
-                log::info!(
-                    "[pitch-diag] z14+_tiles={} within_depth={} layers={}",
-                    z14_plus, z14_plus_within, render_output.raster_layers.len(),
-                );
-            }
+            log::info!(
+                "[pitch-diag] pitch={:.1}° zoom={:.1} base_z={} mode={:?} size={}x{} layers={}",
+                vp.pitch, vp.zoom, base_z, mode, vp.width, vp.height,
+                render_output.raster_layers.len(),
+            );
+            log::info!(
+                "[pitch-diag] quadtree_visible={} [{}]",
+                visible.len(), vis_dist_str,
+            );
+            log::info!(
+                "[pitch-diag] render_tiles={} with_tex={} cached={} coord_dist=[{}] tex_dist=[{}]",
+                total_raster_tiles, tiles_with_tex, total_tex,
+                render_dist_str, tex_dist_str,
+            );
         }
 
         // Always render raster base first

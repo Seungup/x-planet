@@ -713,6 +713,22 @@ impl TileRenderer {
                     })
                     .collect();
 
+                if layer_idx == 0 && log::log_enabled!(log::Level::Info) {
+                    let no_tex = layer.tiles.iter()
+                        .filter(|rt| !layer.texture_views.contains_key(&rt.texture_coord))
+                        .count();
+                    let no_angle = layer.tiles.iter()
+                        .filter(|rt| layer.texture_views.contains_key(&rt.texture_coord)
+                            && !tile_passes_angular_filter(rt, center_lat_rad, center_lon_rad, viewport.zoom))
+                        .count();
+                    if no_tex > 0 || no_angle > 0 || renderable_tiles.is_empty() {
+                        log::info!(
+                            "[render-diag] layer={} input={} drawn={} no_tex={} no_angle={}",
+                            layer.name, layer.tiles.len(), renderable_tiles.len(), no_tex, no_angle,
+                        );
+                    }
+                }
+
                 let renderable_refs: Vec<RenderableTile> =
                     renderable_tiles.iter().map(|rt| (*rt).clone()).collect();
                 let (centered_verts, centered_idxs, tile_idx_counts) =

@@ -1677,6 +1677,38 @@ mod tests {
     /// zoom=14.9, pitch=57.2, Seoul, 1290x2145 (mobile portrait).
     /// Checks that center tiles are within the depth range [0, 1].
     #[test]
+    fn test_centered_zoom_distribution_mobile() {
+        let mut vp = Viewport::new(1290, 2145);
+        vp.center = GeoCoord::new(37.5665, 126.978);
+        vp.zoom = 15.0;
+        vp.pitch = 51.6;
+
+        let tiles = vp.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
+
+        let mut zoom_counts = std::collections::HashMap::new();
+        for t in &tiles {
+            *zoom_counts.entry(t.coord.z).or_insert(0usize) += 1;
+        }
+        let mut zooms: Vec<_> = zoom_counts.into_iter().collect();
+        zooms.sort();
+
+        eprintln!("Total tiles: {}", tiles.len());
+        eprintln!("Zoom distribution:");
+        for (z, count) in &zooms {
+            eprintln!("  z={}: {} tiles", z, count);
+        }
+
+        let z14_plus = tiles.iter().filter(|t| t.coord.z >= 14).count();
+        eprintln!("z14+ tiles: {}", z14_plus);
+
+        assert!(
+            z14_plus > 0,
+            "Expected z14+ tiles at zoom=15, but got 0. Distribution: {:?}",
+            zooms,
+        );
+    }
+
+    #[test]
     fn test_mobile_portrait_high_pitch_depth() {
         use crate::pipeline::tile_mesh::centered_tile_center;
 
