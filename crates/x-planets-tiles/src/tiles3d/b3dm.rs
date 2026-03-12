@@ -148,15 +148,38 @@ impl B3dm {
         }
         let json: serde_json::Value =
             serde_json::from_slice(&self.feature_table_json).ok()?;
-        let arr = json.get("RTC_CENTER")?.as_array()?;
-        if arr.len() != 3 {
-            return None;
+        let rtc_val = json.get("RTC_CENTER")?;
+
+        // Format A: inline JSON array — "RTC_CENTER": [x, y, z]
+        if let Some(arr) = rtc_val.as_array() {
+            if arr.len() != 3 {
+                return None;
+            }
+            return Some([
+                arr[0].as_f64()?,
+                arr[1].as_f64()?,
+                arr[2].as_f64()?,
+            ]);
         }
-        Some([
-            arr[0].as_f64()?,
-            arr[1].as_f64()?,
-            arr[2].as_f64()?,
-        ])
+
+        // Format B: byteOffset into feature table binary —
+        // "RTC_CENTER": {"byteOffset": N}
+        // Values are 3 × f64 little-endian (24 bytes) in feature_table_binary.
+        if let Some(obj) = rtc_val.as_object() {
+            let offset = obj.get("byteOffset")?.as_u64()? as usize;
+            let end = offset.checked_add(24)?;
+            if end > self.feature_table_binary.len() {
+                return None;
+            }
+            let bin = &self.feature_table_binary[offset..end];
+            return Some([
+                f64::from_le_bytes(bin[0..8].try_into().ok()?),
+                f64::from_le_bytes(bin[8..16].try_into().ok()?),
+                f64::from_le_bytes(bin[16..24].try_into().ok()?),
+            ]);
+        }
+
+        None
     }
 }
 
@@ -359,6 +382,60 @@ mod tests {
     fn test_rtc_center_none_when_no_rtc_in_json() {
         let ft_json = br#"{"BATCH_LENGTH":10}"#;
         let data = make_test_b3dm(ft_json, b"", b"", b"", b"glb");
+        let b3dm = parse_b3dm(&data).unwrap();
+        assert!(b3dm.rtc_center().is_none());
+    }
+
+    #[test]
+    fn test_rtc_center_from_byte_offset() {
+        // Cesium ION CWT tiles store RTC_CENTER as {"byteOffset": N}
+        // with 3 × f64 LE values in the feature table binary.
+        let ft_json = br#"{"BATCH_LENGTH":0,"RTC_CENTER":{"byteOffset":0}}"#;
+        let x: f64 = -3_058_211.5;
+        let y: f64 = 4_052_013.25;
+        let z: f64 = 3_863_471.75;
+        let mut ft_bin = Vec::with_capacity(24);
+        ft_bin.extend_from_slice(&x.to_le_bytes());
+        ft_bin.extend_from_slice(&y.to_le_bytes());
+        ft_bin.extend_from_slice(&z.to_le_bytes());
+
+        let data = make_test_b3dm(ft_json, &ft_bin, b"", b"", b"glb");
+        let b3dm = parse_b3dm(&data).unwrap();
+
+        let rtc = b3dm.rtc_center().unwrap();
+        assert!((rtc[0] - x).abs() < 1e-10);
+        assert!((rtc[1] - y).abs() < 1e-10);
+        assert!((rtc[2] - z).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_rtc_center_byte_offset_nonzero() {
+        // byteOffset can be > 0 when other data precedes RTC_CENTER.
+        let ft_json = br#"{"BATCH_LENGTH":0,"RTC_CENTER":{"byteOffset":8}}"#;
+        let x: f64 = 100.0;
+        let y: f64 = 200.0;
+        let z: f64 = 300.0;
+        let mut ft_bin = vec![0u8; 8]; // 8 bytes of padding before RTC
+        ft_bin.extend_from_slice(&x.to_le_bytes());
+        ft_bin.extend_from_slice(&y.to_le_bytes());
+        ft_bin.extend_from_slice(&z.to_le_bytes());
+
+        let data = make_test_b3dm(ft_json, &ft_bin, b"", b"", b"glb");
+        let b3dm = parse_b3dm(&data).unwrap();
+
+        let rtc = b3dm.rtc_center().unwrap();
+        assert!((rtc[0] - 100.0).abs() < 1e-10);
+        assert!((rtc[1] - 200.0).abs() < 1e-10);
+        assert!((rtc[2] - 300.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_rtc_center_byte_offset_out_of_bounds() {
+        // byteOffset + 24 exceeds binary length → graceful None.
+        let ft_json = br#"{"BATCH_LENGTH":0,"RTC_CENTER":{"byteOffset":0}}"#;
+        let ft_bin = [0u8; 16]; // Only 16 bytes, need 24
+
+        let data = make_test_b3dm(ft_json, &ft_bin, b"", b"", b"glb");
         let b3dm = parse_b3dm(&data).unwrap();
         assert!(b3dm.rtc_center().is_none());
     }
