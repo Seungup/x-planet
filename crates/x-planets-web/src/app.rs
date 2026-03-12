@@ -194,6 +194,9 @@ pub struct WebApp {
 
     /// Cached visible_tiles() result: (center_lat, center_lon, zoom, pitch, bearing, width, height, tiles)
     cached_visible: Option<(f64, f64, f64, f64, f64, u32, u32, Vec<VisibleTile>)>,
+
+    /// Frame counter for periodic diagnostics.
+    diag_frame: u64,
 }
 
 impl WebApp {
@@ -243,6 +246,7 @@ impl WebApp {
             event_handlers: HashMap::new(),
             destroyed: false,
             cached_visible: None,
+            diag_frame: 0,
         }
     }
 
@@ -448,6 +452,76 @@ impl WebApp {
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let mode = self.resolve_projection_mode();
+
+        // ── Pitch diagnostic logging ──
+        self.diag_frame += 1;
+        let vp = &self.controller.engine.viewport;
+        if vp.pitch > 0.5 && self.diag_frame % 180 == 1 {
+            let total_raster_tiles: usize = render_output.raster_layers.iter()
+                .map(|l| l.tiles.len())
+                .sum();
+            let tiles_with_tex: usize = render_output.raster_layers.iter()
+                .map(|l| l.tiles.iter().filter(|t| l.texture_views.contains_key(&t.texture_coord)).count())
+                .sum();
+            let total_tex: usize = render_output.raster_layers.iter()
+                .map(|l| l.texture_views.len())
+                .sum();
+            let vp_f64 = vp.to_view_proj_f64_projected(mode);
+            // Check center point clip coordinates
+            let center_clip = if mode == x_planets_math::ProjectionMode::Globe {
+                let lat_r = vp.center.lat.to_radians();
+                let lon_r = vp.center.lon.to_radians();
+                let sp = x_planets_math::geo_to_unit_sphere(lat_r, lon_r);
+                vp_f64 * glam::DVec4::new(sp.x, sp.y, sp.z, 1.0)
+            } else {
+                vp_f64 * glam::DVec4::new(0.5, 0.5, 0.0, 1.0)
+            };
+            let ndc_z = if center_clip.w > 0.0 { center_clip.z / center_clip.w } else { f64::NAN };
+            log::info!(
+                "[pitch-diag] pitch={:.1}° zoom={:.1} mode={:?} visible_tiles={} with_tex={} cached_tex={} center_w={:.6} ndc_z={:.6} size={}x{}",
+                vp.pitch, vp.zoom, mode, total_raster_tiles, tiles_with_tex, total_tex,
+                center_clip.w, ndc_z, vp.width, vp.height,
+            );
+
+            // Log first tile's per-tile MVP clip position
+            // For centered mode, the oblique Mercator center is always (0.5, 0.5)
+            // For globe mode, compute the center of the first tile on the unit sphere
+            if let Some(first_layer) = render_output.raster_layers.first() {
+                if let Some(first_tile) = first_layer.tiles.first() {
+                    let tc = first_tile.coord;
+                    let n = (1u32 << tc.z) as f64;
+                    let merc_center = glam::DVec2::new(
+                        (first_tile.display_x as f64 + 0.5) / n,
+                        (tc.y as f64 + 0.5) / n,
+                    );
+                    let tile_center = if mode == x_planets_math::ProjectionMode::Globe {
+                        // Tile center on unit sphere
+                        let lon = (merc_center.x * 2.0 - 1.0) * std::f64::consts::PI;
+                        let lat = x_planets_math::mercator_y_to_lat_rad(merc_center.y);
+                        x_planets_math::geo_to_unit_sphere(lat, lon)
+                    } else {
+                        // Tile center in oblique Mercator (approximate via standard Mercator center)
+                        let lat_r = x_planets_math::mercator_y_to_lat_rad(merc_center.y);
+                        let lon_r = (merc_center.x * 2.0 - 1.0) * std::f64::consts::PI;
+                        let center_lat_r = vp.center.lat.to_radians();
+                        let center_lon_r = vp.center.lon.to_radians();
+                        let obl = x_planets_math::oblique_mercator(
+                            lat_r, lon_r, center_lat_r, center_lon_r,
+                        );
+                        glam::DVec3::new(obl.x, obl.y, 0.0)
+                    };
+                    let model = glam::DMat4::from_translation(tile_center);
+                    let mvp = vp_f64 * model;
+                    let tile_clip = mvp * glam::DVec4::new(0.0, 0.0, 0.0, 1.0);
+                    let t_ndc_z = if tile_clip.w > 0.0 { tile_clip.z / tile_clip.w } else { f64::NAN };
+                    log::info!(
+                        "[pitch-diag] first_tile z/{}/{}/{} clip_w={:.6} ndc_z={:.6} tile_center=({:.6},{:.6},{:.6})",
+                        tc.z, tc.x, tc.y,
+                        tile_clip.w, t_ndc_z, tile_center.x, tile_center.y, tile_center.z,
+                    );
+                }
+            }
+        }
 
         // Always render raster base first
         self.renderer.render_frame_layered_projected(

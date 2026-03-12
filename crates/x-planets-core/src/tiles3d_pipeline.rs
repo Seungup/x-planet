@@ -618,6 +618,126 @@ mod tests {
         );
     }
 
+    /// Verify that 3D tiles remain visible at various pitch angles.
+    /// The traversal frustum should always include tiles near the camera center
+    /// regardless of pitch.
+    #[test]
+    fn test_3dtiles_visible_at_all_pitches() {
+        use x_planets_tiles::tiles3d::bounding_volume::{
+            extract_frustum_planes, is_sphere_visible, BoundingVolumeKind, distance_to_volume,
+            screen_space_error,
+        };
+
+        for pitch_deg in [0.0, 10.0, 20.0, 30.0, 45.0, 60.0, 75.0] {
+            let mut vp = Viewport::new(1920, 1080);
+            vp.center = GeoCoord::new(40.6892, -74.0445);
+            vp.zoom = 15.0;
+            vp.pitch = pitch_deg;
+            vp.bearing = 0.0;
+
+            let cam = viewport_to_traversal_camera(&vp);
+            let planes = extract_frustum_planes(&cam.view_proj);
+
+            // Tile near NYC: region bounding volume
+            let tile_vol = BoundingVolumeKind::Region {
+                west: (-74.05_f64).to_radians(),
+                south: 40.68_f64.to_radians(),
+                east: (-74.03_f64).to_radians(),
+                north: 40.70_f64.to_radians(),
+                min_height: 0.0,
+                max_height: 500.0,
+            };
+            let center = tile_vol.center_ecef();
+            let radius = tile_vol.bounding_radius();
+
+            let visible = is_sphere_visible(center, radius, &planes);
+            assert!(
+                visible,
+                "NYC tile should be visible at pitch={pitch_deg}°. center=({:.0},{:.0},{:.0}), radius={:.0}, camera=({:.0},{:.0},{:.0})",
+                center.x, center.y, center.z, radius,
+                cam.position_ecef.x, cam.position_ecef.y, cam.position_ecef.z,
+            );
+
+            // Also check that SSE is reasonable (tile should want to be rendered)
+            let dist = distance_to_volume(cam.position_ecef, &tile_vol);
+            let sse = screen_space_error(200.0, dist, 1080.0, 60.0_f64.to_radians());
+            assert!(
+                sse > 1.0,
+                "SSE should be > 1 at pitch={pitch_deg}°, got {sse:.1} (dist={dist:.0}m)"
+            );
+        }
+    }
+
+    /// Verify that 3D tile buildings near the camera produce valid
+    /// clip-space positions at various pitch angles using the RENDERING VP.
+    #[test]
+    fn test_3dtiles_rendering_vp_at_all_pitches() {
+        for pitch_deg in [0.0, 10.0, 20.0, 30.0, 45.0, 60.0, 75.0] {
+            let mut vp = Viewport::new(1920, 1080);
+            vp.center = GeoCoord::new(40.6892, -74.0445);
+            vp.zoom = 15.0;
+            vp.pitch = pitch_deg;
+            vp.bearing = 0.0;
+
+            let (uniforms, camera_ecef) = build_tiles3d_uniforms(&vp);
+            let vp_mat = glam::Mat4::from_cols_array(&uniforms.view_proj);
+
+            // Check VP matrix for NaN/Inf
+            for v in &uniforms.view_proj {
+                assert!(v.is_finite(), "VP non-finite at pitch={pitch_deg}°: {v}");
+            }
+
+            // Simulate a building tile at the surface below the camera.
+            // Use the "up" direction to place it altitude meters below camera.
+            let lat_rad = vp.center.lat.to_radians();
+            let lon_rad = vp.center.lon.to_radians();
+            let cos_lat = lat_rad.cos();
+            let sin_lat = lat_rad.sin();
+            let cos_lon = lon_rad.cos();
+            let sin_lon = lon_rad.sin();
+            let _up_dir = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
+            let altitude = zoom_to_altitude_for(vp.zoom, vp.body.circumference);
+
+            // Building at surface point (where camera is looking at)
+            let surface_ecef = x_planets_math::ecef::geodetic_to_ecef(
+                lat_rad, lon_rad, 0.0, &vp.body.ellipsoid,
+            );
+            let building_ecef = surface_ecef; // On surface at camera center
+            let local_transform = DMat4::from_translation(building_ecef);
+
+            eprintln!("pitch={pitch_deg}° camera=({:.0},{:.0},{:.0}) building=({:.0},{:.0},{:.0}) alt={:.1}",
+                camera_ecef.x, camera_ecef.y, camera_ecef.z,
+                building_ecef.x, building_ecef.y, building_ecef.z, altitude);
+            let model = build_model_matrix(None, local_transform, DMat4::IDENTITY);
+            let rel = ecef_to_relative_world(model, camera_ecef);
+
+            let rel_t = rel.col(3);
+            assert!(
+                rel_t.x.abs() < 2000.0 && rel_t.y.abs() < 2000.0 && rel_t.z.abs() < 2000.0,
+                "Relative translation too large at pitch={pitch_deg}°: ({}, {}, {})",
+                rel_t.x, rel_t.y, rel_t.z
+            );
+
+            // Transform a vertex at the building position
+            let vertex = glam::Vec4::new(0.0, 0.0, 0.0, 1.0);
+            let world_pos = rel * vertex;
+            let clip_pos = vp_mat * world_pos;
+
+            assert!(
+                clip_pos.w > 0.0,
+                "Building behind camera at pitch={pitch_deg}°: w={}",
+                clip_pos.w
+            );
+
+            let ndc_z = clip_pos.z / clip_pos.w;
+            assert!(
+                ndc_z >= 0.0 && ndc_z <= 1.0,
+                "Building outside depth range at pitch={pitch_deg}°: ndc_z={ndc_z} (clip_z={}, clip_w={})",
+                clip_pos.z, clip_pos.w,
+            );
+        }
+    }
+
     /// Verify that multiple nearby tiles produce DISTINCT clip-space positions
     /// (not converging to a single point — the "radiating lines" bug).
     #[test]
