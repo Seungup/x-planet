@@ -180,7 +180,7 @@ pub fn ecef_to_relative_world(ecef_transform: DMat4, reference_ecef: DVec3) -> M
 /// Build a model matrix from an RTC center, glTF local transform,
 /// and tile hierarchy transform.
 ///
-/// Composes: tile_transform × local_transform × translate(rtc)
+/// Composes: tile_transform × translate(rtc) × local_transform
 ///
 /// When `local_transform` already contains an ECEF-scale translation
 /// (magnitude > 10 km), it is treated as self-positioning: the tile
@@ -210,20 +210,21 @@ pub fn build_model_matrix(
         tile_transform
     };
 
-    let mut result = effective_tile_transform * local_transform;
+    // RTC_CENTER is an ECEF offset — it must NOT be rotated by the glTF
+    // node transform (local_transform).  Correct order:
+    //   tile_transform × translate(rtc) × local_transform
+    // This ensures vertex positions are rotated from local (ENU) to ECEF
+    // by local_transform, then translated by the ECEF RTC offset, then
+    // further transformed by the tile hierarchy.
+    let rtc_mat = if !self_positioning {
+        rtc_center
+            .map(|rtc| DMat4::from_translation(DVec3::new(rtc[0], rtc[1], rtc[2])))
+            .unwrap_or(DMat4::IDENTITY)
+    } else {
+        DMat4::IDENTITY
+    };
 
-    // Only apply RTC offset when content is NOT self-positioning.
-    // Self-positioning content already encodes the ECEF position in
-    // local_transform; applying RTC_CENTER on top would produce a
-    // translation of ~2× ECEF magnitude, placing the tile millions
-    // of meters off-screen.
-    if !self_positioning {
-        if let Some(rtc) = rtc_center {
-            let rtc_translation = DMat4::from_translation(DVec3::new(rtc[0], rtc[1], rtc[2]));
-            result = result * rtc_translation;
-        }
-    }
-    result
+    effective_tile_transform * rtc_mat * local_transform
 }
 
 /// Get the vertical FOV used for 3D Tiles traversal.
@@ -736,6 +737,41 @@ mod tests {
                 clip_pos.z, clip_pos.w,
             );
         }
+    }
+
+    #[test]
+    fn test_build_model_matrix_rtc_not_rotated_by_local_transform() {
+        // When local_transform contains a rotation (ENU→ECEF), the RTC center
+        // (which is already in ECEF) must NOT be rotated by that rotation.
+        // Correct: tile_transform × translate(rtc) × local_transform
+        // Wrong:   tile_transform × local_transform × translate(rtc)
+        let rtc = [1_000_000.0, 2_000_000.0, 3_000_000.0];
+
+        // 90° rotation around Z axis
+        let rotation = DMat4::from_rotation_z(std::f64::consts::FRAC_PI_2);
+
+        let model = build_model_matrix(Some(rtc), rotation, DMat4::IDENTITY);
+
+        // The translation column of the result should be the RTC center
+        // (unrotated), because RTC is applied AFTER rotation in the chain:
+        //   translate(rtc) × rotation × vertex
+        // At vertex=0: result = translate(rtc) × rotation × [0,0,0,1] = [rtc, 1]
+        let t = model.col(3).truncate();
+        assert!(
+            (t.x - rtc[0]).abs() < 1e-6,
+            "RTC x was rotated by local_transform! Got {:.1}, expected {:.1}",
+            t.x, rtc[0],
+        );
+        assert!(
+            (t.y - rtc[1]).abs() < 1e-6,
+            "RTC y was rotated by local_transform! Got {:.1}, expected {:.1}",
+            t.y, rtc[1],
+        );
+        assert!(
+            (t.z - rtc[2]).abs() < 1e-6,
+            "RTC z was rotated by local_transform! Got {:.1}, expected {:.1}",
+            t.z, rtc[2],
+        );
     }
 
     /// Verify that multiple nearby tiles produce DISTINCT clip-space positions
