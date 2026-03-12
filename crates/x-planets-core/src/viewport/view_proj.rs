@@ -48,20 +48,30 @@ impl super::Viewport {
         let view = glam::DMat4::look_at_rh(eye, target, up);
         // Adaptive near/far for pitched views.
         //
-        // Far plane: generous multiplier so the frustum covers distant tiles
-        // visible near the horizon.  At pitch=60° the top frustum ray is
-        // nearly horizontal, requiring a far plane ≈ 11× cam_h.
+        // Far plane: compute where the top frustum ray (pitch + fov/2 from
+        // vertical) intersects the ground plane z=0.  This is the farthest
+        // ground point visible on screen.  Add a 50% safety margin to cover
+        // tile edges and geometry that extends beyond the tile center.
+        // When the top ray is nearly horizontal (pitch + fov/2 ≈ 90°), cap
+        // the far distance to avoid extreme depth ratios.
         //
         // Near plane: the closest visible ground point is where the bottom
         // frustum ray (pitch − fov_half from vertical) hits z=0.  Placing
-        // near at half that distance keeps the far/near ratio ≈ 30–40,
+        // near at half that distance keeps the far/near ratio manageable,
         // preserving depth-buffer precision.
-        let sin_p = pitch_rad.sin();
-        let far = cam_h * (4.0 + 8.0 * sin_p);
-        // Closest ground intersection along the bottom frustum ray:
-        //   angle_from_vertical = pitch − fov/2;  dist = eye_z / cos(angle)
-        // Simplified: near ≈ cam_h * cos(pitch) / (2 * cos(pitch − 30°))
         let fov_half = std::f64::consts::FRAC_PI_3 * 0.5;
+        let top_angle = pitch_rad + fov_half;
+        let cos_top = top_angle.cos();
+        let far = if cos_top > 0.02 {
+            // Ground intersection distance of the top frustum ray
+            let ground_hit = cam_h * pitch_rad.cos() / cos_top;
+            ground_hit * 1.5
+        } else {
+            // Near-horizontal view: cap far plane
+            cam_h * pitch_rad.cos() / 0.02 * 1.5
+        };
+        // Floor: at zero pitch, far must still cover 4× cam_h
+        let far = far.max(cam_h * 4.0);
         let bottom_angle = (pitch_rad - fov_half).max(0.0);
         let cos_bottom = bottom_angle.cos().max(0.1);
         let near = (cam_h * pitch_rad.cos() / (2.0 * cos_bottom)).max(cam_h * 0.01);
@@ -165,9 +175,16 @@ impl super::Viewport {
         let target = glam::Vec3::new(cx, cy, 0.0);
 
         let view = glam::Mat4::look_at_rh(eye, target, up);
-        let sin_p = pitch_rad.sin();
-        let far = cam_h * (4.0 + 8.0 * sin_p);
         let fov_half_f = std::f32::consts::FRAC_PI_3 * 0.5;
+        let top_angle = pitch_rad + fov_half_f;
+        let cos_top = top_angle.cos();
+        let far = if cos_top > 0.02 {
+            let ground_hit = cam_h * pitch_rad.cos() / cos_top;
+            ground_hit * 1.5
+        } else {
+            cam_h * pitch_rad.cos() / 0.02 * 1.5
+        };
+        let far = far.max(cam_h * 4.0);
         let bottom_angle = (pitch_rad - fov_half_f).max(0.0);
         let cos_bottom = bottom_angle.cos().max(0.1);
         let near = (cam_h * pitch_rad.cos() / (2.0 * cos_bottom)).max(cam_h * 0.01);

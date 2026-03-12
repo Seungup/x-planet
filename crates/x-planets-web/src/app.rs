@@ -483,43 +483,36 @@ impl WebApp {
                 center_clip.w, ndc_z, vp.width, vp.height,
             );
 
-            // Log first tile's per-tile MVP clip position
-            // For centered mode, the oblique Mercator center is always (0.5, 0.5)
-            // For globe mode, compute the center of the first tile on the unit sphere
+            // Zoom distribution and depth analysis
             if let Some(first_layer) = render_output.raster_layers.first() {
-                if let Some(first_tile) = first_layer.tiles.first() {
-                    let tc = first_tile.coord;
-                    let n = (1u32 << tc.z) as f64;
-                    let merc_center = glam::DVec2::new(
-                        (first_tile.display_x as f64 + 0.5) / n,
-                        (tc.y as f64 + 0.5) / n,
-                    );
-                    let tile_center = if mode == x_planets_math::ProjectionMode::Globe {
-                        // Tile center on unit sphere
-                        let lon = (merc_center.x * 2.0 - 1.0) * std::f64::consts::PI;
-                        let lat = x_planets_math::mercator_y_to_lat_rad(merc_center.y);
-                        x_planets_math::geo_to_unit_sphere(lat, lon)
-                    } else {
-                        // Tile center in oblique Mercator (approximate via standard Mercator center)
-                        let lat_r = x_planets_math::mercator_y_to_lat_rad(merc_center.y);
-                        let lon_r = (merc_center.x * 2.0 - 1.0) * std::f64::consts::PI;
+                let mut z14_plus = 0usize;
+                let mut z14_plus_within = 0usize;
+                for rt in &first_layer.tiles {
+                    if rt.coord.z >= 14 {
+                        z14_plus += 1;
                         let center_lat_r = vp.center.lat.to_radians();
                         let center_lon_r = vp.center.lon.to_radians();
+                        let n = rt.coord.extent() as f64;
+                        let mx = (rt.display_x as f64 + 0.5) / n;
+                        let my = (rt.coord.y as f64 + 0.5) / n;
+                        let lon_r = (mx * 2.0 - 1.0) * std::f64::consts::PI;
+                        let lat_r = x_planets_math::mercator_y_to_lat_rad(my);
                         let obl = x_planets_math::oblique_mercator(
                             lat_r, lon_r, center_lat_r, center_lon_r,
                         );
-                        glam::DVec3::new(obl.x, obl.y, 0.0)
-                    };
-                    let model = glam::DMat4::from_translation(tile_center);
-                    let mvp = vp_f64 * model;
-                    let tile_clip = mvp * glam::DVec4::new(0.0, 0.0, 0.0, 1.0);
-                    let t_ndc_z = if tile_clip.w > 0.0 { tile_clip.z / tile_clip.w } else { f64::NAN };
-                    log::info!(
-                        "[pitch-diag] first_tile z/{}/{}/{} clip_w={:.6} ndc_z={:.6} tile_center=({:.6},{:.6},{:.6})",
-                        tc.z, tc.x, tc.y,
-                        tile_clip.w, t_ndc_z, tile_center.x, tile_center.y, tile_center.z,
-                    );
+                        let tc = glam::DVec3::new(obl.x, obl.y, 0.0);
+                        let model = glam::DMat4::from_translation(tc);
+                        let clip = (vp_f64 * model) * glam::DVec4::new(0.0, 0.0, 0.0, 1.0);
+                        let nz = if clip.w > 0.0 { clip.z / clip.w } else { f64::NAN };
+                        if nz >= 0.0 && nz <= 1.0 {
+                            z14_plus_within += 1;
+                        }
+                    }
                 }
+                log::info!(
+                    "[pitch-diag] z14+_tiles={} within_depth={} layers={}",
+                    z14_plus, z14_plus_within, render_output.raster_layers.len(),
+                );
             }
         }
 

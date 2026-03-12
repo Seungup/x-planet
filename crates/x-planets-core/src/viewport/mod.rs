@@ -1672,4 +1672,65 @@ mod tests {
             );
         }
     }
+
+    /// Reproduce the exact scenario from the user's screenshot:
+    /// zoom=14.9, pitch=57.2, Seoul, 1290x2145 (mobile portrait).
+    /// Checks that center tiles are within the depth range [0, 1].
+    #[test]
+    fn test_mobile_portrait_high_pitch_depth() {
+        use crate::pipeline::tile_mesh::centered_tile_center;
+
+        let mut vp = Viewport::new(1290, 2145);
+        vp.center = GeoCoord::new(37.5665, 126.978);
+        vp.zoom = 14.9;
+        vp.pitch = 57.2;
+
+        let mode = x_planets_math::ProjectionMode::Mercator;
+        let vp_f64 = vp.to_view_proj_f64_projected(mode);
+
+        let tiles = vp.visible_tiles_for_mode(mode);
+        assert!(!tiles.is_empty(), "No visible tiles");
+
+        let center_lat_rad = vp.center.lat.to_radians();
+        let center_lon_rad = vp.center.lon.to_radians();
+
+        let mut within_depth = 0usize;
+        let mut beyond_far = 0usize;
+
+        for vt in &tiles {
+            let tc = &vt.coord;
+            let obl = centered_tile_center(tc, vt.display_x, center_lat_rad, center_lon_rad);
+            let tile_center = glam::DVec3::new(obl.x, obl.y, 0.0);
+            let model = glam::DMat4::from_translation(tile_center);
+            let mvp = vp_f64 * model;
+            let tile_clip = mvp * glam::DVec4::new(0.0, 0.0, 0.0, 1.0);
+            let t_ndc_z = if tile_clip.w > 0.0 {
+                tile_clip.z / tile_clip.w
+            } else {
+                f64::NAN
+            };
+            if t_ndc_z >= 0.0 && t_ndc_z <= 1.0 {
+                within_depth += 1;
+            } else {
+                beyond_far += 1;
+            }
+        }
+
+        // At least some tiles must pass the depth test
+        assert!(
+            within_depth > 0,
+            "No tiles within depth range! {} tiles total, {} beyond far",
+            tiles.len(),
+            beyond_far,
+        );
+        // Most tiles near center should be within depth range
+        let ratio = within_depth as f64 / tiles.len() as f64;
+        assert!(
+            ratio > 0.3,
+            "Only {:.0}% of tiles within depth range ({}/{}), expected >30%",
+            ratio * 100.0,
+            within_depth,
+            tiles.len(),
+        );
+    }
 }
