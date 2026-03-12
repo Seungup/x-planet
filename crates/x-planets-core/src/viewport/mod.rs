@@ -1678,10 +1678,12 @@ mod tests {
     /// Checks that center tiles are within the depth range [0, 1].
     #[test]
     fn test_centered_zoom_distribution_mobile() {
-        let mut vp = Viewport::new(1290, 2145);
-        vp.center = GeoCoord::new(37.5665, 126.978);
-        vp.zoom = 15.0;
-        vp.pitch = 51.6;
+        // Test both the original scenario and the exact device parameters
+        for &(zoom, pitch) in &[(15.0, 51.6), (14.9, 47.4)] {
+            let mut vp = Viewport::new(1290, 2145);
+            vp.center = GeoCoord::new(37.5665, 126.978);
+            vp.zoom = zoom;
+            vp.pitch = pitch;
 
         let tiles = vp.visible_tiles_for_mode(x_planets_math::ProjectionMode::Mercator);
 
@@ -1703,9 +1705,10 @@ mod tests {
 
         assert!(
             z14_plus > 0,
-            "Expected z14+ tiles at zoom=15, but got 0. Distribution: {:?}",
-            zooms,
+            "Expected z14+ tiles at zoom={}, pitch={}, but got 0. Distribution: {:?}",
+            zoom, pitch, zooms,
         );
+        }
     }
 
     #[test]

@@ -415,7 +415,16 @@ impl super::Viewport {
             // so the post-loop truncation can pick the best distribution.
             // A tighter check starves fine tiles near the camera when the
             // frustum covers a large area.
-            let explore_budget = if self.pitch >= 10.0 {
+            //
+            // Centered Mercator needs a much larger explore budget: the 85°
+            // spherical cap frustum is enormous in Mercator space, and the
+            // quadtree must traverse from z=0 down to base_z (e.g. 15) for
+            // center tiles while also expanding distant tiles to min_z.
+            // With the default 1.5× budget the tree gets stuck at min_z
+            // for all tiles, producing zero high-zoom tiles near the camera.
+            let explore_budget = if mode == TileLodMode::Centered && self.pitch >= 10.0 {
+                tile_budget * 20
+            } else if self.pitch >= 10.0 {
                 tile_budget + tile_budget / 2
             } else {
                 tile_budget
@@ -444,47 +453,59 @@ impl super::Viewport {
 
         if result.len() > tile_budget {
             // Separate coarse background tiles from fine foreground tiles.
-            // Coarse tiles (below the ideal base zoom) are few and provide
-            // essential coverage for distant areas in pitched views.  Always
-            // keep them; only truncate fine tiles when the budget is exceeded.
-            // Without this, pitched views at high zoom drop distant coarse
-            // tiles, leaving visible dark gaps at the horizon.
+            // Fine tiles (near-center, high zoom) are the most important —
+            // they're what the user is actually looking at.  Coarse tiles
+            // provide background coverage for distant/horizon areas.
+            //
+            // Give fine tiles priority: they get up to 2/3 of the budget,
+            // with coarse tiles filling the remainder.  This prevents the
+            // common pitched-view failure where hundreds of coarse tiles
+            // starve the fine center tiles completely.
             let coarse_threshold = min_z.saturating_add(1);
-            let (coarse, mut fine): (Vec<_>, Vec<_>) = result
+            let (mut coarse, mut fine): (Vec<_>, Vec<_>) = result
                 .into_iter()
                 .partition(|vt| vt.coord.z <= coarse_threshold);
 
-            if use_angular {
-                fine.sort_by(|a, b| {
-                    let ang_dist = |tc: glam::DVec2| -> f64 {
-                        let g = mercator_to_geo(tc);
-                        let dlat = g.lat.to_radians() - center_lat_rad;
-                        let dlon = g.lon.to_radians() - center_lon_rad;
-                        let a = (dlat * 0.5).sin().powi(2)
-                            + cos_center_lat
-                                * g.lat.to_radians().cos()
-                                * (dlon * 0.5).sin().powi(2);
-                        2.0 * a.sqrt().asin()
-                    };
-                    let da = ang_dist(a.display_mercator_center());
-                    let db = ang_dist(b.display_mercator_center());
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                });
-            } else {
-                fine.sort_by(|a, b| {
-                    let da = (a.display_mercator_center() - center_merc).length();
-                    let db = (b.display_mercator_center() - center_merc).length();
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
-            let fine_budget = tile_budget.saturating_sub(coarse.len());
-            fine.truncate(fine_budget);
+            let sort_by_dist = |tiles: &mut Vec<VisibleTile>| {
+                if use_angular {
+                    tiles.sort_by(|a, b| {
+                        let ang_dist = |tc: glam::DVec2| -> f64 {
+                            let g = mercator_to_geo(tc);
+                            let dlat = g.lat.to_radians() - center_lat_rad;
+                            let dlon = g.lon.to_radians() - center_lon_rad;
+                            let a = (dlat * 0.5).sin().powi(2)
+                                + cos_center_lat
+                                    * g.lat.to_radians().cos()
+                                    * (dlon * 0.5).sin().powi(2);
+                            2.0 * a.sqrt().asin()
+                        };
+                        let da = ang_dist(a.display_mercator_center());
+                        let db = ang_dist(b.display_mercator_center());
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                } else {
+                    tiles.sort_by(|a, b| {
+                        let da = (a.display_mercator_center() - center_merc).length();
+                        let db = (b.display_mercator_center() - center_merc).length();
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+            };
+
+            sort_by_dist(&mut fine);
+            sort_by_dist(&mut coarse);
+
+            // Fine tiles get priority: up to 2/3 of budget (or all if fewer)
+            let max_fine = (tile_budget * 2 / 3).max(fine.len().min(tile_budget));
+            let fine_count = fine.len().min(max_fine);
+            fine.truncate(fine_count);
+
+            let coarse_budget = tile_budget.saturating_sub(fine_count);
+            coarse.truncate(coarse_budget);
 
             result = coarse;
             result.extend(fine);
 
-            // Hard cap: if coarse tiles alone exceed the budget (can happen
-            // at polar latitudes or extreme views), truncate to budget.
             if result.len() > tile_budget {
                 result.truncate(tile_budget);
             }
