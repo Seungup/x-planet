@@ -380,7 +380,13 @@ impl super::Viewport {
             angular_dist_rad(tc) > threshold_rad
         };
 
-        let seed_z = if mode != TileLodMode::Flat { 0 } else { min_z };
+        // Globe and Centered modes seed from z=0: the frustum covers a
+        // large spherical cap and visible_tiles(min_z) could return millions
+        // of tiles.  The quadtree naturally limits exploration via the budget,
+        // and the center-tile chain is guaranteed to reach base_z via the
+        // contains_center bypass below.
+        // Flat mode can seed from min_z since the frustum is small in Mercator space.
+        let seed_z = if mode == TileLodMode::Flat { min_z } else { 0 };
         for vt in frustum.visible_tiles(seed_z) {
             let tc = vt.display_mercator_center();
             if is_beyond_clip(tc, vt.coord.z) {
@@ -429,9 +435,14 @@ impl super::Viewport {
             } else {
                 tile_budget
             };
+            // Always subdivide tiles containing the viewport center,
+            // regardless of explore budget.  This guarantees the center
+            // tile chain reaches base_z even when the frustum is enormous
+            // (e.g. Centered Mercator's 85° spherical cap).
+            let within_budget = (result.len() + heap.len() + 4) <= explore_budget;
             let should_subdivide = (vt.coord.z < ideal_z || contains_center)
                 && vt.coord.z < base_z
-                && (result.len() + heap.len() + 4) <= explore_budget;
+                && (contains_center || within_budget);
 
             if should_subdivide {
                 for child in vt.children() {

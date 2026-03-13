@@ -19,7 +19,7 @@ use x_planets_math::{TileCoord, ViewportUniforms};
 use crate::pipeline::{
     build_globe_tile_mesh, build_polar_caps, tile_uniforms_for_globe,
     build_centered_tile_mesh, tile_uniforms_for_centered,
-    tile_passes_angular_filter, centered_tile_center,
+    tile_passes_angular_filter,
     RenderableTile,
 };
 use crate::render::{GlobeTileVertex, RenderLayerData};
@@ -51,8 +51,6 @@ pub struct TileRenderer {
     surface_height: u32,
     /// Cached polar cap vertex/index buffers (never change after creation).
     cached_polar_caps: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
-    /// Frame counter for periodic diagnostic logging.
-    diag_frame: u64,
 }
 
 impl TileRenderer {
@@ -298,7 +296,6 @@ impl TileRenderer {
             surface_width,
             surface_height,
             cached_polar_caps: None,
-            diag_frame: 0,
         }
     }
 
@@ -517,23 +514,6 @@ impl TileRenderer {
 
         // Compute f64 VP for per-tile MVP (eliminates high-zoom jitter)
         let vp_f64 = viewport.to_view_proj_f64_projected(mode);
-
-        // Diagnostic: log clip_sphere and VP matrix periodically
-        self.diag_frame += 1;
-        let do_diag = self.diag_frame % 300 == 1;
-        if do_diag {
-            log::info!(
-                "[tile-diag] clip_sphere=({:.4},{:.4},{:.4},{:.4})",
-                uniforms.clip_sphere[0], uniforms.clip_sphere[1],
-                uniforms.clip_sphere[2], uniforms.clip_sphere[3],
-            );
-            let vp32 = vp_f64.as_mat4();
-            let c = vp32.col(3);
-            log::info!(
-                "[tile-diag] VP_f64 col3=({:.6},{:.6},{:.6},{:.6}) mode={:?}",
-                c.x, c.y, c.z, c.w, mode,
-            );
-        }
 
         let mut encoder = gpu
             .device
@@ -787,49 +767,6 @@ impl TileRenderer {
                         ))
                     })
                     .collect();
-
-                // Diagnostic: log first tile's MVP and clip position
-                if do_diag && layer_idx == 0 && !renderable_tiles.is_empty() {
-                    let rt0 = renderable_tiles[0];
-                    let tc0 = centered_tile_center(
-                        &rt0.coord, rt0.display_x, center_lat_rad, center_lon_rad,
-                    );
-                    let model = glam::DMat4::from_translation(
-                        glam::DVec3::new(tc0.x, tc0.y, 0.0),
-                    );
-                    let mvp = vp_f64 * model;
-                    let mvp32 = mvp.as_mat4();
-                    // Clip position for the RTE center vertex (0,0,0,1) = MVP column 3
-                    let clip = mvp32.col(3);
-                    let ndc = if clip.w.abs() > 1e-8 {
-                        glam::Vec3::new(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w)
-                    } else {
-                        glam::Vec3::new(f32::NAN, f32::NAN, f32::NAN)
-                    };
-                    // Sphere pos of tile center for clip_sphere check
-                    let n = rt0.coord.extent() as f64;
-                    let mx = (rt0.display_x as f64 + 0.5) / n;
-                    let my = (rt0.coord.y as f64 + 0.5) / n;
-                    let lon_r = (mx * 2.0 - 1.0) * std::f64::consts::PI;
-                    let lat_r = x_planets_math::mercator_y_to_lat_rad(my);
-                    let sp = x_planets_math::geo_to_unit_sphere(lat_r, lon_r);
-                    let cs = &uniforms.clip_sphere;
-                    let clip_center = glam::Vec3::new(cs[0], cs[1], cs[2]);
-                    let sp32 = glam::Vec3::new(sp.x as f32, sp.y as f32, sp.z as f32);
-                    let cos_angle = sp32.normalize().dot(clip_center);
-                    log::info!(
-                        "[tile-diag] tile0={} tc=({:.6},{:.6}) clip=({:.4},{:.4},{:.4},{:.4}) ndc=({:.4},{:.4},{:.4})",
-                        rt0.coord, tc0.x, tc0.y, clip.x, clip.y, clip.z, clip.w, ndc.x, ndc.y, ndc.z,
-                    );
-                    log::info!(
-                        "[tile-diag] tile0 sphere_pos=({:.4},{:.4},{:.4}) cos_angle={:.4} clip_w={:.4} pass={}",
-                        sp32.x, sp32.y, sp32.z, cos_angle, cs[3], cos_angle >= cs[3],
-                    );
-                    log::info!(
-                        "[tile-diag] prepared={} renderable={} verts_empty={} centered_verts={}",
-                        prepared.len(), renderable_tiles.len(), centered_verts.is_empty(), centered_verts.len(),
-                    );
-                }
 
                 {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

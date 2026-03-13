@@ -91,10 +91,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let uv = mix(tile.uv_rect.xy, tile.uv_rect.zw, input.tex_coord);
     let color = textureSample(tile_texture, tile_sampler, uv);
 
-    // DEBUG: solid red output to test geometry visibility
-    // Remove this block once the black screen issue is diagnosed.
-    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
-
     // Apply tile opacity (premultiplied alpha output)
     let opacity = tile.tile_meta.y;
     return vec4<f32>(color.rgb * opacity, color.a * opacity);
