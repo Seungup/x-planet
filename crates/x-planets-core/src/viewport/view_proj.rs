@@ -202,7 +202,7 @@ impl super::Viewport {
         );
         // Clip angle: 85° from center — covers nearly a full hemisphere
         // while avoiding the oblique Mercator singularity at 90°.
-        let _cos_clip_angle = 85.0_f64.to_radians().cos() as f32;
+        let cos_clip_angle = 85.0_f64.to_radians().cos() as f32;
 
         ViewportUniforms {
             view_proj,
@@ -213,13 +213,11 @@ impl super::Viewport {
                 1.0 / self.height.max(1) as f32,
             ],
             camera: [cx, cy, self.zoom as f32, self.pitch as f32],
-            // DEBUG: bypass clip_sphere (w <= -1.0 → shader skips discard)
-            // Original: [clip_center.x, clip_center.y, clip_center.z, cos_clip_angle]
             clip_sphere: [
                 clip_center.x as f32,
                 clip_center.y as f32,
                 clip_center.z as f32,
-                -2.0, // TEMP: disable clipping to diagnose black screen
+                cos_clip_angle,
             ],
             terrain: [self.max_zoom as f32, self.hillshade_strength as f32, 0.0, 0.0],
             sun_dir: [
